@@ -1,0 +1,4 @@
+#!/sbin/openrc-run
+command="/usr/local/bin/git-mirror-sync.sh"
+command_background=false
+depend() { need localmount; after firewall; }
