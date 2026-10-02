@@ -31,21 +31,29 @@ check() {
 
 # 读取模式必须要求目录已存在，不能以可写父目录代替安装目录。
 read_missing_directory_rejected() {
-    if gm_validate_path "$TEST_ROOT/missing-program" read >/dev/null 2>&1; then return 1; fi
+    local output status=0
+    output=$(gm_validate_path "$TEST_ROOT/missing-program" read 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 读取目录不存在、身份不匹配或不可访问' ]] || return 1
     [[ ! -e $TEST_ROOT/missing-program ]]
 }
 
 # 读取模式必须要求普通文件已存在，不应接受尚未安装的记录。
 read_missing_file_rejected() {
-    if gm_validate_file "$TEST_ROOT/missing-record" read >/dev/null 2>&1; then return 1; fi
+    local output status=0
+    output=$(gm_validate_file "$TEST_ROOT/missing-record" read 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 读取文件不存在或不可读' ]] || return 1
     [[ ! -e $TEST_ROOT/missing-record ]]
 }
 
 # 模式必须来自固定枚举，拼写错误不能变成隐式放宽校验。
 invalid_mode_rejected() {
-    if gm_validate_path "$TEST_ROOT" unknown >/dev/null 2>&1; then return 1; fi
-    if gm_validate_file "$TEST_ROOT/missing-record" unknown >/dev/null 2>&1; then return 1; fi
-    return 0
+    local output status=0
+    output=$(gm_validate_path "$TEST_ROOT" unknown 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 不支持的路径访问模式' ]] || return 1
+    status=0
+    output=$(gm_validate_file "$TEST_ROOT/missing-record" unknown 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 不支持的文件访问模式' ]] || return 1
+    [[ ! -e $TEST_ROOT/missing-record ]]
 }
 
 # 只读目录中的记录可以读取；Windows 的通过不证明 Linux 挂载权限语义。

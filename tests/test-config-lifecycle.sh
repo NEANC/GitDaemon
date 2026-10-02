@@ -71,10 +71,11 @@ config_precedence() {
 config_rejected() {
     require_function gm_load_config || return 1
     clear_config_environment
-    local file=$TEST_ROOT/rejected.conf
+    local file=$TEST_ROOT/rejected.conf expected=$2 output status=0
     printf '%s\n' "$1" > "$file"
     export GIT_PORT=23456
-    if gm_load_config "$file" >/dev/null 2>&1; then return 1; fi
+    output=$(gm_load_config "$file" 2>&1) || status=$?
+    [[ $status == 1 && $output == "git-mirror: $expected" ]]
 }
 
 # 验证显式空值不会回退为合法默认值。
@@ -82,7 +83,9 @@ config_empty_required() {
     require_function gm_load_config || return 1
     clear_config_environment
     export GIT_PORT=
-    if gm_load_config "$TEST_ROOT/absent.conf" >/dev/null 2>&1; then return 1; fi
+    local output status=0
+    output=$(gm_load_config "$TEST_ROOT/absent.conf" 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 有效配置值非法：GIT_PORT' ]]
 }
 
 # 验证恶意数据既不执行命令替换，也不执行分号后的命令。
@@ -91,8 +94,9 @@ config_no_execution() {
     clear_config_environment
     local file=$TEST_ROOT/injection.conf marker=$TEST_ROOT/executed
     printf 'TZ=$(touch "%s");touch "%s"\n' "$marker" "$marker" > "$file"
-    if gm_load_config "$file" >/dev/null 2>&1; then return 1; fi
-    [[ ! -e $marker ]]
+    local output status=0
+    output=$(gm_load_config "$file" 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 配置值非法：TZ' && ! -e $marker ]]
 }
 
 # 验证读取已有配置不会改写其任何字节。
@@ -115,7 +119,7 @@ config_credentials() {
     local output status
     output=$(gm_load_config "$TEST_ROOT/absent.conf" 2>&1)
     status=$?
-    [[ $status != 0 && $output != *foundation-sensitive-fixture* ]]
+    [[ $status == 1 && $output == 'git-mirror: GITHUB_TOKEN 与 GITHUB_TOKEN_FILE 互斥' && $output != *foundation-sensitive-fixture* ]]
 }
 
 # 验证多仓库分支数组及已确认的 owner 同名短名被完整保留。
@@ -125,10 +129,18 @@ repos_valid() {
     [[ ${#GM_REPOS[@]} == 3 && ${GM_REPOS[0]} == git/git && ${GM_BRANCHES[0]} == '' && ${GM_BRANCHES[2]} == master,next,stable && ${GM_LINK_TARGETS[0]} == git/git && ${GM_LINK_NAMES[0]} == git ]]
 }
 
-# 验证所有非法项均导致整组预检失败。
+# 验证非法项按指定原因拒绝，且不发布上次或本次的半组解析结果。
 repos_rejected() {
     require_function gm_parse_repos || return 1
-    if gm_parse_repos "$1" "${2:-}" >/dev/null 2>&1; then return 1; fi
+    local expected=$3 status=0 output
+    GM_REPOS=(previous/repo)
+    GM_BRANCHES=(main)
+    GM_LINK_TARGETS=(previous/repo)
+    GM_LINK_NAMES=(previous)
+    gm_parse_repos "$1" "$2" > "$TEST_ROOT/rejected-repos-output" 2>&1 || status=$?
+    output=$(<"$TEST_ROOT/rejected-repos-output")
+    [[ $status == 1 && $output == "git-mirror: $expected" ]] || return 1
+    [[ ${#GM_REPOS[@]} == 0 && ${#GM_BRANCHES[@]} == 0 && ${#GM_LINK_TARGETS[@]} == 0 && ${#GM_LINK_NAMES[@]} == 0 ]]
 }
 
 # 验证预检自身不创建目录、链接或执行输入中的命令。
@@ -137,7 +149,7 @@ repos_no_side_effects() {
     local work=$TEST_ROOT/preflight marker=$TEST_ROOT/repo-executed
     mkdir -- "$work" || return 1
     cd -- "$work" || return 1
-    if gm_parse_repos "git/git;owner/repo \$(touch $marker)" '' >/dev/null 2>&1; then return 1; fi
+    repos_rejected "git/git;owner/repo \$(touch $marker)" '' '仓库分支字段为空或包含空白' || return 1
     [[ ! -e $marker && ! -e git && ! -e owner ]] || return 1
     gm_parse_repos 'git/git' 'git/git git' || return 1
     [[ ! -e git && ! -L git ]]
@@ -165,7 +177,16 @@ entry_source_safe() {
 # 验证路径检查拒绝危险形式，且不通过创建目录来修复输入。
 path_rejected() {
     require_function gm_validate_path || return 1
-    if gm_validate_path "$1" > /dev/null 2>&1; then return 1; fi
+    local expected=${2-} output status=0
+    if [[ -z $expected ]]; then
+        case "$1" in
+            ''|/|/tmp|/etc|/usr|/var|/var/lib) expected='拒绝危险根目录' ;;
+            relative/instance) expected='路径必须为明确的绝对实例目录' ;;
+            *) expected='路径包含非法分量' ;;
+        esac
+    fi
+    output=$(gm_validate_path "$1" 2>&1) || status=$?
+    [[ $status == 1 && $output == "git-mirror: $expected" ]]
 }
 
 # 验证调用者拥有的绝对目标可预检，且预检不创建缺失目录。
@@ -190,15 +211,17 @@ path_symlink_rejected() {
         printf '测试环境不能创建真实符号链接，不能验证此项\n'
         return 1
     }
-    path_rejected "$TEST_ROOT/link-parent/instance"
+    path_rejected "$TEST_ROOT/link-parent/instance" '路径包含符号链接' || return 1
+    [[ -L $TEST_ROOT/link-parent && ! -e $TEST_ROOT/link-target/instance ]]
 }
 
 # 验证文件不能被当作实例目录或目录父路径。
 path_file_rejected() {
     require_function gm_validate_path || return 1
     printf '%s\n' sentinel > "$TEST_ROOT/not-directory"
-    path_rejected "$TEST_ROOT/not-directory" || return 1
-    path_rejected "$TEST_ROOT/not-directory/instance"
+    path_rejected "$TEST_ROOT/not-directory" '路径组件不是目录' || return 1
+    path_rejected "$TEST_ROOT/not-directory/instance" '路径组件不是目录' || return 1
+    [[ $(<"$TEST_ROOT/not-directory") == sentinel ]]
 }
 
 # 身份边界桩仅模拟 id 返回值，生产代码不得提供跳过身份检查的选项。
@@ -211,7 +234,9 @@ identity_root_rejected() {
             *) command id "$@" ;;
         esac
     }
-    if gm_check_identity > /dev/null 2>&1; then return 1; fi
+    local output status=0
+    output=$(gm_check_identity 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 必须以实际和有效 UID 相同的非 root 用户运行' ]]
 }
 
 # 验证真实当前身份；测试运行者为非零 UID 时应通过。
@@ -226,7 +251,9 @@ platform_non_alpine_rejected() {
     require_function gm_check_platform || return 1
     case "$(uname -s)" in
         MINGW*|MSYS*)
-            if gm_check_platform > /dev/null 2>&1; then return 1; fi
+            local output status=0
+            output=$(gm_check_platform 2>&1) || status=$?
+            [[ $status == 1 && $output == 'git-mirror: 仅支持 Alpine Linux' ]] || return 1
             ;;
         *)
             printf '本用例要求已确认的 Git Bash 非 Alpine 环境\n'
@@ -311,17 +338,23 @@ lock_boundary_case() {
             builtin command "$@"
         }
     fi
-    gm_lock_acquire sync exclusive || status=$?
+    gm_lock_acquire sync exclusive > "$work/output" 2>&1 || status=$?
+    local output arguments
+    output=$(<"$work/output")
     [[ $(<"$work/runtime/sync.lock") == "$before" ]] || return 1
+    if [[ $scenario == missing ]]; then
+        [[ $status == 1 && $output == 'git-mirror: 缺少必要依赖 flock' && ! -e $work/flock-arguments ]]
+        return $?
+    fi
+    [[ -f $work/flock-arguments ]] || return 1
+    arguments=$(<"$work/flock-arguments")
+    [[ $arguments =~ ^-n\ -E\ 75\ -x\ [0-9]+$ ]] || return 1
     case "$scenario" in
-        missing) [[ $status != 0 && $status != 75 && ! -e $work/flock-arguments ]] ;;
-        busy) [[ $status == 75 ]] ;;
-        error) [[ $status != 0 && $status != 75 ]] ;;
+        busy) [[ $status == 75 && $output == 'git-mirror: 实例锁忙：sync' ]] ;;
+        error) [[ $status == 1 && $output == 'git-mirror: 锁工具执行失败，未取得锁' ]] ;;
         success)
-            [[ $status == 0 && -s $work/flock-arguments ]] || return 1
-            local arguments
-            arguments=$(<"$work/flock-arguments")
-            [[ $arguments == *'-n'* && $arguments == *'-E 75'* && $arguments == *'-x'* ]]
+            [[ $status == 0 && -z $output ]] || return 1
+            gm_lock_release sync
             ;;
     esac
 }
@@ -341,8 +374,10 @@ lock_symlink_rejected() {
     # 权限与锁调用边界桩，链接检查仍执行真实实现。
     gm_check_private_directory() { return 0; }
     flock() { printf called > "$work/called"; return 0; }
-    gm_lock_acquire sync exclusive > /dev/null 2>&1 || status=$?
-    [[ $status != 0 && ! -e $work/called && $(<"$work/outside") == sentinel ]]
+    local output
+    output=$(gm_lock_acquire sync exclusive 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 实例文件不能为符号链接' ]] || return 1
+    [[ ! -e $work/called && -L $work/runtime/sync.lock && $(<"$work/outside") == sentinel ]]
 }
 
 # 验证锁名只能为共享协议中的固定名称，不能变成任意文件路径。
@@ -353,9 +388,11 @@ lock_name_rejected() {
     export RUN_ROOT=$work
     # 权限与依赖边界桩不替代锁名称校验。
     gm_check_private_directory() { return 0; }
-    flock() { return 0; }
-    if gm_lock_acquire ../outside exclusive > /dev/null 2>&1; then return 1; fi
-    [[ ! -e $work/outside && ! -e $work/outside.lock ]]
+    flock() { printf called > "$work/called"; return 0; }
+    local output status=0
+    output=$(gm_lock_acquire ../outside exclusive 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 不支持的实例锁名称' ]] || return 1
+    [[ ! -e $work/called && ! -e $work/outside && ! -e $work/outside.lock ]]
 }
 
 # 验证关键运行入口在真实非 Alpine 平台拒绝，且尚未产生写入。
@@ -374,7 +411,7 @@ entry_platform_rejected_before_write() {
         bash "$ROOT/scripts/$script"
     ) > "$work/output" 2>&1 || status=$?
     output=$(<"$work/output")
-    [[ $status != 0 && $output == *Alpine* && ! -e $work/instance ]]
+    [[ $status == 1 && $output == 'git-mirror: 仅支持 Alpine Linux' && ! -e $work/instance ]]
 }
 
 # 验证初始化遇到依赖、权限或忙锁错误时不创建配置及实例记录。
@@ -389,12 +426,18 @@ initialize_boundary_failure() {
         gm_deploy_main --install --install-root "$work/program" || exit 1
         mkdir -p -- "$work/instance/runtime" || exit 1
         export REPOS=git/git
-        # 权限边界桩分别返回拒绝或通过；生产检查不能绕过。
+        # 权限边界桩记录到达位置，使用生产接口的诊断契约。
         gm_check_private_directory() {
-            [[ $scenario != permissions ]]
+            printf 'private %s\n' "$1" >> "$work/permissions"
+            if [[ $scenario == permissions ]]; then
+                gm_error '实例私有目录权限必须为 0700'
+                return 1
+            fi
+            return 0
         }
-        # 锁边界桩模拟 util-linux flock 的独立忙锁退出码。
+        # 锁边界桩记录真实锁接口传来的参数，不证明内核互斥。
         flock() {
+            printf '%s\n' "$*" >> "$work/locks"
             if [[ $scenario == busy ]]; then return 75; fi
             return 0
         }
@@ -407,8 +450,26 @@ initialize_boundary_failure() {
             }
         fi
         gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" > "$work/output" 2>&1 || status=$?
-        [[ $status != 0 && ! -e $work/instance/config/mirror.env && ! -e $work/instance/config/installation.conf ]] || exit 1
-        if [[ $scenario == busy ]]; then [[ $status == 75 ]] || exit 1; fi
+        local output
+        output=$(<"$work/output")
+        [[ ! -e $work/instance/config/mirror.env && ! -e $work/instance/config/installation.conf ]] || exit 1
+        case "$scenario" in
+            missing)
+                [[ $status == 1 && $output == 'git-mirror: 缺少必要依赖：flock' ]] || exit 1
+                [[ ! -e $work/permissions && ! -e $work/locks ]] || exit 1
+                ;;
+            permissions)
+                [[ $status == 1 && $output == 'git-mirror: 实例私有目录权限必须为 0700' ]] || exit 1
+                [[ $(<"$work/permissions") == "private $work/instance/runtime" && ! -e $work/locks ]] || exit 1
+                ;;
+            busy)
+                [[ $status == 75 && $output == 'git-mirror: 实例锁忙：instance' ]] || exit 1
+                local -a lock_calls=()
+                mapfile -t lock_calls < "$work/locks"
+                [[ ${#lock_calls[@]} == 1 && ${lock_calls[0]} =~ ^-n\ -E\ 75\ -x\ [0-9]+$ ]] || exit 1
+                [[ -s $work/permissions ]] || exit 1
+                ;;
+        esac
         return 0
     )
 }
@@ -463,7 +524,7 @@ operation_lock_order() {
             ;;
         stopped)
             expected=$'acquire instance shared\nrelease instance'
-            [[ $status != 0 && $actual == "$expected" ]]
+            [[ $status == 1 && $actual == "$expected" && $(<"$work/output") == 'git-mirror: 实例已停止，拒绝启动新操作' ]]
             ;;
     esac
 }
@@ -486,7 +547,9 @@ uninstall_behavior() {
         printf '%s\n' repository > "$work/instance/repos/example/sentinel"
         printf '%s\n' credential-fixture > "$work/instance/secrets/sentinel"
         printf '%s\n' log-fixture > "$work/instance/logs/sentinel"
-        printf '%s\n' 'GIT_PORT=12345' > "$work/instance/config/mirror.env"
+        if [[ $scenario != default ]]; then
+            printf '%s\n' 'GIT_PORT=12345' > "$work/instance/config/mirror.env"
+        fi
         printf '%s\n' outside-sentinel > "$work/outside"
         # 旧卸载脚本会在 source 时执行；以 --help 安全终止旧实现，绝不执行旧删除流程。
         set -- --help
@@ -616,10 +679,39 @@ uninstall_behavior() {
                 [[ -f $run/config/installation.conf && -d $run/runtime ]] || exit 1
                 ;;
             *)
-                [[ $status != 0 ]] || exit 1
-                [[ -f $run/repos/example/sentinel && -f $run/config/mirror.env && -f $run/secrets/sentinel && -f $run/logs/sentinel ]] || exit 1
-                if [[ $scenario == busy ]]; then [[ $status == 75 ]] || exit 1; fi
-                if [[ $scenario == lock-error ]]; then [[ $status != 75 ]] || exit 1; fi
+                local expected_diagnostic expected_status=1 expected_services=
+                case "$scenario" in
+                    stop-failure) expected_diagnostic='实例服务停止失败，未执行删除' ;;
+                    busy) expected_diagnostic='实例锁忙：instance'; expected_status=75 ;;
+                    lock-error) expected_diagnostic='锁工具执行失败，未取得锁' ;;
+                    missing-flock) expected_diagnostic='缺少必要依赖：flock' ;;
+                    missing-openrc) expected_diagnostic='缺少必要依赖：rc-service' ;;
+                    forged-record) expected_diagnostic='安装记录缺失字段、路径冲突或身份不匹配' ;;
+                    missing-record) expected_diagnostic='读取文件不存在或不可读' ;;
+                    dangerous-root) expected_diagnostic='拒绝危险根目录' ;;
+                    linked-repos) expected_diagnostic='路径包含符号链接' ;;
+                    *) printf '未定义的卸载负向场景：%s\n' "$scenario"; exit 1 ;;
+                esac
+                [[ $status == "$expected_status" && $output == *"git-mirror: $expected_diagnostic"* ]] || {
+                    printf '卸载拒绝原因不符：%s，status=%s\n%s\n' "$scenario" "$status" "$output"
+                    exit 1
+                }
+                [[ $(<"$run/repos/example/sentinel") == repository && $(<"$run/config/mirror.env") == GIT_PORT=12345 ]] || exit 1
+                [[ $(<"$run/secrets/sentinel") == credential-fixture && $(<"$run/logs/sentinel") == log-fixture ]] || exit 1
+                [[ ! -e $run/runtime/stopped ]] || exit 1
+                case "$scenario" in
+                    stop-failure)
+                        [[ $(<"$work/services") == "--user $work/program/openrc/git-mirror-sync stop" && ! -e $work/locks ]] || exit 1
+                        ;;
+                    busy|lock-error)
+                        expected_services="--user $work/program/openrc/git-mirror-sync stop"$'\n'"--user $work/program/openrc/git-mirror-hosts stop"
+                        [[ $(<"$work/services") == "$expected_services" ]] || exit 1
+                        local -a lock_calls=()
+                        mapfile -t lock_calls < "$work/locks"
+                        [[ ${#lock_calls[@]} == 1 && ${lock_calls[0]} =~ ^-n\ -E\ 75\ -x\ [0-9]+$ ]] || exit 1
+                        ;;
+                    *) [[ ! -e $work/services && ! -e $work/locks ]] || exit 1 ;;
+                esac
                 ;;
         esac
         printf verified > "$work/verified"
@@ -676,6 +768,18 @@ managed_link_cleanup() {
         printf 'lock %s %s\n' "$1" "$2" >> "$work/calls"
         return 0
     }
+    # 记录真实删除命令；解除链接时目标仍存在，递归清理前链接已解除。
+    rm() {
+        printf '%s\n' "$*" >> "$work/removals"
+        if [[ ${2-} == "$work/instance/repos/alias" ]]; then
+            [[ $# == 2 && $1 == -- && -L $2 ]] || return 91
+            [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 92
+        elif [[ ${3-} == "$work/instance/repos" ]]; then
+            [[ $# == 3 && $1 == -rf && $2 == -- && ! -L $work/instance/repos/alias ]] || return 93
+            [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 94
+        fi
+        command rm "$@"
+    }
     gm_uninstall_main --run-root "$work/instance" --delete-repos --yes > "$work/output" 2>&1 || status=$?
     output=$(<"$work/output")
     [[ $(<"$work/outside/sentinel") == outside ]] || return 1
@@ -689,12 +793,15 @@ managed_link_cleanup() {
         }
         [[ $(<"$work/calls") == "$expected" && $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
         [[ ! -e $work/instance/config/managed-links/alias ]] || return 1
+        local expected_removals
+        expected_removals="-- $work/instance/repos/alias"$'\n'"-- $work/instance/config/managed-links/alias"$'\n'"-rf -- $work/instance/repos"
+        [[ $(<"$work/removals") == "$expected_removals" ]] || return 1
     else
         [[ $status == 1 && $output == *"$expected"* ]] || {
             printf '链接拒绝原因不符：预期=%s，status=%s\n%s\n' "$expected" "$status" "$output"
             return 1
         }
-        [[ ! -e $work/calls && ! -e $work/instance/runtime/stopped ]] || return 1
+        [[ ! -e $work/calls && ! -e $work/removals && ! -e $work/instance/runtime/stopped ]] || return 1
         [[ -L $work/instance/repos/alias && $(readlink -- "$work/instance/repos/alias") == "$target" ]] || return 1
         [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 1
     fi
@@ -777,10 +884,13 @@ resume_lifecycle() {
     if [[ $scenario == forged-record ]]; then
         printf '%s\n' invalid > "$work/instance/config/installation.conf"
     fi
+    # 遗留 PID 文件不能代替服务状态，也不应在恢复时被擅自删除。
+    printf '%s\n' 424242 > "$work/instance/runtime/git-daemon.pid"
     status=0
     gm_deploy_main --resume --install-root "$work/program" --run-root "$work/instance" > "$work/output" 2>&1 || status=$?
     output=$(<"$work/output")
     [[ $(<"$work/instance/repos/sentinel") == repository ]] || return 1
+    [[ $(<"$work/instance/runtime/git-daemon.pid") == 424242 ]] || return 1
     case "$scenario" in
         success)
             expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync\nstatus git-mirror-hosts\nstatus git-daemon'
@@ -946,11 +1056,15 @@ permission_write_boundary() {
         fi
         command stat "$@"
     }
+    # 记录异常权限检查是否擅自尝试修复，不改变宿主或测试树权限。
+    chmod() { printf 'chmod\n' >> "$work/permission-writes"; return 99; }
+    chown() { printf 'chown\n' >> "$work/permission-writes"; return 99; }
     case "$scenario" in
         file-*|normal) output=$(gm_validate_file "$work/ancestor/protected/data" read 2>&1) || status=$? ;;
         *) output=$(gm_validate_path "$work/ancestor/protected" read 2>&1) || status=$? ;;
     esac
     [[ $(<"$work/ancestor/protected/data") == sentinel ]] || return 1
+    [[ ! -e $work/permission-writes ]] || return 1
     [[ $(stat -c %a -- "$checked") == "$fixture_permission_mode" ]] || return 1
     if [[ -n $expected ]]; then
         [[ $status == 1 && $output == *"$expected"* ]] || {
@@ -1005,28 +1119,82 @@ check '安装不要求 REPOS、不读取凭据、不创建运行目录（平台�
 check '重复初始化保留配置与实例环境（平台边界桩）' initialize_preserves_config
 check '同步入口加载无副作用并提供显式主函数' entry_source_safe git-mirror-sync.sh gm_sync_main
 check '刷新入口加载无副作用并提供显式主函数' entry_source_safe update-github-hosts.sh gm_hosts_main
+# 向负向断言注入不相关错误，验证断言不会把任意非零误当成预期失败。
+negative_assertion_reason_guard() {
+    local scenario=$1
+    case "$scenario" in
+        config)
+            # 故障注入只替换此子 Shell 中的解析器，不改变生产代码。
+            gm_load_config() { gm_error '故障注入：不相关的提前失败'; }
+            if config_rejected 'GIT_PORT=80' '配置值非法：GIT_PORT'; then
+                printf '配置负向断言错误接受了不相关诊断\n'
+                return 1
+            fi
+            ;;
+        repos)
+            # 不相关诊断和未清理数组都不能被当成正确的预检拒绝。
+            gm_parse_repos() { gm_error '故障注入：不相关的提前失败'; }
+            if repos_rejected 'owner/' '' '仓库名称必须为 owner/repo 且不带 .git 后缀'; then
+                printf '仓库负向断言错误接受了不相关诊断\n'
+                return 1
+            fi
+            ;;
+        lock)
+            # 故障注入不调用 flock，原有宽松断言不能据此宣布锁错误覆盖通过。
+            gm_lock_acquire() { gm_error '故障注入：未到达锁工具'; }
+            if lock_boundary_case error; then
+                printf '锁负向断言错误接受了未到达锁工具的失败\n'
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+check '负向断言拒绝错误原因：config（故障注入）' negative_assertion_reason_guard config
+check '负向断言拒绝错误原因：repos（故障注入）' negative_assertion_reason_guard repos
+check '负向断言拒绝错误原因：lock（故障注入）' negative_assertion_reason_guard lock
 check '配置保留等号与 cron 原始字符串' config_values
 check '显式环境、文件、默认值优先级及可选空值' config_precedence
-check '重复键拒绝' config_rejected $'GIT_PORT=12345\nGIT_PORT=23456'
-check '未知键拒绝' config_rejected 'UNSUPPORTED=value'
-check '历史卷 REPOS 拒绝' config_rejected 'REPOS=git/git'
-check '历史卷 SHORT_LINKS 拒绝' config_rejected 'SHORT_LINKS=git/git git'
-check '配置内 Token 拒绝' config_rejected 'GITHUB_TOKEN=fixture'
-check '旧 Shell 引号配置拒绝而非执行或转换' config_rejected 'GIT_PORT="12345"'
-check '非法端口不被环境覆盖掩盖' config_rejected 'GIT_PORT=80'
-check '非法开关拒绝' config_rejected 'ENABLE_CRON=perhaps'
-check '非法 cron 拒绝' config_rejected 'CRON_SCHEDULE=99 99 * * *'
-check '非 HTTPS 来源拒绝' config_rejected 'HOSTS_URL=http://example.invalid/meta'
+check '重复键拒绝' config_rejected $'GIT_PORT=12345\nGIT_PORT=23456' '配置键重复：GIT_PORT'
+check '未知键拒绝' config_rejected 'UNSUPPORTED=value' '配置第 1 行包含不支持的键，旧 Shell 配置不可执行或自动转换'
+check '历史卷 REPOS 拒绝' config_rejected 'REPOS=git/git' '配置第 1 行包含不支持的键，旧 Shell 配置不可执行或自动转换'
+check '历史卷 SHORT_LINKS 拒绝' config_rejected 'SHORT_LINKS=git/git git' '配置第 1 行包含不支持的键，旧 Shell 配置不可执行或自动转换'
+check '配置内 Token 拒绝' config_rejected 'GITHUB_TOKEN=fixture' '配置第 1 行包含不支持的键，旧 Shell 配置不可执行或自动转换'
+check '旧 Shell 引号配置拒绝而非执行或转换' config_rejected 'GIT_PORT="12345"' '配置值非法：GIT_PORT'
+check '非法端口不被环境覆盖掩盖' config_rejected 'GIT_PORT=80' '配置值非法：GIT_PORT'
+check '非法开关拒绝' config_rejected 'ENABLE_CRON=perhaps' '配置值非法：ENABLE_CRON'
+check '非法 cron 拒绝' config_rejected 'CRON_SCHEDULE=99 99 * * *' '配置值非法：CRON_SCHEDULE'
+check '非 HTTPS 来源拒绝' config_rejected 'HOSTS_URL=http://example.invalid/meta' '配置值非法：HOSTS_URL'
 check '显式必填空值拒绝' config_empty_required
 check '命令替换与分号绝不执行' config_no_execution
 check '已有配置字节不变' config_unchanged
 check '凭据互斥且诊断不泄漏 Token' config_credentials
 check '合法多仓库及 git/git git 映射预检' repos_valid
 for input in '' 'owner/' '/repo' 'owner/repo/extra' 'owner/repo.git' '../repo' 'git/git;git/git main' 'git/git;' ';git/git' 'git/git;;owner/repo' 'git/git HEAD' 'git/git --help' 'git/git *' 'git/git main,' 'git/git ,main' 'git/git main,,next' 'git/git main,main' 'git/git main..next' 'git/git main #comment' $'git/git\nowner/repo' $'git/git\r'; do
-    check "非法仓库或分支拒绝：$input" repos_rejected "$input"
+    case "$input" in
+        ''|$'git/git\nowner/repo'|$'git/git\r') expected='REPOS 必填，REPOS/SHORT_LINKS 必须为单行字符串' ;;
+        'owner/'|'/repo'|'owner/repo/extra'|'owner/repo.git'|'../repo') expected='仓库名称必须为 owner/repo 且不带 .git 后缀' ;;
+        'git/git;git/git main') expected='REPOS 包含重复仓库' ;;
+        'git/git;'|';git/git'|'git/git;;owner/repo') expected='REPOS 包含空仓库项' ;;
+        'git/git HEAD'|'git/git --help') expected='不接受 HEAD 或选项形式的分支' ;;
+        'git/git *'|'git/git main..next') expected='分支引用格式非法' ;;
+        'git/git main,'|'git/git ,main'|'git/git main,,next') expected='分支列表包含空项' ;;
+        'git/git main,main') expected='仓库包含重复分支' ;;
+        'git/git main #comment') expected='仓库分支字段为空或包含空白' ;;
+    esac
+    check "非法仓库或分支拒绝：$input" repos_rejected "$input" '' "$expected"
 done
 for input in 'other/repo name' 'git/git .' 'git/git ..' 'git/git bad..name' 'git/git ../bad' 'git/git bad/name' 'git/git name.git' 'git/git two names' 'git/git alias;git/git other' 'git/git same;owner/repo same' 'git/git alias;' $'git/git alias\n'; do
-    check "非法短名或关联拒绝：$input" repos_rejected 'git/git;owner/repo' "$input"
+    case "$input" in
+        'other/repo name') expected='短名目标不在 REPOS 中' ;;
+        'git/git alias;git/git other'|'git/git same;owner/repo same') expected='短名或映射目标重复' ;;
+        'git/git alias;') expected='SHORT_LINKS 包含空映射' ;;
+        $'git/git alias\n') expected='REPOS 必填，REPOS/SHORT_LINKS 必须为单行字符串' ;;
+        *) expected='短名格式非法' ;;
+    esac
+    check "非法短名或关联拒绝：$input" repos_rejected 'git/git;owner/repo' "$input" "$expected"
 done
 check '预检无命令执行或链接创建副作用' repos_no_side_effects
 printf '基础行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
