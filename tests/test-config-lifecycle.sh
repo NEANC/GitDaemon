@@ -594,6 +594,71 @@ uninstall_behavior() {
     [[ -f $work/verified ]]
 }
 
+# 用真实配置读取和独立消费者进程验证服务传参，仅替换平台、私有权限与锁边界。
+service_effective_config() {
+    local scenario=$1 work=$TEST_ROOT/service-config-$1 status=0 output
+    local expected_port=12345 expected_address=127.0.0.1 expected_timezone=UTC
+    mkdir -- "$work" || return 1
+    clear_config_environment
+    source "$ROOT/scripts/deploy-git-mirror.sh"
+    require_function gm_with_runtime_environment || return 1
+    # 平台与锁边界桩不代替实际配置、安装记录或服务定义读取。
+    gm_check_platform() { return 0; }
+    gm_check_private_directory() { return 0; }
+    flock() { return 0; }
+    gm_deploy_main --install --install-root "$work/program" || return 1
+    export REPOS=git/git
+    gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
+    printf '%s\n' 'GIT_PORT=12345' 'LISTEN_ADDRESS=127.0.0.1' 'TZ=UTC' 'CRON_SCHEDULE=15 * * * *' > "$work/instance/config/mirror.env"
+    case "$scenario" in
+        defaults)
+            printf '%s\n' '# 使用真实默认配置' > "$work/instance/config/mirror.env"
+            expected_port=9418; expected_address=0.0.0.0; expected_timezone=Asia/Shanghai
+            ;;
+        environment)
+            export GIT_PORT=23456 LISTEN_ADDRESS=::1 TZ=Asia/Hong_Kong
+            expected_port=23456; expected_address=::1; expected_timezone=Asia/Hong_Kong
+            ;;
+        invalid)
+            printf '%s\n' 'LISTEN_ADDRESS=::1:' > "$work/instance/config/mirror.env"
+            export LISTEN_ADDRESS=127.0.0.1
+            ;;
+    esac
+    cp -- "$work/instance/config/mirror.env" "$work/before" || return 1
+    gm_with_runtime_environment "$work/instance" "$work/program" bash -c '
+        source "$INSTALL_ROOT/openrc/git-daemon" || exit 1
+        printf "%s\n" "$command_args" "$TZ" "$ENABLE_CRON" "$CRON_SCHEDULE" "$pidfile" > "$1"
+    ' service-consumer "$work/consumer" > "$work/output" 2>&1 || status=$?
+    output=$(<"$work/output")
+    cmp -s -- "$work/before" "$work/instance/config/mirror.env" || return 1
+    if [[ $scenario == invalid ]]; then
+        [[ $status == 1 && $output == 'git-mirror: 配置值非法：LISTEN_ADDRESS' && ! -e $work/consumer ]] || return 1
+        return 0
+    fi
+    [[ $status == 0 && -f $work/consumer ]] || { printf '%s\n' "$output"; return 1; }
+    local -a received=()
+    mapfile -t received < "$work/consumer"
+    [[ ${received[0]} == *"--port=$expected_port"* && ${received[0]} == *"--listen=$expected_address"* ]] || return 1
+    [[ ${received[0]} == *"--base-path=$work/instance/repos"* ]] || return 1
+    [[ ${received[1]} == "$expected_timezone" && ${received[2]} == yes ]] || return 1
+    [[ ${received[4]} == "$work/instance/runtime/git-daemon.pid" ]] || return 1
+    if [[ $scenario == defaults ]]; then
+        [[ ${received[3]} == '0 * * * *' ]] || return 1
+    else
+        [[ ${received[3]} == '15 * * * *' ]] || return 1
+    fi
+    if [[ $scenario == environment ]]; then
+        [[ $GIT_PORT == 23456 && $LISTEN_ADDRESS == ::1 && $TZ == Asia/Hong_Kong ]] || return 1
+    else
+        [[ ! -v GIT_PORT && ! -v LISTEN_ADDRESS && ! -v TZ ]] || return 1
+    fi
+    return 0
+}
+
+for scenario in defaults file environment invalid; do
+    check "有效配置传递到服务：$scenario（平台和锁边界桩）" service_effective_config "$scenario"
+done
+
 # 同时验证真实地址校验器与文件配置读取，非法文件不能被环境覆盖掩盖。
 ipv6_config_boundary() {
     local address=$1 expected_status=$2 direct_status=0 config_status=0 output

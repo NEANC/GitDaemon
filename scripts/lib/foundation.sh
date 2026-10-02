@@ -521,6 +521,17 @@ gm_prepare_runtime() {
     return 0
 }
 
+# 在独立环境中将有效配置传给消费者，不改变调用方环境或回写配置文件。
+gm_with_runtime_environment() (
+    local run=$1 install=$2 key
+    shift 2
+    gm_prepare_runtime "$run" "$install" || return $?
+    for key in "${!GM_CONFIG[@]}"; do
+        export "$key=${GM_CONFIG[$key]}"
+    done
+    "$@"
+)
+
 # 运行入口按实例共享锁、操作排他锁顺序进入，停止标记禁止新操作。
 gm_begin_operation() {
     local operation=$1 status
