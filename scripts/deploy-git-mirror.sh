@@ -30,6 +30,10 @@ gm_install_program() {
     if [[ -e $install/installation.conf ]]; then
         gm_match_record "$install/installation.conf" "$record" || return 1
     fi
+    gm_validate_file "$install/service-capabilities.conf" || return 1
+    if [[ -e $install/service-capabilities.conf ]]; then
+        gm_match_record "$install/service-capabilities.conf" $'FORMAT=1\nSCHEDULER=absent' || return 1
+    fi
     (umask 077; mkdir -p -- "$install/lib" "$install/openrc") || return 1
     for file in "${files[@]}"; do
         if [[ ! -e $install/$file ]]; then
@@ -38,6 +42,7 @@ gm_install_program() {
         fi
     done
     gm_create_data_file "$install/installation.conf" "$record" || return 1
+    gm_create_data_file "$install/service-capabilities.conf" $'FORMAT=1\nSCHEDULER=absent' || return 1
     printf '程序安装位置：%s\n' "$install"
 }
 

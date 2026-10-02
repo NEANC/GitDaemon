@@ -480,7 +480,7 @@ uninstall_behavior() {
         gm_check_private_directory() { return 0; }
         flock() { return 0; }
         gm_deploy_main --install --install-root "$work/program" || exit 1
-        export REPOS=git/git ENABLE_CRON=no
+        export REPOS=git/git
         gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
         mkdir -p -- "$work/instance/repos/example" || exit 1
         printf '%s\n' repository > "$work/instance/repos/example/sentinel"
@@ -515,7 +515,7 @@ uninstall_behavior() {
             esac
         }
         case "$scenario" in
-            default) options+=(--yes) ;;
+            default|scheduler-installed|scheduler-missing|capability-missing) options+=(--yes) ;;
             repos|config|credentials|logs) options+=("--delete-$scenario" --yes) ;;
             confirm-no|confirm-yes) options+=(--delete-repos) ;;
             stop-failure|busy|lock-error|missing-flock|missing-openrc|forged-record|missing-record|dangerous-root|linked-repos)
@@ -523,6 +523,19 @@ uninstall_behavior() {
                 ;;
         esac
         case "$scenario" in
+            scheduler-installed|scheduler-missing)
+                printf 'FORMAT=1\nSCHEDULER=present\n' > "$work/program/service-capabilities.conf"
+                export ENABLE_CRON=no
+                if [[ $scenario == scheduler-installed ]]; then
+                    printf '%s\n' '#!/sbin/openrc-run' > "$work/program/openrc/git-mirror-scheduler"
+                    chmod 755 -- "$work/program/openrc/git-mirror-scheduler" || exit 1
+                fi
+                ;;
+            capability-missing)
+                if [[ -f $work/program/service-capabilities.conf ]]; then
+                    rm -- "$work/program/service-capabilities.conf" || exit 1
+                fi
+                ;;
             missing-flock|missing-openrc)
                 # 依赖发现边界桩只隐藏指定组件，其他工具仍使用真实实现。
                 command() {
@@ -556,10 +569,31 @@ uninstall_behavior() {
         [[ $(<"$work/outside") == outside-sentinel && $output != *credential-fixture* ]] || exit 1
         [[ -f $work/program/git-mirror-sync.sh && -f $work/program/installation.conf ]] || exit 1
         case "$scenario" in
-            default|confirm-no)
+            default|scheduler-installed|confirm-no)
                 [[ $status == 0 ]] || { printf '%s\n' "$output"; exit 1; }
                 [[ -f $run/repos/example/sentinel && -f $run/config/mirror.env && -f $run/secrets/sentinel && -f $run/logs/sentinel ]] || exit 1
-                if [[ $scenario == confirm-no ]]; then [[ ! -e $work/services ]] || exit 1; fi
+                if [[ $scenario == confirm-no ]]; then
+                    [[ ! -e $work/services && ! -e $work/locks ]] || exit 1
+                else
+                    local expected_services= expected_service
+                    if [[ $scenario == scheduler-installed ]]; then
+                        expected_services="--user $work/program/openrc/git-mirror-scheduler stop"$'\n'
+                    else
+                        [[ $(<"$work/program/service-capabilities.conf") == $'FORMAT=1\nSCHEDULER=absent' ]] || exit 1
+                    fi
+                    for expected_service in git-mirror-sync git-mirror-hosts git-daemon; do
+                        expected_services+="--user $work/program/openrc/$expected_service stop"$'\n'
+                    done
+                    [[ -f $work/services && $(<"$work/services") == "${expected_services%$'\n'}" ]] || exit 1
+                    [[ -s $work/locks && $(<"$run/runtime/stopped") == STOPPED=1 ]] || exit 1
+                fi
+                ;;
+            scheduler-missing|capability-missing)
+                local expected_diagnostic='缺少安装服务能力记录'
+                if [[ $scenario == scheduler-missing ]]; then expected_diagnostic='已登记调度服务定义缺失'; fi
+                [[ $status == 1 && $output == *"$expected_diagnostic"* ]] || { printf '%s\n' "$output"; exit 1; }
+                [[ ! -e $work/services && ! -e $work/locks && ! -e $run/runtime/stopped ]] || exit 1
+                [[ -f $run/repos/example/sentinel && -f $run/config/mirror.env && -f $run/secrets/sentinel && -f $run/logs/sentinel ]] || exit 1
                 ;;
             repos|config|credentials|logs|confirm-yes)
                 [[ $status == 0 && -s $work/services && -s $work/locks ]] || { printf '%s\n' "$output"; exit 1; }
@@ -744,7 +778,7 @@ for scenario in directory-group directory-other protected-sticky ancestor-writab
     check "非授权写入边界：$scenario（权限元数据桩）" permission_write_boundary "$scenario"
 done
 
-for scenario in default repos config credentials logs confirm-no confirm-yes stop-failure busy lock-error missing-flock missing-openrc forged-record missing-record dangerous-root linked-repos; do
+for scenario in default scheduler-installed scheduler-missing capability-missing repos config credentials logs confirm-no confirm-yes stop-failure busy lock-error missing-flock missing-openrc forged-record missing-record dangerous-root linked-repos; do
     check "临时实例卸载：$scenario（服务、权限及锁边界桩）" uninstall_behavior "$scenario"
 done
 check '同步服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-sync

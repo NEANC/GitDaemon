@@ -110,14 +110,7 @@ gm_uninstall_main() (
         gm_validate_file "$install/openrc/$service" read || return 1
         [[ -f $install/openrc/$service && -x $install/openrc/$service ]] || { gm_error '实例服务定义缺失'; return 1; }
     done
-    # 完整调度留待后续实现；启用调度而缺少可停止的服务时必须失败关闭。
-    if [[ ${GM_CONFIG[ENABLE_CRON]} == yes ]]; then
-        gm_validate_file "$install/openrc/git-mirror-scheduler" read || return 1
-        [[ -f $install/openrc/git-mirror-scheduler && -x $install/openrc/git-mirror-scheduler ]] || {
-            gm_error '调度已启用但缺少可核验的调度服务，拒绝清理'
-            return 1
-        }
-    fi
+    gm_load_service_capabilities "$install" || return 1
     printf '实例：%s\n程序保留：%s\n' "$run" "$install"
     if [[ ${#targets[@]} -gt 0 ]]; then
         printf '将删除：%s\n' "${targets[@]}"
@@ -130,7 +123,7 @@ gm_uninstall_main() (
         printf '%s\n' '仅停止实例，保留全部数据。'
     fi
     gm_validate_uninstall_targets "$run" "$install" "${targets[@]}" || return 1
-    if [[ ${GM_CONFIG[ENABLE_CRON]} == yes ]]; then
+    if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
         gm_stop_instance_service git-mirror-scheduler || return 1
     fi
     gm_stop_instance_service git-mirror-sync || return 1

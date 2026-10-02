@@ -405,6 +405,25 @@ gm_instance_record() {
     printf 'FORMAT=1\nMODE=instance\nUID=%s\nRUN_ROOT=%s\nINSTALL_ROOT=%s' "$EUID" "$1" "$2"
 }
 
+# 读取程序层固定能力记录，区分从未安装调度与已登记组件定义丢失。
+gm_load_service_capabilities() {
+    local install=$1 file=$1/service-capabilities.conf content
+    [[ -e $file || -L $file ]] || { gm_error '缺少安装服务能力记录'; return 1; }
+    gm_validate_file "$file" read || return 1
+    content=$(<"$file")
+    case "$content" in
+        $'FORMAT=1\nSCHEDULER=absent') GM_SCHEDULER_CAPABILITY=absent ;;
+        $'FORMAT=1\nSCHEDULER=present') GM_SCHEDULER_CAPABILITY=present ;;
+        *) gm_error '安装服务能力记录格式非法'; return 1 ;;
+    esac
+    if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
+        [[ -f $install/openrc/git-mirror-scheduler ]] || { gm_error '已登记调度服务定义缺失'; return 1; }
+        gm_validate_file "$install/openrc/git-mirror-scheduler" read || return 1
+        [[ -x $install/openrc/git-mirror-scheduler ]] || { gm_error '已登记调度服务定义不可执行'; return 1; }
+    fi
+    return 0
+}
+
 # 将所有用户运行环境定向实例目录，不在安装阶段调用。
 gm_set_instance_environment() {
     RUN_ROOT=$1
