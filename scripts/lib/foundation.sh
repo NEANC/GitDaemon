@@ -540,6 +540,57 @@ gm_prepare_runtime() {
     return 0
 }
 
+# 仅控制安装目录中的本实例用户服务，任何停止失败均向上传播。
+gm_stop_instance_service() {
+    local service=$1 path
+    case "$service" in git-mirror-scheduler|git-mirror-sync|git-mirror-hosts|git-daemon) ;;
+        *) gm_error '不支持的实例服务'; return 1 ;;
+    esac
+    path=$INSTALL_ROOT/openrc/$service
+    gm_validate_file "$path" read || return 1
+    [[ -f $path && -x $path ]] || { gm_error '所需实例服务定义缺失'; return 1; }
+    rc-service --user "$path" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
+    return 0
+}
+
+# 显式恢复先停止旧服务，再按既有锁序核验实例；仅解除停止标记，不启动服务或删除 PID。
+gm_resume_instance() (
+    local run=$1 install=$2 service status
+    local -a services=(git-mirror-sync git-mirror-hosts git-daemon)
+    gm_prepare_runtime "$run" "$install" || return $?
+    command -v rc-service >/dev/null 2>&1 || { gm_error '缺少必要依赖：rc-service'; return 1; }
+    gm_load_service_capabilities "$install" || return 1
+    for service in git-mirror-sync git-mirror-hosts git-daemon; do
+        gm_validate_file "$install/openrc/$service" read || return 1
+        [[ -x $install/openrc/$service ]] || { gm_error '实例服务定义不可执行'; return 1; }
+    done
+    if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
+        gm_stop_instance_service git-mirror-scheduler || return 1
+    fi
+    gm_stop_instance_service git-mirror-sync || return 1
+    gm_stop_instance_service git-mirror-hosts || return 1
+    gm_lock_acquire instance exclusive || return $?
+    gm_lock_acquire sync exclusive || return $?
+    gm_lock_acquire hosts exclusive || return $?
+    gm_stop_instance_service git-daemon || return 1
+    gm_prepare_runtime "$run" "$install" || return $?
+    gm_load_service_capabilities "$install" || return 1
+    if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
+        services=(git-mirror-scheduler "${services[@]}")
+    fi
+    for service in "${services[@]}"; do
+        status=0
+        rc-service --user "$install/openrc/$service" status >/dev/null 2>&1 || status=$?
+        [[ $status == 3 ]] || { gm_error '实例服务未确认停止，保留停止标记'; return 1; }
+    done
+    if [[ -e $run/runtime/stopped ]]; then
+        gm_match_record "$run/runtime/stopped" 'STOPPED=1' || return 1
+        rm -- "$run/runtime/stopped" || return 1
+    fi
+    printf '%s\n' '实例已解除停止标记；服务启动由调用方显式执行。'
+    return 0
+)
+
 # 在独立环境中将有效配置传给消费者，不改变调用方环境或回写配置文件。
 gm_with_runtime_environment() (
     local run=$1 install=$2 key

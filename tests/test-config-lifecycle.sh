@@ -628,6 +628,107 @@ uninstall_behavior() {
     [[ -f $work/verified ]]
 }
 
+# 验证显式恢复 CLI 与停止意图，服务及锁桩仅记录外部边界。
+resume_lifecycle() {
+    local scenario=$1 work=$TEST_ROOT/resume-$1 status=0 output expected
+    mkdir -- "$work" || return 1
+    clear_config_environment
+    source "$ROOT/scripts/deploy-git-mirror.sh"
+    require_function gm_resume_instance || return 1
+    # 平台、私有权限和 flock 边界桩，文件与配置生命周期仍使用真实实现。
+    gm_check_platform() { return 0; }
+    gm_check_private_directory() { return 0; }
+    flock() { return 0; }
+    gm_deploy_main --install --install-root "$work/program" || return 1
+    export REPOS=git/git
+    gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
+    printf '%s\n' repository > "$work/instance/repos/sentinel"
+    source "$work/program/uninstall-git-mirror.sh"
+    gm_check_platform() { return 0; }
+    gm_check_private_directory() { return 0; }
+    # 初次默认停止成功，不运行真实 OpenRC。
+    rc-service() { return 0; }
+    gm_uninstall_main --run-root "$work/instance" || return 1
+    [[ $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
+    gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
+    [[ $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
+    output=$(gm_begin_operation sync 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 实例已停止，拒绝启动新操作' ]] || return 1
+    # 锁接口桩记录恢复锁序并模拟忙锁，不声称实际互斥已验证。
+    gm_lock_acquire() {
+        printf 'lock %s %s\n' "$1" "$2" >> "$work/calls"
+        if [[ $scenario == busy && $1 == instance ]]; then
+            printf 'git-mirror: 实例锁忙：instance\n' >&2
+            return 75
+        fi
+        return 0
+    }
+    # 服务边界桩记录停止与状态查询；返回码契约不代表真实 OpenRC 验证。
+    rc-service() {
+        [[ $# == 3 && $1 == --user && $2 == "$work/program/openrc/"* ]] || return 90
+        case "$3" in
+            stop)
+                printf 'stop %s\n' "${2##*/}" >> "$work/calls"
+                if [[ $scenario == stop-failure ]]; then return 23; fi
+                return 0
+                ;;
+            status)
+                printf 'status %s\n' "${2##*/}" >> "$work/calls"
+                case "$scenario" in
+                    still-running) return 0 ;;
+                    status-error) return 23 ;;
+                    *) return 3 ;;
+                esac
+                ;;
+            *) return 90 ;;
+        esac
+    }
+    if [[ $scenario == forged-record ]]; then
+        printf '%s\n' invalid > "$work/instance/config/installation.conf"
+    fi
+    status=0
+    gm_deploy_main --resume --install-root "$work/program" --run-root "$work/instance" > "$work/output" 2>&1 || status=$?
+    output=$(<"$work/output")
+    [[ $(<"$work/instance/repos/sentinel") == repository ]] || return 1
+    case "$scenario" in
+        success)
+            expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync\nstatus git-mirror-hosts\nstatus git-daemon'
+            [[ $status == 0 && ! -e $work/instance/runtime/stopped && $(<"$work/calls") == "$expected" ]] || {
+                printf '恢复必须在三把排他锁内确认全部服务已停止\n实际调用：\n%s\n%s\n' "$(<"$work/calls")" "$output"
+                return 1
+            }
+            : > "$work/calls"
+            gm_begin_operation sync || return 1
+            [[ $(<"$work/calls") == $'lock instance shared\nlock sync exclusive' ]] || return 1
+            ;;
+        busy)
+            [[ $status == 75 && $output == *'实例锁忙：instance'* ]] || return 1
+            [[ $(<"$work/calls") == $'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive' ]] || return 1
+            ;;
+        stop-failure)
+            [[ $status == 1 && $output == *'实例服务停止失败'* && $(<"$work/calls") == 'stop git-mirror-sync' ]] || return 1
+            ;;
+        still-running|status-error)
+            expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync'
+            [[ $status == 1 && $output == *'实例服务未确认停止，保留停止标记'* && $(<"$work/calls") == "$expected" ]] || {
+                printf '未确认服务停止时必须拒绝恢复：status=%s\n%s\n' "$status" "$output"
+                return 1
+            }
+            ;;
+        forged-record)
+            [[ $status == 1 && $output == *'安装记录缺失字段、路径冲突或身份不匹配'* && ! -e $work/calls ]] || return 1
+            ;;
+    esac
+    if [[ $scenario != success ]]; then
+        [[ $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
+    fi
+    return 0
+}
+
+for scenario in success busy stop-failure forged-record still-running status-error; do
+    check "显式恢复生命周期：$scenario（服务及锁边界桩）" resume_lifecycle "$scenario"
+done
+
 # 用真实配置读取和独立消费者进程验证服务传参，仅替换平台、私有权限与锁边界。
 service_effective_config() {
     local scenario=$1 work=$TEST_ROOT/service-config-$1 status=0 output

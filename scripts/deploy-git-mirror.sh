@@ -8,7 +8,9 @@ usage() {
     printf '%s\n' \
         '安装：deploy-git-mirror.sh --install --install-root /调用者拥有的程序目录' \
         '初始化：deploy-git-mirror.sh --init --install-root /程序目录 [--run-root /var/lib/git-daemon]' \
-        '安装无需 REPOS，不读取运行凭据；初始化的 REPOS/SHORT_LINKS 仅来自环境。'
+        '恢复：deploy-git-mirror.sh --resume --install-root /程序目录 [--run-root /var/lib/git-daemon]' \
+        '恢复仅解除停止标记，不启动服务；普通初始化保留停止意图。' \
+        '安装无需 REPOS，不读取运行凭据；初始化和恢复的 REPOS/SHORT_LINKS 仅来自环境。'
 }
 
 # 安装固定程序文件；对已有不同内容明确失败，不覆盖用户文件。
@@ -101,8 +103,8 @@ gm_deploy_main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --help|-h) usage; return 0 ;;
-            --install|--init)
-                [[ -z $mode ]] || { gm_error '安装与初始化模式只能选择一个'; return 2; }
+            --install|--init|--resume)
+                [[ -z $mode ]] || { gm_error '安装、初始化与恢复模式只能选择一个'; return 2; }
                 mode=$1; shift ;;
             --install-root|--run-root)
                 [[ $# -ge 2 && -n $2 ]] || { gm_error '路径参数缺少值'; return 2; }
@@ -115,11 +117,11 @@ gm_deploy_main() {
     gm_check_identity || return 1
     gm_check_platform || return 1
     source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
-    if [[ $mode == --install ]]; then
-        gm_install_program "$install" "$source_root"
-    else
-        gm_initialize_instance "$run" "$install"
-    fi
+    case "$mode" in
+        --install) gm_install_program "$install" "$source_root" ;;
+        --init) gm_initialize_instance "$run" "$install" ;;
+        --resume) gm_resume_instance "$run" "$install" ;;
+    esac
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

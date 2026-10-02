@@ -56,19 +56,6 @@ gm_validate_uninstall_targets() {
     return 0
 }
 
-# 仅控制安装目录中的本实例用户服务，任何停止失败均向上传播。
-gm_stop_instance_service() {
-    local service=$1 path
-    case "$service" in git-mirror-scheduler|git-mirror-sync|git-mirror-hosts|git-daemon) ;;
-        *) gm_error '不支持的实例服务'; return 1 ;;
-    esac
-    path=$INSTALL_ROOT/openrc/$service
-    gm_validate_file "$path" read || return 1
-    [[ -f $path && -x $path ]] || { gm_error '所需实例服务定义缺失'; return 1; }
-    rc-service --user "$path" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
-    return 0
-}
-
 # 默认只停止实例；显式分类清理必须通过记录、边界、停止与排他锁校验。
 gm_uninstall_main() (
     local run=${RUN_ROOT-/var/lib/git-daemon} install actual_install yes=no
