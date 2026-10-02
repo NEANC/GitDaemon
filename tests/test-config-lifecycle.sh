@@ -21,6 +21,7 @@ fi
 check() {
     local label=$1
     shift
+    if [[ -n ${TEST_FILTER-} && $label != *"$TEST_FILTER"* ]]; then return 0; fi
     CHECKS=$((CHECKS + 1))
     if ( "$@" ); then
         printf '[PASS] %s\n' "$label"
@@ -592,6 +593,58 @@ uninstall_behavior() {
     # 旧实现因 --help 退出子 Shell 时不会写此标记，应得到真实 red。
     [[ -f $work/verified ]]
 }
+
+# 权限元数据桩只替换指定节点的 stat 返回值，不声称验证 Linux ACL 或挂载。
+permission_write_boundary() {
+    local scenario=$1 work=$TEST_ROOT/permission-$1 checked fixture_permission_mode expected= output status=0
+    mkdir -p -- "$work/ancestor/protected" || return 1
+    printf '%s\n' sentinel > "$work/ancestor/protected/data"
+    case "$scenario" in
+        directory-group) checked=$work/ancestor/protected; fixture_permission_mode=770; expected='目录允许组或其他用户写入' ;;
+        directory-other) checked=$work/ancestor/protected; fixture_permission_mode=707; expected='目录允许组或其他用户写入' ;;
+        protected-sticky) checked=$work/ancestor/protected; fixture_permission_mode=1777; expected='目录允许组或其他用户写入' ;;
+        ancestor-writable) checked=$work/ancestor; fixture_permission_mode=777; expected='共享祖先缺少 sticky 保护' ;;
+        ancestor-sticky) checked=$work/ancestor; fixture_permission_mode=1777 ;;
+        ancestor-system) checked=$work/ancestor; fixture_permission_mode=755 ;;
+        file-group) checked=$work/ancestor/protected/data; fixture_permission_mode=660; expected='文件允许组或其他用户写入' ;;
+        file-other) checked=$work/ancestor/protected/data; fixture_permission_mode=606; expected='文件允许组或其他用户写入' ;;
+        normal) checked=$work/ancestor/protected/data; fixture_permission_mode=600 ;;
+        *) return 1 ;;
+    esac
+    # 只模拟目标权限及两个受信任祖先的所有者，其余元数据来自真实临时树。
+    stat() {
+        if [[ ${1-} == -c && ${3-} == -- && ${4-} == "$checked" ]]; then
+            if [[ $2 == %a ]]; then printf '%s\n' "$fixture_permission_mode"; return 0; fi
+            if [[ $2 == %u && ( $scenario == ancestor-system || $scenario == ancestor-sticky ) ]]; then
+                printf '0\n'
+                return 0
+            fi
+        fi
+        command stat "$@"
+    }
+    case "$scenario" in
+        file-*|normal) output=$(gm_validate_file "$work/ancestor/protected/data" read 2>&1) || status=$? ;;
+        *) output=$(gm_validate_path "$work/ancestor/protected" read 2>&1) || status=$? ;;
+    esac
+    [[ $(<"$work/ancestor/protected/data") == sentinel ]] || return 1
+    [[ $(stat -c %a -- "$checked") == "$fixture_permission_mode" ]] || return 1
+    if [[ -n $expected ]]; then
+        [[ $status == 1 && $output == *"$expected"* ]] || {
+            printf '权限断言失败：%s，status=%s，诊断=%s\n' "$scenario" "$status" "$output"
+            return 1
+        }
+    else
+        [[ $status == 0 && -z $output ]] || {
+            printf '正常权限对照失败：%s，status=%s，诊断=%s\n' "$scenario" "$status" "$output"
+            return 1
+        }
+    fi
+    return 0
+}
+
+for scenario in directory-group directory-other protected-sticky ancestor-writable ancestor-sticky ancestor-system file-group file-other normal; do
+    check "非授权写入边界：$scenario（权限元数据桩）" permission_write_boundary "$scenario"
+done
 
 for scenario in default repos config credentials logs confirm-no confirm-yes stop-failure busy lock-error missing-flock missing-openrc forged-record missing-record dangerous-root linked-repos; do
     check "临时实例卸载：$scenario（服务、权限及锁边界桩）" uninstall_behavior "$scenario"

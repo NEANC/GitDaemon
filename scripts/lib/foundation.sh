@@ -316,6 +316,15 @@ gm_validate_path() {
             [[ -d $current ]] || { gm_error '路径组件不是目录'; return 1; }
             owner=$(stat -c %u -- "$current") || return 1
             [[ $owner == "$EUID" || $owner == 0 ]] || { gm_error '父目录所有权异常'; return 1; }
+            local mode
+            mode=$(stat -c %a -- "$current") || return 1
+            if (( (8#$mode & 0022) != 0 )); then
+                if [[ $current == "$path" ]]; then
+                    gm_error '目录允许组或其他用户写入'
+                    return 1
+                fi
+                (( (8#$mode & 01000) != 0 )) || { gm_error '共享祖先缺少 sticky 保护'; return 1; }
+            fi
             nearest=$current
         fi
     done
@@ -331,7 +340,7 @@ gm_validate_path() {
 
 # 按读写用途校验文件，拒绝链接、特殊文件、其他所有者和硬链接。
 gm_validate_file() {
-    local file=$1 access=${2-write} links
+    local file=$1 access=${2-write} links mode
     case "$access" in read|write) ;; *) gm_error '不支持的文件访问模式'; return 1 ;; esac
     gm_validate_path "${file%/*}" "$access" || return 1
     [[ ! -L $file ]] || { gm_error '实例文件不能为符号链接'; return 1; }
@@ -340,6 +349,8 @@ gm_validate_file() {
     fi
     if [[ -e $file ]]; then
         [[ -f $file && -O $file ]] || { gm_error '实例文件类型或所有权异常'; return 1; }
+        mode=$(stat -c %a -- "$file") || return 1
+        (( (8#$mode & 0022) == 0 )) || { gm_error '文件允许组或其他用户写入'; return 1; }
         links=$(stat -c %h -- "$file") || return 1
         [[ $links == 1 ]] || { gm_error '实例文件不能为硬链接'; return 1; }
     fi
