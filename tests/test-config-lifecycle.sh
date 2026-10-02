@@ -467,6 +467,135 @@ operation_lock_order() {
     esac
 }
 
+# 所有卸载行为只运行于本测试安装、初始化并填充的临时实例。
+uninstall_behavior() {
+    local scenario=$1 work=$TEST_ROOT/uninstall-$1
+    mkdir -- "$work" || return 1
+    (
+        clear_config_environment
+        source "$ROOT/scripts/deploy-git-mirror.sh"
+        # 平台、权限及锁边界桩，不代表真实 Alpine/OpenRC/flock 集成。
+        gm_check_platform() { return 0; }
+        gm_check_private_directory() { return 0; }
+        flock() { return 0; }
+        gm_deploy_main --install --install-root "$work/program" || exit 1
+        export REPOS=git/git ENABLE_CRON=no
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
+        mkdir -p -- "$work/instance/repos/example" || exit 1
+        printf '%s\n' repository > "$work/instance/repos/example/sentinel"
+        printf '%s\n' credential-fixture > "$work/instance/secrets/sentinel"
+        printf '%s\n' log-fixture > "$work/instance/logs/sentinel"
+        printf '%s\n' 'GIT_PORT=12345' > "$work/instance/config/mirror.env"
+        printf '%s\n' outside-sentinel > "$work/outside"
+        # 旧卸载脚本会在 source 时执行；以 --help 安全终止旧实现，绝不执行旧删除流程。
+        set -- --help
+        source "$work/program/uninstall-git-mirror.sh"
+        require_function gm_uninstall_main || exit 1
+        set --
+        # 已安装入口重新加载共享实现后，重新设置明确的测试边界桩。
+        gm_check_platform() { return 0; }
+        gm_check_private_directory() { return 0; }
+        local status=0 output category run=$work/instance
+        local -a options=(--run-root "$run" --install-root "$work/program")
+        # 服务控制边界桩只允许本测试程序目录的用户模式停止调用。
+        rc-service() {
+            [[ ${1-} == --user && ${2-} == "$work/program/openrc/"* && ${3-} == stop && $# == 3 ]] || return 90
+            printf '%s\n' "$*" >> "$work/services"
+            if [[ $scenario == stop-failure ]]; then return 23; fi
+            return 0
+        }
+        # 保留真实锁文件检查，仅替换外部 flock 退出状态。
+        flock() {
+            printf '%s\n' "$*" >> "$work/locks"
+            case "$scenario" in
+                busy) return 75 ;;
+                lock-error) return 69 ;;
+                *) return 0 ;;
+            esac
+        }
+        case "$scenario" in
+            default) options+=(--yes) ;;
+            repos|config|credentials|logs) options+=("--delete-$scenario" --yes) ;;
+            confirm-no|confirm-yes) options+=(--delete-repos) ;;
+            stop-failure|busy|lock-error|missing-flock|missing-openrc|forged-record|missing-record|dangerous-root|linked-repos)
+                options+=(--delete-repos --delete-config --delete-credentials --delete-logs --yes)
+                ;;
+        esac
+        case "$scenario" in
+            missing-flock|missing-openrc)
+                # 依赖发现边界桩只隐藏指定组件，其他工具仍使用真实实现。
+                command() {
+                    if [[ ${1-} == -v ]]; then
+                        if [[ $scenario == missing-flock && ${2-} == flock ]]; then return 1; fi
+                        if [[ $scenario == missing-openrc && ${2-} == rc-service ]]; then return 1; fi
+                    fi
+                    builtin command "$@"
+                }
+                ;;
+            forged-record)
+                printf 'FORMAT=1\nMODE=instance\nUID=%s\nRUN_ROOT=%s\nINSTALL_ROOT=%s\n' "$EUID" "$work" "$work/program" > "$run/config/installation.conf"
+                ;;
+            missing-record) rm -- "$run/config/installation.conf" || exit 1 ;;
+            dangerous-root) options=(--run-root / --install-root "$work/program" --delete-repos --yes) ;;
+            linked-repos)
+                mv -- "$run/repos" "$work/preserved-repos" || exit 1
+                case "$(uname -s)" in
+                    MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$work/preserved-repos" "$run/repos" || exit 1 ;;
+                    *) ln -s -- "$work/preserved-repos" "$run/repos" || exit 1 ;;
+                esac
+                [[ -L $run/repos ]] || exit 1
+                ;;
+        esac
+        case "$scenario" in
+            confirm-no) gm_uninstall_main "${options[@]}" <<< n > "$work/output" 2>&1 || status=$? ;;
+            confirm-yes) gm_uninstall_main "${options[@]}" <<< y > "$work/output" 2>&1 || status=$? ;;
+            *) gm_uninstall_main "${options[@]}" </dev/null > "$work/output" 2>&1 || status=$? ;;
+        esac
+        output=$(<"$work/output")
+        [[ $(<"$work/outside") == outside-sentinel && $output != *credential-fixture* ]] || exit 1
+        [[ -f $work/program/git-mirror-sync.sh && -f $work/program/installation.conf ]] || exit 1
+        case "$scenario" in
+            default|confirm-no)
+                [[ $status == 0 ]] || { printf '%s\n' "$output"; exit 1; }
+                [[ -f $run/repos/example/sentinel && -f $run/config/mirror.env && -f $run/secrets/sentinel && -f $run/logs/sentinel ]] || exit 1
+                if [[ $scenario == confirm-no ]]; then [[ ! -e $work/services ]] || exit 1; fi
+                ;;
+            repos|config|credentials|logs|confirm-yes)
+                [[ $status == 0 && -s $work/services && -s $work/locks ]] || { printf '%s\n' "$output"; exit 1; }
+                [[ $output == *"$run/"* ]] || exit 1
+                for category in repos config credentials logs; do
+                    local sentinel
+                    case "$category" in
+                        repos) sentinel=$run/repos/example/sentinel ;;
+                        config) sentinel=$run/config/mirror.env ;;
+                        credentials) sentinel=$run/secrets/sentinel ;;
+                        logs) sentinel=$run/logs/sentinel ;;
+                    esac
+                    if [[ $category == "$scenario" || ( $scenario == confirm-yes && $category == repos ) ]]; then
+                        [[ ! -e $sentinel ]] || exit 1
+                    else
+                        [[ -f $sentinel ]] || exit 1
+                    fi
+                done
+                # 安装记录与锁保留，避免删除配置后丢失实例身份或更换锁 inode。
+                [[ -f $run/config/installation.conf && -d $run/runtime ]] || exit 1
+                ;;
+            *)
+                [[ $status != 0 ]] || exit 1
+                [[ -f $run/repos/example/sentinel && -f $run/config/mirror.env && -f $run/secrets/sentinel && -f $run/logs/sentinel ]] || exit 1
+                if [[ $scenario == busy ]]; then [[ $status == 75 ]] || exit 1; fi
+                if [[ $scenario == lock-error ]]; then [[ $status != 75 ]] || exit 1; fi
+                ;;
+        esac
+        printf verified > "$work/verified"
+    ) || return 1
+    # 旧实现因 --help 退出子 Shell 时不会写此标记，应得到真实 red。
+    [[ -f $work/verified ]]
+}
+
+for scenario in default repos config credentials logs confirm-no confirm-yes stop-failure busy lock-error missing-flock missing-openrc forged-record missing-record dangerous-root linked-repos; do
+    check "临时实例卸载：$scenario（服务、权限及锁边界桩）" uninstall_behavior "$scenario"
+done
 check '同步服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-sync
 check '刷新服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-hosts
 check 'daemon 使用实例仓库和运行路径（仅定义接线）' service_instance_paths git-daemon
