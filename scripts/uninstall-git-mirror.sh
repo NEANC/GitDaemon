@@ -63,7 +63,7 @@ gm_stop_instance_service() {
         *) gm_error '不支持的实例服务'; return 1 ;;
     esac
     path=$INSTALL_ROOT/openrc/$service
-    gm_validate_file "$path" || return 1
+    gm_validate_file "$path" read || return 1
     [[ -f $path && -x $path ]] || { gm_error '所需实例服务定义缺失'; return 1; }
     rc-service --user "$path" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
     return 0
@@ -107,12 +107,12 @@ gm_uninstall_main() (
     gm_load_config "$run/config/mirror.env" || return 1
     gm_set_instance_environment "$run" "$install"
     for service in git-mirror-sync git-mirror-hosts git-daemon; do
-        gm_validate_file "$install/openrc/$service" || return 1
+        gm_validate_file "$install/openrc/$service" read || return 1
         [[ -f $install/openrc/$service && -x $install/openrc/$service ]] || { gm_error '实例服务定义缺失'; return 1; }
     done
     # 完整调度留待后续实现；启用调度而缺少可停止的服务时必须失败关闭。
     if [[ ${GM_CONFIG[ENABLE_CRON]} == yes ]]; then
-        gm_validate_file "$install/openrc/git-mirror-scheduler" || return 1
+        gm_validate_file "$install/openrc/git-mirror-scheduler" read || return 1
         [[ -f $install/openrc/git-mirror-scheduler && -x $install/openrc/git-mirror-scheduler ]] || {
             gm_error '调度已启用但缺少可核验的调度服务，拒绝清理'
             return 1
