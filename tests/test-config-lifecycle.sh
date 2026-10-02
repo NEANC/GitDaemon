@@ -246,20 +246,13 @@ identity_current_user() {
     gm_check_identity
 }
 
-# 验证 Git Bash 无法冒充 Alpine；此项不是 Alpine 正向集成验证。
+# 以明确的 uname 边界桩验证非 Alpine 拒绝，不依赖测试宿主平台。
 platform_non_alpine_rejected() {
     require_function gm_check_platform || return 1
-    case "$(uname -s)" in
-        MINGW*|MSYS*)
-            local output status=0
-            output=$(gm_check_platform 2>&1) || status=$?
-            [[ $status == 1 && $output == 'git-mirror: 仅支持 Alpine Linux' ]] || return 1
-            ;;
-        *)
-            printf '本用例要求已确认的 Git Bash 非 Alpine 环境\n'
-            return 1
-            ;;
-    esac
+    uname() { printf 'MINGW64_NT\n'; }
+    local output status=0
+    output=$(gm_check_platform 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 仅支持 Alpine Linux' ]]
 }
 
 # 在明确的平台边界桩下验证安装只写独立程序根，不依赖运行配置。
@@ -395,7 +388,7 @@ lock_name_rejected() {
     [[ ! -e $work/called && ! -e $work/outside && ! -e $work/outside.lock ]]
 }
 
-# 验证关键运行入口在真实非 Alpine 平台拒绝，且尚未产生写入。
+# 以 uname 边界桩验证关键运行入口拒绝非 Alpine，且尚未产生写入。
 entry_platform_rejected_before_write() {
     local script=$1 work=$TEST_ROOT/platform-$1 status=0 output
     mkdir -- "$work" || return 1
@@ -407,7 +400,9 @@ entry_platform_rejected_before_write() {
         git() {
             if [[ ${1-} == check-ref-format ]]; then command git "$@"; else return 97; fi
         }
-        export -f curl git
+        # 平台边界桩仅注入操作系统名称，仍执行真实生产平台检查。
+        uname() { printf 'MINGW64_NT\n'; }
+        export -f curl git uname
         bash "$ROOT/scripts/$script"
     ) > "$work/output" 2>&1 || status=$?
     output=$(<"$work/output")
@@ -1114,7 +1109,7 @@ check '普通文件不能充当实例路径' path_file_rejected
 check '实际 UID 为零拒绝（身份边界桩）' identity_root_rejected real
 check '有效 UID 为零拒绝（身份边界桩）' identity_root_rejected effective
 check '当前真实非零身份通过' identity_current_user
-check 'Git Bash 非 Alpine 平台拒绝' platform_non_alpine_rejected
+check '非 Alpine 平台拒绝（uname 边界桩）' platform_non_alpine_rejected
 check '安装不要求 REPOS、不读取凭据、不创建运行目录（平台边界桩）' install_without_runtime_config
 check '重复初始化保留配置与实例环境（平台边界桩）' initialize_preserves_config
 check '同步入口加载无副作用并提供显式主函数' entry_source_safe git-mirror-sync.sh gm_sync_main
