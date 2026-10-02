@@ -78,7 +78,7 @@ gm_validate_address() {
         if [[ $value == *::* ]]; then
             left=${value%%::*}
             right=${value#*::}
-            [[ $right != *::* ]] || return 1
+            [[ $left != :* && $right != *: && $right != *::* ]] || return 1
             if [[ -n $left ]]; then IFS=: read -r -a left_parts <<< "$left"; fi
             if [[ -n $right ]]; then IFS=: read -r -a right_parts <<< "$right"; fi
             parts=("${left_parts[@]}" "${right_parts[@]}")

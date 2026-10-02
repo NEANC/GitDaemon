@@ -594,6 +594,39 @@ uninstall_behavior() {
     [[ -f $work/verified ]]
 }
 
+# 同时验证真实地址校验器与文件配置读取，非法文件不能被环境覆盖掩盖。
+ipv6_config_boundary() {
+    local address=$1 expected_status=$2 direct_status=0 config_status=0 output
+    local file=$TEST_ROOT/ipv6.conf before
+    clear_config_environment
+    printf 'LISTEN_ADDRESS=%s\n' "$address" > "$file"
+    before=$(<"$file")
+    gm_validate_address "$address" || direct_status=$?
+    [[ $direct_status == "$expected_status" ]] || {
+        printf 'IPv6 校验返回异常：%s，实际=%s，预期=%s\n' "$address" "$direct_status" "$expected_status"
+        return 1
+    }
+    if [[ $expected_status == 0 ]]; then
+        gm_load_config "$file" || return 1
+        [[ ${GM_CONFIG[LISTEN_ADDRESS]} == "$address" ]] || return 1
+    else
+        export LISTEN_ADDRESS=127.0.0.1
+        output=$(gm_load_config "$file" 2>&1) || config_status=$?
+        [[ $config_status == 1 && $output == 'git-mirror: 配置值非法：LISTEN_ADDRESS' ]] || {
+            printf 'IPv6 配置拒绝异常：%s，status=%s，诊断=%s\n' "$address" "$config_status" "$output"
+            return 1
+        }
+    fi
+    [[ $(<"$file") == "$before" ]]
+}
+
+for address in '::' '::1' '1::' '2001:db8::1'; do
+    check "IPv6 合法地址及配置读取：$address" ipv6_config_boundary "$address" 0
+done
+for address in '::1:' '1::2:' ':1::2' ':1:2:3:4:5:6:7'; do
+    check "IPv6 非法地址及配置拒绝：$address" ipv6_config_boundary "$address" 1
+done
+
 # 权限元数据桩只替换指定节点的 stat 返回值，不声称验证 Linux ACL 或挂载。
 permission_write_boundary() {
     local scenario=$1 work=$TEST_ROOT/permission-$1 checked fixture_permission_mode expected= output status=0
