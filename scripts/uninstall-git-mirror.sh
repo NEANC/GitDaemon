@@ -13,10 +13,15 @@ gm_uninstall_usage() {
         '--yes 仅代替确认，不绕过身份、路径、停止或锁检查。'
 }
 
-# 递归预检选中目录，拒绝链接、异常身份、特殊文件及跨设备子树。
+# 递归预检选中目录，仅放行已登记相对短链接，拒绝异常身份、特殊文件及跨设备子树。
 gm_validate_cleanup_tree() (
-    local path=$1 device=$2 actual child
-    [[ ! -L $path ]] || { gm_error '清理目标包含符号链接'; return 1; }
+    local path=$1 device=$2 run=$3 actual child
+    if [[ -L $path ]]; then
+        gm_validate_managed_link "$run" "$path" || return 1
+        actual=$(stat -c %d -- "$path") || return 1
+        [[ $actual == "$device" ]] || { gm_error '清理目标包含跨设备挂载'; return 1; }
+        return 0
+    fi
     [[ -e $path ]] || return 0
     [[ -O $path ]] || { gm_error '清理目标所有权异常'; return 1; }
     actual=$(stat -c %d -- "$path") || return 1
@@ -25,7 +30,7 @@ gm_validate_cleanup_tree() (
         gm_validate_path "$path" || return 1
         shopt -s nullglob dotglob
         for child in "$path"/*; do
-            gm_validate_cleanup_tree "$child" "$device" || return 1
+            gm_validate_cleanup_tree "$child" "$device" "$run" || return 1
         done
     elif [[ -f $path ]]; then
         gm_validate_file "$path" || return 1
@@ -51,7 +56,7 @@ gm_validate_uninstall_targets() {
             "$run/repos"|"$run/secrets"|"$run/logs"|"$run/config/mirror.env") ;;
             *) gm_error '目标不属于允许清理的实例类别'; return 1 ;;
         esac
-        gm_validate_cleanup_tree "$target" "$device" || return 1
+        gm_validate_cleanup_tree "$target" "$device" "$run" || return 1
     done
     return 0
 }
@@ -60,7 +65,7 @@ gm_validate_uninstall_targets() {
 gm_uninstall_main() (
     local run=${RUN_ROOT-/var/lib/git-daemon} install actual_install yes=no
     local delete_repos=no delete_config=no delete_credentials=no delete_logs=no
-    local target answer executable service
+    local target answer executable service link
     local -a targets=()
     actual_install=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
     install=$actual_install
@@ -125,7 +130,19 @@ gm_uninstall_main() (
     for target in "${targets[@]}"; do
         case "$target" in
             "$run/config/mirror.env") rm -f -- "$target" || return 1 ;;
-            "$run/repos"|"$run/secrets"|"$run/logs") rm -rf -- "$target" || return 1 ;;
+            "$run/repos")
+                # 全部类别已预检；先 unlink 已登记链接，不沿链接进入仓库目标。
+                shopt -s nullglob dotglob
+                for link in "$run/repos"/*; do
+                    if [[ -L $link ]]; then
+                        gm_validate_managed_link "$run" "$link" || return 1
+                        rm -- "$link" || return 1
+                        rm -- "$run/config/managed-links/${link##*/}" || return 1
+                    fi
+                done
+                rm -rf -- "$target" || return 1
+                ;;
+            "$run/secrets"|"$run/logs") rm -rf -- "$target" || return 1 ;;
             *) gm_error '拒绝非允许目标'; return 1 ;;
         esac
     done

@@ -628,6 +628,97 @@ uninstall_behavior() {
     [[ -f $work/verified ]]
 }
 
+# 验证分类删除消费纯数据链接记录，不跟随链接且不触碰实例外目标。
+managed_link_cleanup() {
+    local scenario=$1 work=$TEST_ROOT/managed-link-$1 status=0 output target=owner/repo.git
+    local expected= record_target=owner/repo.git
+    mkdir -- "$work" || return 1
+    clear_config_environment
+    source "$ROOT/scripts/deploy-git-mirror.sh"
+    # 平台、私有权限和服务锁为边界桩；记录、链接及删除执行真实实现。
+    gm_check_platform() { return 0; }
+    gm_check_private_directory() { return 0; }
+    flock() { return 0; }
+    gm_deploy_main --install --install-root "$work/program" || return 1
+    export REPOS=owner/repo
+    gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
+    mkdir -p -- "$work/instance/repos/owner/repo.git" "$work/instance/config/managed-links" "$work/outside" || return 1
+    printf '%s\n' repository > "$work/instance/repos/owner/repo.git/sentinel"
+    printf '%s\n' published > "$work/instance/repos/owner/repo.git/git-daemon-export-ok"
+    printf '%s\n' outside > "$work/outside/sentinel"
+    case "$scenario" in
+        valid) ;;
+        unknown) expected='未登记短链接' ;;
+        dangling) target=owner/missing.git; record_target=$target; expected='受管理短链接目标不存在' ;;
+        outside) target=../../outside; record_target=$target; expected='短链接管理记录目标非法' ;;
+        mismatch) target=owner; expected='短链接实际目标与管理记录不一致' ;;
+        *) return 1 ;;
+    esac
+    if [[ $scenario != unknown ]]; then
+        gm_create_data_file "$work/instance/config/managed-links/alias" "$(printf 'FORMAT=1\nTARGET=%s' "$record_target")" || return 1
+    fi
+    # Git Bash 链接表示仅提供本地行为证据，不等同于 Linux 原生链接验收。
+    case "$(uname -s)" in
+        MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$target" "$work/instance/repos/alias" || return 1 ;;
+        *) ln -s -- "$target" "$work/instance/repos/alias" || return 1 ;;
+    esac
+    [[ -L $work/instance/repos/alias ]] || return 1
+    source "$work/program/uninstall-git-mirror.sh"
+    gm_check_platform() { return 0; }
+    gm_check_private_directory() { return 0; }
+    # 记录跨层停止与锁序，拒绝其他实例及非停止服务操作。
+    rc-service() {
+        [[ $# == 3 && $1 == --user && $2 == "$work/program/openrc/"* && $3 == stop ]] || return 90
+        printf 'stop %s\n' "${2##*/}" >> "$work/calls"
+        return 0
+    }
+    gm_lock_acquire() {
+        printf 'lock %s %s\n' "$1" "$2" >> "$work/calls"
+        return 0
+    }
+    gm_uninstall_main --run-root "$work/instance" --delete-repos --yes > "$work/output" 2>&1 || status=$?
+    output=$(<"$work/output")
+    [[ $(<"$work/outside/sentinel") == outside ]] || return 1
+    [[ -f $work/instance/config/mirror.env && -f $work/instance/config/installation.conf ]] || return 1
+    [[ -f $work/program/installation.conf ]] || return 1
+    if [[ $scenario == valid ]]; then
+        expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon'
+        [[ $status == 0 && ! -e $work/instance/repos && ! -L $work/instance/repos ]] || {
+            printf '合法受管理相对链接必须允许分类删除：status=%s\n%s\n' "$status" "$output"
+            return 1
+        }
+        [[ $(<"$work/calls") == "$expected" && $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
+        [[ ! -e $work/instance/config/managed-links/alias ]] || return 1
+    else
+        [[ $status == 1 && $output == *"$expected"* ]] || {
+            printf '链接拒绝原因不符：预期=%s，status=%s\n%s\n' "$expected" "$status" "$output"
+            return 1
+        }
+        [[ ! -e $work/calls && ! -e $work/instance/runtime/stopped ]] || return 1
+        [[ -L $work/instance/repos/alias && $(readlink -- "$work/instance/repos/alias") == "$target" ]] || return 1
+        [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 1
+    fi
+    return 0
+}
+
+# 已有 owner 目录即使有同名管理记录也不是可解除的链接对象。
+managed_link_owner_preserved() {
+    local run=$TEST_ROOT/managed-owner status=0 output
+    mkdir -p -- "$run/repos/git/git.git" "$run/config/managed-links" || return 1
+    printf '%s\n' repository > "$run/repos/git/git.git/sentinel"
+    gm_create_data_file "$run/config/managed-links/git" $'FORMAT=1\nTARGET=git/git.git' || return 1
+    output=$(gm_validate_managed_link "$run" "$run/repos/git" 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 受管理短链接对象类型异常' ]] || return 1
+    [[ -d $run/repos/git && ! -L $run/repos/git ]] || return 1
+    [[ $(<"$run/repos/git/git.git/sentinel") == repository ]] || return 1
+    gm_match_record "$run/config/managed-links/git" $'FORMAT=1\nTARGET=git/git.git'
+}
+
+for scenario in valid unknown dangling outside mismatch; do
+    check "受管理链接分类删除：$scenario（服务和锁边界桩）" managed_link_cleanup "$scenario"
+done
+check '受管理链接分类删除：owner 目录保持原状' managed_link_owner_preserved
+
 # 验证显式恢复 CLI 与停止意图，服务及锁桩仅记录外部边界。
 resume_lifecycle() {
     local scenario=$1 work=$TEST_ROOT/resume-$1 status=0 output expected

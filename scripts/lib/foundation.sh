@@ -263,6 +263,36 @@ gm_parse_repos() {
     return 0
 }
 
+# 清理仅接受 repos 根下已登记的相对链接；记录是数据，不作为配置或代码加载。
+# 创建者须在实例排他锁内用 gm_create_data_file 写入 config/managed-links/短名，
+# 内容固定为 FORMAT=1 换行 TARGET=owner/repo.git；不得覆盖同名 owner 目录。
+gm_validate_managed_link() {
+    local run=$1 path=$2 name record content target actual owner
+    [[ ${path%/*} == "$run/repos" ]] || { gm_error '未登记短链接'; return 1; }
+    name=${path##*/}
+    [[ $name =~ ^[A-Za-z0-9._-]+$ && $name != . && $name != *..* && $name != *.git ]] || {
+        gm_error '未登记短链接'; return 1;
+    }
+    gm_validate_path "$run/repos" read || return 1
+    [[ -L $path ]] || { gm_error '受管理短链接对象类型异常'; return 1; }
+    owner=$(stat -c %u -- "$path") || return 1
+    [[ $owner == "$EUID" ]] || { gm_error '短链接所有权异常'; return 1; }
+    record=$run/config/managed-links/$name
+    [[ -e $record || -L $record ]] || { gm_error '未登记短链接'; return 1; }
+    gm_validate_file "$record" read || return 1
+    content=$(<"$record")
+    [[ $content == $'FORMAT=1\nTARGET='* ]] || { gm_error '短链接管理记录格式非法'; return 1; }
+    target=${content#*$'\nTARGET='}
+    [[ $target == *.git ]] && gm_validate_repo_name "${target%.git}" || {
+        gm_error '短链接管理记录目标非法'; return 1;
+    }
+    actual=$(readlink -- "$path") || return 1
+    [[ $actual == "$target" ]] || { gm_error '短链接实际目标与管理记录不一致'; return 1; }
+    [[ -d $run/repos/$target ]] || { gm_error '受管理短链接目标不存在'; return 1; }
+    gm_validate_path "$run/repos/$target" read || return 1
+    return 0
+}
+
 # 同时核对 Shell 身份和操作系统实际、有效身份，拒绝任何零 UID。
 gm_check_identity() {
     local actual effective
