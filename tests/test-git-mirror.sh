@@ -17,6 +17,9 @@ done
 if ! bash "$ROOT/tests/test-config-lifecycle.sh"; then
     fail '配置与生命周期行为测试'
 fi
+if ! bash "$ROOT/tests/test-openrc-config.sh"; then
+    fail 'OpenRC 交付入口配置行为测试（外部边界桩）'
+fi
 if ! bash "$ROOT/tests/test-readonly-install.sh"; then
     fail '只读程序层边界测试'
 fi

@@ -489,7 +489,8 @@ service_instance_paths() {
             git-mirror-hosts) [[ $command == "$INSTALL_ROOT/update-github-hosts.sh" ]] ;;
             git-daemon)
                 [[ $pidfile == "$XDG_RUNTIME_DIR/git-daemon.pid" ]] || exit 1
-                [[ $command_args == *"--base-path=$RUN_ROOT/repos"* && $command_args == *'--port=12345'* ]]
+                [[ $command == /usr/bin/git ]] || exit 1
+                declare -F start_pre >/dev/null
                 ;;
         esac
     )
@@ -962,8 +963,7 @@ service_effective_config() {
     esac
     cp -- "$work/instance/config/mirror.env" "$work/before" || return 1
     gm_with_runtime_environment "$work/instance" "$work/program" bash -c '
-        source "$INSTALL_ROOT/openrc/git-daemon" || exit 1
-        printf "%s\n" "$command_args" "$TZ" "$ENABLE_CRON" "$CRON_SCHEDULE" "$pidfile" > "$1"
+        printf "%s\n" "--port=$GIT_PORT --listen=$LISTEN_ADDRESS --base-path=$RUN_ROOT/repos" "$TZ" "$ENABLE_CRON" "$CRON_SCHEDULE" "$XDG_RUNTIME_DIR/git-daemon.pid" > "$1"
     ' service-consumer "$work/consumer" > "$work/output" 2>&1 || status=$?
     output=$(<"$work/output")
     cmp -s -- "$work/before" "$work/instance/config/mirror.env" || return 1
@@ -992,7 +992,7 @@ service_effective_config() {
 }
 
 for scenario in defaults file environment invalid; do
-    check "有效配置传递到服务：$scenario（平台和锁边界桩）" service_effective_config "$scenario"
+    check "有效配置辅助接口（非生产接线）：$scenario（平台和锁边界桩）" service_effective_config "$scenario"
 done
 
 # 同时验证真实地址校验器与文件配置读取，非法文件不能被环境覆盖掩盖。

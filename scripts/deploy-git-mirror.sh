@@ -16,7 +16,7 @@ usage() {
 # 安装固定程序文件；对已有不同内容明确失败，不覆盖用户文件。
 gm_install_program() {
     local install=$1 source_root=$2 file directory record
-    local -a files=(deploy-git-mirror.sh uninstall-git-mirror.sh git-mirror-sync.sh update-github-hosts.sh lib/foundation.sh openrc/git-daemon openrc/git-mirror-sync openrc/git-mirror-hosts)
+    local -a files=(deploy-git-mirror.sh uninstall-git-mirror.sh git-daemon-config.sh git-mirror-sync.sh update-github-hosts.sh lib/foundation.sh openrc/git-daemon openrc/git-mirror-sync openrc/git-mirror-hosts)
     [[ $install != "${HOME:-/}" ]] || { gm_error '不能将用户 HOME 作为安装根'; return 1; }
     gm_validate_path "$install" || return 1
     for directory in lib openrc; do gm_validate_path "$install/$directory" || return 1; done
