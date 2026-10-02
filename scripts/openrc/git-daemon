@@ -7,7 +7,14 @@ pidfile="${XDG_RUNTIME_DIR:?必须提供实例运行目录}/git-daemon.pid"
 # 在后台启动之前读取并验证配置；只读取数据行，不 source 或 eval 配置输出。
 start_pre() {
     local effective_config
-    effective_config=$("${INSTALL_ROOT:?必须提供独立程序安装路径}/git-daemon-config.sh") || return $?
+    effective_config=$(
+        # 仅传递校验所需状态，在启动任何外部程序前清除 Token。
+        token_state=empty
+        if [ -n "${GITHUB_TOKEN-}" ]; then token_state=present; fi
+        case ${GITHUB_TOKEN-} in *[[:cntrl:]]*) token_state=invalid ;; esac
+        unset GITHUB_TOKEN
+        "${INSTALL_ROOT:?必须提供独立程序安装路径}/git-daemon-config.sh" "--token-state=$token_state"
+    ) || return $?
     {
         IFS= read -r GIT_PORT
         IFS= read -r LISTEN_ADDRESS

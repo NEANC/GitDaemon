@@ -50,7 +50,20 @@ printf '%s\0' "$@" > "$SERVICE_CAPTURE/argv"
 printf '%s\n' "${TZ-unset}" "${GITHUB_TOKEN+present}" "${GITHUB_TOKEN_FILE+present}" > "$SERVICE_CAPTURE/environment"
 FIXTURE
     chmod 755 -- "$work/boundary/git" || return 1
+    local executable real_executable
+    for executable in dirname id stat realpath; do
+        real_executable=$(command -v "$executable") || return 1
+        # 包装真实预检命令，只记录凭据变量存在性，不保存凭据值。
+        printf '#!/usr/bin/env bash\nprintf "%%s:%%s\\n" "%s" "${GITHUB_TOKEN+present}" >> "$SERVICE_CAPTURE/preflight-environment"\nbuiltin exec %q "$@"\n' \
+            "$executable" "$real_executable" > "$work/boundary/$executable"
+        chmod 755 -- "$work/boundary/$executable" || return 1
+    done
+    export PATH="$work/boundary:$PATH"
     cat > "$work/boundary/bash-env" <<'FIXTURE'
+# 在配置脚本执行第一条语句前捕获入口环境，不替生产代码清理凭据。
+if [[ $0 == "$INSTALL_ROOT/git-daemon-config.sh" ]]; then
+    printf 'config:%s\n' "${GITHUB_TOKEN+present}" >> "$SERVICE_CAPTURE/preflight-environment"
+fi
 # 真实入口加载真实共享模块后，仅替换宿主无法提供的外部边界。
 source() {
     builtin source "$@" || return $?
@@ -95,6 +108,31 @@ run_service() {
     '
 }
 
+# 检查配置入口和真实预检命令包装器记录的环境，不输出凭据值。
+assert_preflight_environment() {
+    local boundary presence failed=0
+    local -A seen=() reported=()
+    [[ -s $work/capture/preflight-environment ]] || {
+        printf '缺少配置与预检进程环境证据\n'; return 1;
+    }
+    while IFS=: read -r boundary presence; do
+        seen[$boundary]=1
+        if [[ -n $presence ]]; then
+            if [[ ! ${reported[$boundary]-} ]]; then
+                printf '前置进程不应继承 Token：%s\n' "$boundary"
+                reported[$boundary]=1
+            fi
+            failed=1
+        fi
+    done < "$work/capture/preflight-environment"
+    for boundary in config dirname id stat realpath; do
+        [[ ${seen[$boundary]-} == 1 ]] || {
+            printf '未捕获必要进程环境：%s\n' "$boundary"; failed=1;
+        }
+    done
+    [[ $failed == 0 ]]
+}
+
 # 从安装后的服务定义启动，核验真实最终参数、时区、拒绝行为和配置字节保持。
 daemon_configuration() {
     local scenario=$1 work=$TEST_ROOT/$1 status=0 output
@@ -127,12 +165,66 @@ daemon_configuration() {
             expected_error='git-mirror: 有效配置值非法：GIT_PORT'
             ;;
         token) export GITHUB_TOKEN=service-sensitive-fixture ;;
+        token-invalid-port)
+            export GITHUB_TOKEN=service-sensitive-fixture
+            printf '%s\n' 'GIT_PORT=80' > "$RUN_ROOT/config/mirror.env"
+            expected_error='git-mirror: 配置值非法：GIT_PORT'
+            ;;
+        token-file-conflict)
+            export GITHUB_TOKEN=service-sensitive-fixture
+            printf 'GITHUB_TOKEN_FILE=%s\n' "$RUN_ROOT/secrets/token" >> "$RUN_ROOT/config/mirror.env"
+            expected_error='git-mirror: GITHUB_TOKEN 与 GITHUB_TOKEN_FILE 互斥'
+            ;;
+        token-environment-conflict)
+            export GITHUB_TOKEN=service-sensitive-fixture GITHUB_TOKEN_FILE=$RUN_ROOT/secrets/token
+            expected_error='git-mirror: GITHUB_TOKEN 与 GITHUB_TOKEN_FILE 互斥'
+            ;;
+        token-control)
+            export GITHUB_TOKEN=$'service-sensitive-fixture\n'
+            expected_error='git-mirror: 凭据包含非法控制字符'
+            ;;
+        token-empty)
+            export GITHUB_TOKEN=
+            ;;
+        credential-file|credential-override|credential-empty|credential-missing)
+            printf 'GITHUB_TOKEN_FILE=%s\n' "$RUN_ROOT/secrets/token" >> "$RUN_ROOT/config/mirror.env"
+            if [[ $scenario != credential-missing ]]; then
+                printf '%s\n' service-file-fixture > "$RUN_ROOT/secrets/token"
+            fi
+            case "$scenario" in
+                credential-override)
+                    printf 'GITHUB_TOKEN_FILE=%s\n' "$RUN_ROOT/secrets/not-used" > "$RUN_ROOT/config/mirror.env"
+                    export GITHUB_TOKEN_FILE=$RUN_ROOT/secrets/token
+                    expected_port=9418; expected_address=0.0.0.0; expected_timezone=Asia/Shanghai
+                    ;;
+                credential-empty)
+                    export GITHUB_TOKEN_FILE=
+                    expected_error='git-mirror: 不能以显式空值清除已配置凭据来源'
+                    ;;
+                credential-missing) expected_error='git-mirror: 凭据文件不存在或不可读' ;;
+            esac
+            ;;
+        credential-invalid)
+            export GITHUB_TOKEN_FILE=relative-token
+            expected_error='git-mirror: 有效配置值非法：GITHUB_TOKEN_FILE'
+            ;;
         file) ;;
         *) return 1 ;;
     esac
     cp -- "$RUN_ROOT/config/mirror.env" "$work/config.before" || return 1
+    local token_before=${GITHUB_TOKEN+x}:${GITHUB_TOKEN-}
+    local token_file_before=${GITHUB_TOKEN_FILE+x}:${GITHUB_TOKEN_FILE-}
     run_service > "$work/output" 2>&1 || status=$?
     output=$(<"$work/output")
+    [[ ${GITHUB_TOKEN+x}:${GITHUB_TOKEN-} == "$token_before" && ${GITHUB_TOKEN_FILE+x}:${GITHUB_TOKEN_FILE-} == "$token_file_before" ]] || {
+        printf '服务启动意外修改了调用者凭据环境\n'; return 1;
+    }
+    [[ $output != *service-sensitive-fixture* && $output != *service-file-fixture* ]] || {
+        printf '服务诊断包含测试凭据值\n'; return 1;
+    }
+    if [[ ${SERVICE_DISCONNECT-} != 1 ]]; then
+        assert_preflight_environment || return 1
+    fi
     cmp -s -- "$work/config.before" "$RUN_ROOT/config/mirror.env" || {
         printf '服务启动改写了配置文件\n'; return 1;
     }
@@ -201,6 +293,7 @@ worker_configuration() {
 # Git 与下载边界不联网，记录真实同步、刷新入口传来的配置。
 git() {
     printf '%s\n' "${TZ-unset}" >> "$SERVICE_CAPTURE/worker-timezone"
+    printf '%s\n' "${GITHUB_TOKEN+present}" >> "$SERVICE_CAPTURE/worker-token"
     return 0
 }
 curl() {
@@ -210,6 +303,7 @@ curl() {
 }
 FIXTURE
     mkdir -p -- "$RUN_ROOT/repos/git/git.git" || return 1
+    if [[ $service == git-mirror-sync ]]; then export GITHUB_TOKEN=service-sensitive-fixture; fi
     bash -c 'source "$INSTALL_ROOT/openrc/$1" || exit $?; "$command"' worker "$service" > "$work/output" 2>&1 || status=$?
     [[ $status == 0 && -s $work/capture/worker-timezone ]] || {
         printf '工作服务配置调用失败：%s，status=%s\n%s\n' "$service" "$status" "$(<"$work/output")"
@@ -219,6 +313,11 @@ FIXTURE
     while IFS= read -r timezone; do [[ $timezone == UTC ]] || return 1; done < "$work/capture/worker-timezone"
     if [[ $service == git-mirror-hosts ]]; then
         [[ $(<"$work/capture/curl-argv") == *'https://example.invalid/service-config'* ]] || return 1
+    else
+        [[ -s $work/capture/worker-token && $GITHUB_TOKEN == service-sensitive-fixture ]] || return 1
+        local presence
+        while IFS= read -r presence; do [[ $presence == present ]] || return 1; done < "$work/capture/worker-token"
+        [[ $(<"$work/output") != *service-sensitive-fixture* ]] || return 1
     fi
     cmp -s -- "$work/config.before" "$RUN_ROOT/config/mirror.env"
 }
@@ -226,7 +325,7 @@ FIXTURE
 check '同步交付入口使用文件时区（外部边界桩）' worker_configuration git-mirror-sync
 check '刷新交付入口使用文件 URL 与时区（外部边界桩）' worker_configuration git-mirror-hosts
 check 'OpenRC 生产接线断开必须失败（故障注入）' disconnected_wiring_guard
-for scenario in file defaults environment invalid-address invalid-port empty-environment token; do
+for scenario in file defaults environment invalid-address invalid-port empty-environment token token-invalid-port token-file-conflict token-environment-conflict token-control token-empty credential-file credential-override credential-empty credential-missing credential-invalid; do
     check "OpenRC 交付入口配置：$scenario（外部边界桩，非 Alpine 集成）" daemon_configuration "$scenario"
 done
 printf 'OpenRC 入口行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
