@@ -6,8 +6,17 @@ pass() { printf '[PASS] %s\n' "$1"; }
 fail() { printf '[FAIL] %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
 assert_contains() { grep -Fq -- "$2" "$1" && pass "$3" || fail "$3"; }
 assert_absent() { grep -Eiq -- "$2" "$1" && fail "$3" || pass "$3"; }
-for file in "$ROOT"/scripts/*.sh; do bash -n "$file" || exit 1; done
-pass 'Shell 脚本语法'
+for file in "$ROOT"/scripts/*.sh "$ROOT"/scripts/lib/*.sh "$ROOT"/tests/*.sh; do
+    bash -n "$file" || exit 1
+    pass "Bash 语法：${file#"$ROOT"/}"
+done
+for file in "$ROOT"/scripts/openrc/*; do
+    sh -n "$file" || exit 1
+    pass "OpenRC 定义 Shell 语法（非运行验证）：${file#"$ROOT"/}"
+done
+if ! bash "$ROOT/tests/test-config-lifecycle.sh"; then
+    fail '配置与生命周期行为测试'
+fi
 assert_contains "$ROOT/scripts/deploy-git-mirror.sh" 'REPOS' '部署使用 REPOS 环境变量'
 assert_absent "$ROOT/scripts/deploy-git-mirror.sh" 'systemd|systemctl|apt|yum|sudo|su |doas|SSH|ssh-key|REPOS_FILE' '部署移除非 Alpine 配置与 SSH 回退'
 assert_absent "$ROOT/scripts/uninstall-git-mirror.sh" 'systemd|systemctl|apt|yum|sudo|su |doas|/etc/hosts|resolv.conf' '卸载仅操作 OpenRC 文件和应用数据'
