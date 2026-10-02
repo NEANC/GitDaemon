@@ -1,4 +1,4 @@
 #!/sbin/openrc-run
-command="/usr/local/bin/update-github-hosts.sh"
+command="${INSTALL_ROOT:?必须提供独立程序安装路径}/update-github-hosts.sh"
 command_background=false
 depend() { need localmount; after firewall; }

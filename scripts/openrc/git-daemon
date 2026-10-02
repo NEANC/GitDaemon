@@ -1,6 +1,6 @@
 #!/sbin/openrc-run
 name="git-daemon"
 command="/usr/bin/git"
-command_args="daemon --reuseaddr --base-path=${MIRROR_ROOT:-/srv/git-mirror} --export-all --informative-errors --verbose --listen=${LISTEN_ADDRESS:-0.0.0.0} --port=${GIT_PORT:-9418}"
+command_args="daemon --reuseaddr --base-path=${RUN_ROOT:?必须提供实例运行根}/repos --export-all --informative-errors --verbose --listen=${LISTEN_ADDRESS:-0.0.0.0} --port=${GIT_PORT:-9418}"
 command_background=true
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="${XDG_RUNTIME_DIR:?必须提供实例运行目录}/git-daemon.pid"

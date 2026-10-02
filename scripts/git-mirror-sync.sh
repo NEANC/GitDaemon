@@ -60,17 +60,17 @@ report_branches() {
 }
 
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
-gm_sync_main() {
-    local index failed=0
+gm_sync_main() (
+    local index failed=0 install
     if [[ ${1-} == --help || ${1-} == -h ]]; then
         printf '%s\n' '用法：git-mirror-sync.sh；REPOS/SHORT_LINKS 仅来自当前环境'
         return 0
     fi
     [[ $# == 0 ]] || { gm_error '同步入口不接受此参数'; return 2; }
-    RUN_ROOT=${RUN_ROOT-/var/lib/git-daemon}
+    install=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
+    gm_prepare_runtime "${RUN_ROOT-/var/lib/git-daemon}" "$install" || return 1
+    gm_begin_operation sync || return $?
     CONFIG_DIR=$RUN_ROOT/config
-    gm_load_config "$CONFIG_DIR/mirror.env" || return 1
-    gm_parse_repos "${REPOS-}" "${SHORT_LINKS-}" || return 1
     MIRROR_ROOT=$RUN_ROOT/repos
     LOG_DIR=$RUN_ROOT/logs
     RUN_DIR=$RUN_ROOT/runtime
@@ -78,14 +78,11 @@ gm_sync_main() {
     LOCK_FILE=$RUN_DIR/sync.lock
     GITHUB_HOST=${GITHUB_HOST:-github.com}
     GITHUB_IP=${GITHUB_IP:-}
-    mkdir -p "$MIRROR_ROOT" "$LOG_DIR" "$RUN_DIR" || return 1
-    exec 9>"$LOCK_FILE"
-    flock -n 9 || { printf '已有同步任务在运行，跳过\n'; return 0; }
     for index in "${!GM_REPOS[@]}"; do
         sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}" || failed=1
     done
     return "$failed"
-}
+)
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     set -euo pipefail

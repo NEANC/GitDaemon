@@ -161,6 +161,342 @@ entry_source_safe() {
     [[ ! -e $work/executed && ! -e $work/repos && ! -e $work/logs && ! -e $work/runtime ]]
 }
 
+# 验证路径检查拒绝危险形式，且不通过创建目录来修复输入。
+path_rejected() {
+    require_function gm_validate_path || return 1
+    if gm_validate_path "$1" > /dev/null 2>&1; then return 1; fi
+}
+
+# 验证调用者拥有的绝对目标可预检，且预检不创建缺失目录。
+path_valid_without_creation() {
+    require_function gm_validate_path || return 1
+    local target=$TEST_ROOT/path-parent/new-instance
+    mkdir -- "$TEST_ROOT/path-parent" || return 1
+    gm_validate_path "$target" || return 1
+    [[ ! -e $target ]]
+}
+
+# 验证中间符号链接即使指向同一测试树也不被接受。
+path_symlink_rejected() {
+    require_function gm_validate_path || return 1
+    mkdir -- "$TEST_ROOT/link-target" || return 1
+    # Git Bash 使用自身可识别的链接表示；不等同于 Linux 原生链接集成验证。
+    case "$(uname -s)" in
+        MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$TEST_ROOT/link-target" "$TEST_ROOT/link-parent" || return 1 ;;
+        *) ln -s -- "$TEST_ROOT/link-target" "$TEST_ROOT/link-parent" || return 1 ;;
+    esac
+    [[ -L $TEST_ROOT/link-parent ]] || {
+        printf '测试环境不能创建真实符号链接，不能验证此项\n'
+        return 1
+    }
+    path_rejected "$TEST_ROOT/link-parent/instance"
+}
+
+# 验证文件不能被当作实例目录或目录父路径。
+path_file_rejected() {
+    require_function gm_validate_path || return 1
+    printf '%s\n' sentinel > "$TEST_ROOT/not-directory"
+    path_rejected "$TEST_ROOT/not-directory" || return 1
+    path_rejected "$TEST_ROOT/not-directory/instance"
+}
+
+# 身份边界桩仅模拟 id 返回值，生产代码不得提供跳过身份检查的选项。
+identity_root_rejected() {
+    require_function gm_check_identity || return 1
+    local kind=$1
+    id() {
+        case "$1:$kind" in
+            -u:effective|-ru:real) printf '0\n' ;;
+            *) command id "$@" ;;
+        esac
+    }
+    if gm_check_identity > /dev/null 2>&1; then return 1; fi
+}
+
+# 验证真实当前身份；测试运行者为非零 UID 时应通过。
+identity_current_user() {
+    require_function gm_check_identity || return 1
+    [[ $UID != 0 && $EUID != 0 ]] || return 1
+    gm_check_identity
+}
+
+# 验证 Git Bash 无法冒充 Alpine；此项不是 Alpine 正向集成验证。
+platform_non_alpine_rejected() {
+    require_function gm_check_platform || return 1
+    case "$(uname -s)" in
+        MINGW*|MSYS*)
+            if gm_check_platform > /dev/null 2>&1; then return 1; fi
+            ;;
+        *)
+            printf '本用例要求已确认的 Git Bash 非 Alpine 环境\n'
+            return 1
+            ;;
+    esac
+}
+
+# 在明确的平台边界桩下验证安装只写独立程序根，不依赖运行配置。
+install_without_runtime_config() {
+    local work=$TEST_ROOT/install-only
+    mkdir -- "$work" || return 1
+    (
+        unset REPOS SHORT_LINKS
+        export GITHUB_TOKEN_FILE="$work/missing-secret"
+        export RUN_ROOT="$work/unused-runtime"
+        source "$ROOT/scripts/deploy-git-mirror.sh"
+        require_function gm_deploy_main || exit 1
+        # 平台边界桩：不代表 Alpine/OpenRC 能力验证通过。
+        gm_check_platform() { return 0; }
+        # 外部服务边界桩：安装阶段一旦调用即失败。
+        curl() { return 91; }
+        rc-service() { return 92; }
+        gm_deploy_main --install --install-root "$work/program" || exit 1
+        [[ -f $work/program/git-mirror-sync.sh && -f $work/program/lib/foundation.sh ]] || exit 1
+        [[ -f $work/program/openrc/git-daemon && ! -e $work/unused-runtime ]]
+    )
+}
+
+# 在平台边界桩下验证初始化保留已有配置，同时采用新的显式环境参数。
+initialize_preserves_config() {
+    local work=$TEST_ROOT/initialize
+    mkdir -- "$work" || return 1
+    (
+        clear_config_environment
+        source "$ROOT/scripts/deploy-git-mirror.sh"
+        require_function gm_deploy_main || exit 1
+        # 平台边界桩：只允许测试本地临时文件生命周期。
+        gm_check_platform() { return 0; }
+        gm_deploy_main --install --install-root "$work/program" || exit 1
+        # 权限与锁边界桩：Windows 不提供 Alpine 模式位及 flock 集成证据。
+        gm_check_private_directory() { return 0; }
+        flock() { return 0; }
+        export REPOS=git/git SHORT_LINKS='git/git git' GIT_PORT=12345
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
+        [[ -f $work/instance/config/mirror.env ]] || { printf '初始化缺少配置：%s\n' "$work/instance/config/mirror.env"; exit 1; }
+        [[ -f $work/instance/config/installation.conf ]] || { printf '初始化缺少安装记录：%s\n' "$work/instance/config/installation.conf"; exit 1; }
+        printf '%s\n' '# 用户已有配置' 'GIT_PORT=23456' > "$work/instance/config/mirror.env"
+        cp -- "$work/instance/config/mirror.env" "$work/before" || exit 1
+        export GIT_PORT=34567
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
+        cmp -s -- "$work/before" "$work/instance/config/mirror.env" || exit 1
+        [[ $HOME == "$work/instance/home" && $XDG_RUNTIME_DIR == "$work/instance/runtime" && $TMPDIR == "$work/instance/tmp" ]] || exit 1
+        [[ ! -e $work/instance/repos/git && ! -L $work/instance/repos/git ]]
+    )
+}
+
+# 锁边界桩只验证调用参数和失败传播，不证明操作系统排他锁有效。
+lock_boundary_case() {
+    require_function gm_lock_acquire || return 1
+    local scenario=$1 work=$TEST_ROOT/lock-$1 status=0 before
+    mkdir -p -- "$work/runtime" || return 1
+    export RUN_ROOT=$work
+    printf '%s\n' '不可截断的已有锁内容' > "$work/runtime/sync.lock"
+    before=$(<"$work/runtime/sync.lock")
+    # 权限边界桩：Windows 模式位不能代表 Alpine 的 0700 权限。
+    gm_check_private_directory() { return 0; }
+    # 锁系统调用边界桩：区分忙锁、系统错误和成功。
+    flock() {
+        printf '%s\n' "$*" > "$work/flock-arguments"
+        case "$scenario" in
+            busy) return 75 ;;
+            error) return 69 ;;
+            *) return 0 ;;
+        esac
+    }
+    if [[ $scenario == missing ]]; then
+        unset -f flock
+        # 依赖发现边界桩：不影响其他真实文件系统命令。
+        command() {
+            if [[ ${1-} == -v && ${2-} == flock ]]; then return 1; fi
+            builtin command "$@"
+        }
+    fi
+    gm_lock_acquire sync exclusive || status=$?
+    [[ $(<"$work/runtime/sync.lock") == "$before" ]] || return 1
+    case "$scenario" in
+        missing) [[ $status != 0 && $status != 75 && ! -e $work/flock-arguments ]] ;;
+        busy) [[ $status == 75 ]] ;;
+        error) [[ $status != 0 && $status != 75 ]] ;;
+        success)
+            [[ $status == 0 && -s $work/flock-arguments ]] || return 1
+            local arguments
+            arguments=$(<"$work/flock-arguments")
+            [[ $arguments == *'-n'* && $arguments == *'-E 75'* && $arguments == *'-x'* ]]
+            ;;
+    esac
+}
+
+# 验证锁链接在调用锁工具之前拒绝，外部目标不被截断。
+lock_symlink_rejected() {
+    require_function gm_lock_acquire || return 1
+    local work=$TEST_ROOT/lock-link status=0
+    mkdir -p -- "$work/runtime" || return 1
+    export RUN_ROOT=$work
+    printf '%s\n' sentinel > "$work/outside"
+    case "$(uname -s)" in
+        MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$work/outside" "$work/runtime/sync.lock" || return 1 ;;
+        *) ln -s -- "$work/outside" "$work/runtime/sync.lock" || return 1 ;;
+    esac
+    [[ -L $work/runtime/sync.lock ]] || return 1
+    # 权限与锁调用边界桩，链接检查仍执行真实实现。
+    gm_check_private_directory() { return 0; }
+    flock() { printf called > "$work/called"; return 0; }
+    gm_lock_acquire sync exclusive > /dev/null 2>&1 || status=$?
+    [[ $status != 0 && ! -e $work/called && $(<"$work/outside") == sentinel ]]
+}
+
+# 验证锁名只能为共享协议中的固定名称，不能变成任意文件路径。
+lock_name_rejected() {
+    require_function gm_lock_acquire || return 1
+    local work=$TEST_ROOT/lock-name
+    mkdir -p -- "$work/runtime" || return 1
+    export RUN_ROOT=$work
+    # 权限与依赖边界桩不替代锁名称校验。
+    gm_check_private_directory() { return 0; }
+    flock() { return 0; }
+    if gm_lock_acquire ../outside exclusive > /dev/null 2>&1; then return 1; fi
+    [[ ! -e $work/outside && ! -e $work/outside.lock ]]
+}
+
+# 验证关键运行入口在真实非 Alpine 平台拒绝，且尚未产生写入。
+entry_platform_rejected_before_write() {
+    local script=$1 work=$TEST_ROOT/platform-$1 status=0 output
+    mkdir -- "$work" || return 1
+    (
+        clear_config_environment
+        export RUN_ROOT=$work/instance REPOS=git/git
+        # 外部边界桩防止缺少平台检查的旧实现触发真实网络。
+        curl() { return 98; }
+        git() {
+            if [[ ${1-} == check-ref-format ]]; then command git "$@"; else return 97; fi
+        }
+        export -f curl git
+        bash "$ROOT/scripts/$script"
+    ) > "$work/output" 2>&1 || status=$?
+    output=$(<"$work/output")
+    [[ $status != 0 && $output == *Alpine* && ! -e $work/instance ]]
+}
+
+# 验证初始化遇到依赖、权限或忙锁错误时不创建配置及实例记录。
+initialize_boundary_failure() {
+    local scenario=$1 work=$TEST_ROOT/init-boundary-$1 status=0
+    mkdir -- "$work" || return 1
+    (
+        clear_config_environment
+        source "$ROOT/scripts/deploy-git-mirror.sh"
+        # 平台边界桩仅允许临时文件测试，不代表 Alpine 集成。
+        gm_check_platform() { return 0; }
+        gm_deploy_main --install --install-root "$work/program" || exit 1
+        mkdir -p -- "$work/instance/runtime" || exit 1
+        export REPOS=git/git
+        # 权限边界桩分别返回拒绝或通过；生产检查不能绕过。
+        gm_check_private_directory() {
+            [[ $scenario != permissions ]]
+        }
+        # 锁边界桩模拟 util-linux flock 的独立忙锁退出码。
+        flock() {
+            if [[ $scenario == busy ]]; then return 75; fi
+            return 0
+        }
+        if [[ $scenario == missing ]]; then
+            unset -f flock
+            # 依赖发现边界桩只隐藏 flock，不隐藏其他实际文件工具。
+            command() {
+                if [[ ${1-} == -v && ${2-} == flock ]]; then return 1; fi
+                builtin command "$@"
+            }
+        fi
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" > "$work/output" 2>&1 || status=$?
+        [[ $status != 0 && ! -e $work/instance/config/mirror.env && ! -e $work/instance/config/installation.conf ]] || exit 1
+        if [[ $scenario == busy ]]; then [[ $status == 75 ]] || exit 1; fi
+        return 0
+    )
+}
+
+# 只解释服务定义并检查变量，不启动 OpenRC 或真实服务。
+service_instance_paths() {
+    local service=$1
+    (
+        export INSTALL_ROOT=$TEST_ROOT/service-program RUN_ROOT=$TEST_ROOT/service-instance
+        export XDG_RUNTIME_DIR=$RUN_ROOT/runtime
+        export GIT_PORT=12345 LISTEN_ADDRESS=127.0.0.1
+        export RC_SVCNAME=$service
+        unset MIRROR_ROOT
+        source "$ROOT/scripts/openrc/$service"
+        case "$service" in
+            git-mirror-sync) [[ $command == "$INSTALL_ROOT/git-mirror-sync.sh" ]] ;;
+            git-mirror-hosts) [[ $command == "$INSTALL_ROOT/update-github-hosts.sh" ]] ;;
+            git-daemon)
+                [[ $pidfile == "$XDG_RUNTIME_DIR/git-daemon.pid" ]] || exit 1
+                [[ $command_args == *"--base-path=$RUN_ROOT/repos"* && $command_args == *'--port=12345'* ]]
+                ;;
+        esac
+    )
+}
+
+# 验证操作入口的锁顺序和错误传播；不模拟真实操作系统排他效果。
+operation_lock_order() {
+    local scenario=$1 work=$TEST_ROOT/operation-$1 status=0 expected actual
+    mkdir -p -- "$work/runtime" || return 1
+    export RUN_ROOT=$work
+    if [[ $scenario == stopped ]]; then printf stopped > "$work/runtime/stopped"; fi
+    # 共享锁接口边界桩记录顺序，并模拟第二把锁忙。
+    gm_lock_acquire() {
+        printf 'acquire %s %s\n' "$1" "$2" >> "$work/calls"
+        if [[ $scenario == busy && $1 == sync ]]; then return 75; fi
+        return 0
+    }
+    # 释放边界桩验证失败时不会泄漏已取得的实例锁。
+    gm_lock_release() {
+        printf 'release %s\n' "$1" >> "$work/calls"
+    }
+    gm_begin_operation sync > "$work/output" 2>&1 || status=$?
+    actual=$(<"$work/calls")
+    case "$scenario" in
+        success)
+            expected=$'acquire instance shared\nacquire sync exclusive'
+            [[ $status == 0 && $actual == "$expected" ]]
+            ;;
+        busy)
+            expected=$'acquire instance shared\nacquire sync exclusive\nrelease instance'
+            [[ $status == 75 && $actual == "$expected" ]]
+            ;;
+        stopped)
+            expected=$'acquire instance shared\nrelease instance'
+            [[ $status != 0 && $actual == "$expected" ]]
+            ;;
+    esac
+}
+
+check '同步服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-sync
+check '刷新服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-hosts
+check 'daemon 使用实例仓库和运行路径（仅定义接线）' service_instance_paths git-daemon
+check '操作按实例共享锁再同步排他锁进入（接口边界桩）' operation_lock_order success
+check '操作锁忙返回 75 并释放实例锁（接口边界桩）' operation_lock_order busy
+check '停止标记拒绝新操作并释放实例锁（接口边界桩）' operation_lock_order stopped
+check '初始化缺少 flock 时不写配置或记录（依赖边界桩）' initialize_boundary_failure missing
+check '初始化运行目录权限异常时不写配置或记录（权限边界桩）' initialize_boundary_failure permissions
+check '初始化实例锁忙时不写配置或记录（锁边界桩）' initialize_boundary_failure busy
+check '锁依赖缺失非零退出且不截断（依赖边界桩）' lock_boundary_case missing
+check '忙锁返回 75 且不截断（锁边界桩）' lock_boundary_case busy
+check '锁系统错误不能当作忙锁（锁边界桩）' lock_boundary_case error
+check '排他锁采用非阻塞和独立忙锁码（锁边界桩）' lock_boundary_case success
+check '锁文件链接拒绝且不触碰外部目标（Git Bash 链接）' lock_symlink_rejected
+check '锁名称不能穿越实例目录' lock_name_rejected
+check '同步入口在非 Alpine 平台写入前拒绝' entry_platform_rejected_before_write git-mirror-sync.sh
+check '刷新入口在非 Alpine 平台写入前拒绝' entry_platform_rejected_before_write update-github-hosts.sh
+check '部署入口加载无副作用并提供显式主函数' entry_source_safe deploy-git-mirror.sh gm_deploy_main
+check '路径预检不创建缺失目标' path_valid_without_creation
+for input in '' '/' '/tmp' '/etc' '/usr' '/var' '/var/lib' 'relative/instance' "$TEST_ROOT/../escape" "$TEST_ROOT/./instance"; do
+    check "危险路径拒绝：$input" path_rejected "$input"
+done
+check '中间符号链接拒绝' path_symlink_rejected
+check '普通文件不能充当实例路径' path_file_rejected
+check '实际 UID 为零拒绝（身份边界桩）' identity_root_rejected real
+check '有效 UID 为零拒绝（身份边界桩）' identity_root_rejected effective
+check '当前真实非零身份通过' identity_current_user
+check 'Git Bash 非 Alpine 平台拒绝' platform_non_alpine_rejected
+check '安装不要求 REPOS、不读取凭据、不创建运行目录（平台边界桩）' install_without_runtime_config
+check '重复初始化保留配置与实例环境（平台边界桩）' initialize_preserves_config
 check '同步入口加载无副作用并提供显式主函数' entry_source_safe git-mirror-sync.sh gm_sync_main
 check '刷新入口加载无副作用并提供显式主函数' entry_source_safe update-github-hosts.sh gm_hosts_main
 check '配置保留等号与 cron 原始字符串' config_values

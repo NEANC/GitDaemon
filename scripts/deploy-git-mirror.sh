@@ -1,59 +1,123 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PREFIX=${PREFIX:-/usr/local}
-CONFIG_DIR=${CONFIG_DIR:-/etc/git-mirror}
-DATA_DIR=${DATA_DIR:-/srv/git-mirror}
-LOG_DIR=${LOG_DIR:-/var/log/git-mirror}
-RUN_DIR=${RUN_DIR:-/run/git-mirror}
-OPENRC_DIR=${OPENRC_DIR:-/etc/init.d}
+# 仅加载程序目录中的共享代码，加载定义本身没有部署副作用。
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/foundation.sh"
 
-# 输出部署使用说明。
+# 显示安装与运行初始化的独立命令接口。
 usage() {
-    printf '%s\n' "用法: $0 [--prefix 路径] [--config-dir 路径] [--data-dir 路径]"
-    printf '%s\n' "REPOS 必须通过环境变量提供，例如 owner/repo;owner/other main,stable"
+    printf '%s\n' \
+        '安装：deploy-git-mirror.sh --install --install-root /调用者拥有的程序目录' \
+        '初始化：deploy-git-mirror.sh --init --install-root /程序目录 [--run-root /var/lib/git-daemon]' \
+        '安装无需 REPOS，不读取运行凭据；初始化的 REPOS/SHORT_LINKS 仅来自环境。'
 }
 
-# 校验目录参数为绝对路径，避免把文件写到意外位置。
-valid_path() {
-    case "$1" in
-        /*) return 0 ;;
-        *) return 1 ;;
-    esac
+# 安装固定程序文件；对已有不同内容明确失败，不覆盖用户文件。
+gm_install_program() {
+    local install=$1 source_root=$2 file directory record
+    local -a files=(deploy-git-mirror.sh uninstall-git-mirror.sh git-mirror-sync.sh update-github-hosts.sh lib/foundation.sh openrc/git-daemon openrc/git-mirror-sync openrc/git-mirror-hosts)
+    [[ $install != "${HOME:-/}" ]] || { gm_error '不能将用户 HOME 作为安装根'; return 1; }
+    gm_validate_path "$install" || return 1
+    for directory in lib openrc; do gm_validate_path "$install/$directory" || return 1; done
+    for file in "${files[@]}"; do
+        [[ -f $source_root/$file && ! -L $source_root/$file ]] || { gm_error '程序源文件缺失或类型异常'; return 1; }
+        gm_validate_file "$install/$file" || return 1
+        if [[ -e $install/$file ]]; then
+            cmp -s -- "$source_root/$file" "$install/$file" || { gm_error '已有程序文件不同，拒绝覆盖'; return 1; }
+        fi
+    done
+    record=$(gm_program_record "$install") || return 1
+    gm_validate_file "$install/installation.conf" || return 1
+    if [[ -e $install/installation.conf ]]; then
+        gm_match_record "$install/installation.conf" "$record" || return 1
+    fi
+    (umask 077; mkdir -p -- "$install/lib" "$install/openrc") || return 1
+    for file in "${files[@]}"; do
+        if [[ ! -e $install/$file ]]; then
+            (umask 077; set -o noclobber; cat -- "$source_root/$file" > "$install/$file") || return 1
+            chmod 755 -- "$install/$file" || return 1
+        fi
+    done
+    gm_create_data_file "$install/installation.conf" "$record" || return 1
+    printf '程序安装位置：%s\n' "$install"
 }
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --prefix) PREFIX=${2:?缺少 --prefix 参数}; shift 2 ;;
-        --config-dir) CONFIG_DIR=${2:?缺少 --config-dir 参数}; shift 2 ;;
-        --data-dir) DATA_DIR=${2:?缺少 --data-dir 参数}; shift 2 ;;
-        --help|-h) usage; exit 0 ;;
-        *) printf '未知参数：%s\n' "$1" >&2; exit 2 ;;
-    esac
-done
+# 初始化缺失的实例文件，验证现存记录并保留已有配置和数据。
+gm_initialize_instance() {
+    local run=$1 install=$2 record directory file repo executable status
+    for executable in git flock stat realpath; do
+        command -v "$executable" >/dev/null 2>&1 || { gm_error "缺少必要依赖：$executable"; return 1; }
+    done
+    gm_validate_instance_paths "$run" "$install" || return 1
+    if [[ -d $run/runtime ]]; then
+        gm_check_private_directory "$run/runtime" || return 1
+    fi
+    gm_match_record "$install/installation.conf" "$(gm_program_record "$install")" || return 1
+    record=$(gm_instance_record "$run" "$install") || return 1
+    if [[ -e $run/config/installation.conf ]]; then
+        gm_match_record "$run/config/installation.conf" "$record" || return 1
+    fi
+    gm_load_config "$run/config/mirror.env" || return 1
+    gm_parse_repos "${REPOS-}" "${SHORT_LINKS-}" || return 1
+    for repo in "${GM_REPOS[@]}"; do
+        gm_validate_path "$run/repos/${repo%/*}" || return 1
+        gm_validate_path "$run/repos/$repo.git" || return 1
+    done
+    file=${GM_CONFIG[GITHUB_TOKEN_FILE]}
+    if [[ -n $file ]]; then
+        [[ $file == "$run/secrets/"* ]] || { gm_error '凭据文件必须位于本实例 secrets 目录'; return 1; }
+        gm_validate_file "$file" || return 1
+        [[ -f $file && -r $file ]] || { gm_error '凭据文件不存在或不可读'; return 1; }
+    fi
+    (umask 077; mkdir -p -- "$run/runtime") || return 1
+    gm_check_private_directory "$run/runtime" || return 1
+    (
+        RUN_ROOT=$run
+        gm_lock_acquire instance exclusive || exit $?
+        gm_validate_instance_paths "$run" "$install" || exit 1
+        if [[ -e $run/config/installation.conf ]]; then
+            gm_match_record "$run/config/installation.conf" "$record" || exit 1
+        fi
+        gm_load_config "$run/config/mirror.env" || exit 1
+        for directory in repos config secrets home hosts logs runtime cache tmp; do
+            (umask 077; mkdir -p -- "$run/$directory") || exit 1
+        done
+        gm_create_data_file "$run/config/mirror.env" '# 固定允许键的 KEY=VALUE 纯数据配置；环境参数不自动回写。' || exit 1
+        gm_create_data_file "$run/config/installation.conf" "$record" || exit 1
+    )
+    status=$?
+    [[ $status == 0 ]] || return "$status"
+    gm_set_instance_environment "$run" "$install"
+    printf '实例初始化位置：%s\n' "$run"
+}
 
-[ -n "${REPOS:-}" ] || { printf '%s\n' 'REPOS 必须设置' >&2; exit 1; }
-for path in "$PREFIX" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$RUN_DIR" "$OPENRC_DIR"; do
-    valid_path "$path" || { printf '路径必须为绝对路径：%s\n' "$path" >&2; exit 1; }
-done
-command -v git >/dev/null 2>&1 || { printf '%s\n' '请先安装 git' >&2; exit 1; }
-command -v curl >/dev/null 2>&1 || { printf '%s\n' '请先安装 curl' >&2; exit 1; }
+# 先完成参数、身份和平台预检，再分派安装或运行初始化。
+gm_deploy_main() {
+    local mode= install= run=${RUN_ROOT-/var/lib/git-daemon} source_root
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h) usage; return 0 ;;
+            --install|--init)
+                [[ -z $mode ]] || { gm_error '安装与初始化模式只能选择一个'; return 2; }
+                mode=$1; shift ;;
+            --install-root|--run-root)
+                [[ $# -ge 2 && -n $2 ]] || { gm_error '路径参数缺少值'; return 2; }
+                if [[ $1 == --install-root ]]; then install=$2; else run=$2; fi
+                shift 2 ;;
+            *) gm_error '不支持的部署参数'; return 2 ;;
+        esac
+    done
+    [[ -n $mode && -n $install ]] || { usage >&2; return 2; }
+    gm_check_identity || return 1
+    gm_check_platform || return 1
+    source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
+    if [[ $mode == --install ]]; then
+        gm_install_program "$install" "$source_root"
+    else
+        gm_initialize_instance "$run" "$install"
+    fi
+}
 
-mkdir -p "$PREFIX/bin" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$RUN_DIR" "$OPENRC_DIR"
-cp "$SCRIPT_DIR/git-mirror-sync.sh" "$PREFIX/bin/git-mirror-sync.sh"
-cp "$SCRIPT_DIR/update-github-hosts.sh" "$PREFIX/bin/update-github-hosts.sh"
-chmod 755 "$PREFIX/bin/git-mirror-sync.sh" "$PREFIX/bin/update-github-hosts.sh"
-cp "$SCRIPT_DIR/openrc/git-daemon" "$OPENRC_DIR/git-daemon"
-cp "$SCRIPT_DIR/openrc/git-mirror-sync" "$OPENRC_DIR/git-mirror-sync"
-cp "$SCRIPT_DIR/openrc/git-mirror-hosts" "$OPENRC_DIR/git-mirror-hosts"
-chmod 755 "$OPENRC_DIR/git-daemon" "$OPENRC_DIR/git-mirror-sync" "$OPENRC_DIR/git-mirror-hosts"
-cat > "$CONFIG_DIR/mirror.env" <<EOF
-REPOS=$(printf '%s' "$REPOS")
-SHORT_LINKS=${SHORT_LINKS:-}
-MIRROR_ROOT=$DATA_DIR
-LOG_DIR=$LOG_DIR
-RUN_DIR=$RUN_DIR
-EOF
-chmod 600 "$CONFIG_DIR/mirror.env"
-printf '%s\n' 'Alpine/OpenRC Git 镜像部署完成。'
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    set -euo pipefail
+    gm_deploy_main "$@"
+fi
