@@ -1017,6 +1017,28 @@ init_append_without_trailing_newline() {
 }
 check '实例 rc.conf 追加：既有内容无尾随换行仍幂等' init_append_without_trailing_newline
 
+# 验证既有 rc_env_allow 采用引号外行内注释时仍安全解析，未闭合引号失败关闭。
+init_read_inline_comment() {
+    local work=$TEST_ROOT/init-inline-comment
+    mkdir -- "$work" || return 1
+    (
+        require_function gm_read_rc_env_allow || exit 1
+        require_function gm_ensure_instance_rc_conf || exit 1
+        local file=$work/rc.conf tokens
+        printf '%s\n' 'rc_env_allow="A B" # 用户注释' > "$file" || exit 1
+        tokens=$(gm_read_rc_env_allow "$file") || { printf '含行内注释的行应可解析\n'; exit 1; }
+        [[ $tokens == $'A\nB' ]] || { printf '解析结果应仅取引号内值：%s\n' "$tokens"; exit 1; }
+        cp -- "$file" "$work/original" || exit 1
+        gm_ensure_instance_rc_conf "$file" || { printf '含行内注释的既有配置应可追加\n'; exit 1; }
+        head -n 1 -- "$file" | cmp -s - "$work/original" || { printf '既有行应逐字节保留\n'; exit 1; }
+        printf '%s\n' 'rc_env_allow="A B' > "$work/unterminated" || exit 1
+        if gm_read_rc_env_allow "$work/unterminated" >/dev/null 2>&1; then
+            printf '未闭合引号应失败关闭\n'; exit 1
+        fi
+    )
+}
+check '实例 rc.conf 解析：引号外行内注释可用且未闭合失败关闭' init_read_inline_comment
+
 # 验证服务未登记或不可解析时恢复与停止失败关闭，不凭 status 报已停止。
 service_unregistered_rejected() {
     local kind=$1 work=$TEST_ROOT/unreg-$1 status=0 output

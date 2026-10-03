@@ -584,9 +584,18 @@ gm_read_rc_env_allow() {
         value=${line#*=}
         value=${value#"${value%%[![:space:]]*}"}
         value=${value%"${value##*[![:space:]]}"}
+        # 引号值只取到首个闭合引号，其后注释与空白忽略；无法确定闭合时失败关闭。
         case "$value" in
-            \"*) value=${value#\"}; value=${value%\"} ;;
-            \'*) value=${value#\'}; value=${value%\'} ;;
+            \"*)
+                value=${value#\"}
+                [[ $value == *\"* ]] || return 1
+                value=${value%%\"*}
+                ;;
+            \'*)
+                value=${value#\'}
+                [[ $value == *\'* ]] || return 1
+                value=${value%%\'*}
+                ;;
         esac
         [[ $value != *[\"\'\`\$\\\;\&\|\<\>]* ]] || return 1
         for token in $value; do printf '%s\n' "$token"; done
