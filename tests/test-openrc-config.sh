@@ -137,7 +137,7 @@ assert_preflight_environment() {
 daemon_configuration() {
     local scenario=$1 work=$TEST_ROOT/$1 status=0 output
     local expected_port=12345 expected_address=127.0.0.1 expected_timezone=UTC expected_error=
-    local argument port= address= base=
+    local argument port= address= base= disable_receive=no forbid_receive=no
     local -a arguments=() environment=()
     prepare_fixture || return 1
     printf '%s\n' '# 保留原始配置字节' 'GIT_PORT=12345' 'LISTEN_ADDRESS=127.0.0.1' 'TZ=UTC' > "$RUN_ROOT/config/mirror.env"
@@ -247,11 +247,17 @@ daemon_configuration() {
             --port=*) port=${argument#*=} ;;
             --listen=*) address=${argument#*=} ;;
             --base-path=*) base=${argument#*=} ;;
+            --disable=receive-pack) disable_receive=yes ;;
+            --forbid-override=receive-pack) forbid_receive=yes ;;
+            --export-all) printf 'daemon 不应绕过仓库导出标记\n'; return 1 ;;
         esac
     done
     [[ $port == "$expected_port" && $address == "$expected_address" && $base == "$RUN_ROOT/repos" ]] || {
         printf 'daemon argv 不匹配：port=%s，listen=%s，base=%s；预期 port=%s，listen=%s\n' "$port" "$address" "$base" "$expected_port" "$expected_address"
         return 1
+    }
+    [[ $disable_receive == yes && $forbid_receive == yes ]] || {
+        printf 'daemon 必须禁用 receive-pack 并禁止仓库覆盖\n'; return 1;
     }
     [[ ${environment[0]-} == "$expected_timezone" ]] || {
         printf 'daemon 时区不匹配：实际=%s，预期=%s\n' "${environment[0]-}" "$expected_timezone"

@@ -24,6 +24,6 @@ $effective_config
 EOF
     export TZ
     unset GITHUB_TOKEN GITHUB_TOKEN_FILE
-    command_args="daemon --reuseaddr --base-path=${RUN_ROOT:?必须提供实例运行根}/repos --export-all --informative-errors --verbose --listen=${LISTEN_ADDRESS} --port=${GIT_PORT}"
+    command_args="daemon --reuseaddr --base-path=${RUN_ROOT:?必须提供实例运行根}/repos --disable=receive-pack --forbid-override=receive-pack --informative-errors --verbose --listen=${LISTEN_ADDRESS} --port=${GIT_PORT}"
     return 0
 }
