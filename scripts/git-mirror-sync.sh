@@ -145,20 +145,43 @@ update_repo() {
     return 0
 }
 
-# 输出每个同步分支的提交摘要，失败时明确标记缓存状态。
+# 报告每个同步分支的提交头；无本地分支或枚举失败时明确提示。
 report_branches() {
-    local repo=$1 dir=$2 branches=$3 status=$4 branch commit
-    local -a branch_list=()
-    [ "$status" = success ] && log "本次同步成功：$repo" || log "本次同步失败：$repo（保留本地缓存）"
-    if [ -n "$branches" ]; then
-        IFS=, read -r -a branch_list <<< "$branches"
+    local repo=$1 dir=$2 branches=$3 status=$4 branch branch_list details short_hash commit_time subject
+    local -a selected=()
+    if [ "$status" = success ]; then
+        log "$repo 分支提交（本次同步成功）"
     else
-        mapfile -t branch_list < <(git --git-dir="$dir" for-each-ref --format='%(refname:strip=2)' refs/heads 2>/dev/null || true)
+        log "$repo 分支提交（本次同步失败；仅本地缓存，未确认上游最新）"
     fi
-    for branch in "${branch_list[@]}"; do
-        commit=$(git --git-dir="$dir" log -1 --format='%h %s' "refs/heads/$branch" 2>/dev/null || true)
-        [ -n "$commit" ] && log "  ↳ $branch: $commit" || log "  ↳ $branch: 本地不存在或无法读取提交"
+    if [ -n "$branches" ]; then
+        IFS=, read -r -a selected <<< "$branches"
+    else
+        if ! branch_list=$(git --git-dir="$dir" for-each-ref --sort=refname --format='%(refname:strip=2)' refs/heads/ 2>>"$LOG_FILE"); then
+            log "  无法读取本地分支列表"
+            return 1
+        fi
+        if [ -z "$branch_list" ]; then
+            log "  没有本地分支可报告"
+            return 0
+        fi
+        while IFS= read -r branch; do
+            selected+=("$branch")
+        done <<< "$branch_list"
+    fi
+    for branch in "${selected[@]}"; do
+        if details=$(git --git-dir="$dir" log -1 --abbrev=12 --format='%h%n%cI%n%s' "refs/heads/$branch" -- 2>>"$LOG_FILE") && [ -n "$details" ]; then
+            short_hash=${details%%$'\n'*}
+            details=${details#*$'\n'}
+            commit_time=${details%%$'\n'*}
+            subject=${details#*$'\n'}
+            log "  ↳ $branch: $short_hash $subject"
+            log "    提交时间：$commit_time"
+        else
+            log "  ↳ $branch: 本地不存在或无法读取提交"
+        fi
     done
+    return 0
 }
 
 # 同步单个仓库，失败时保留已有缓存且不发布新仓库。

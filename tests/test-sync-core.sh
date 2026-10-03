@@ -253,6 +253,46 @@ head_follows_upstream_default() {
     [[ $(git --git-dir="$dir" symbolic-ref HEAD) == refs/heads/dev ]]
 }
 
+# 报告每个分支的 12 位短哈希、提交摘要与独立成行的提交时间。
+report_short_hash_and_time() {
+    require_function report_branches || return 1
+    local up=$TEST_ROOT/report-up.git dir=$TEST_ROOT/report.git
+    local LOG_FILE=$TEST_ROOT/report.log
+    build_upstream "$up" "$TEST_ROOT/report-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    : > "$LOG_FILE"
+    report_branches owner/repo "$dir" main success || return 1
+    grep -Eq 'main: [0-9a-f]{12} 第二个提交' "$LOG_FILE" || { printf '短哈希或摘要不正确\n'; return 1; }
+    grep -Eq '提交时间：[0-9]{4}-[0-9]{2}-[0-9]{2}T' "$LOG_FILE" || { printf '缺少独立提交时间行\n'; return 1; }
+    return 0
+}
+
+# 没有本地分支时明确提示，而不是静默返回。
+report_empty_repo_prompts() {
+    require_function report_branches || return 1
+    local dir=$TEST_ROOT/empty.git
+    local LOG_FILE=$TEST_ROOT/empty.log
+    git init -q --bare "$dir" || return 1
+    : > "$LOG_FILE"
+    report_branches owner/repo "$dir" "" success || return 1
+    grep -Fq '没有本地分支可报告' "$LOG_FILE"
+}
+
+# 分支枚举失败必须可见且返回非零，不得被吞掉。
+report_enumeration_error_not_swallowed() {
+    require_function report_branches || return 1
+    local dir=$TEST_ROOT/not-a-repo
+    local LOG_FILE=$TEST_ROOT/enum.log
+    mkdir -p "$dir" || return 1
+    : > "$LOG_FILE"
+    if report_branches owner/repo "$dir" "" success 2>/dev/null; then
+        printf '枚举失败被吞掉\n'
+        return 1
+    fi
+    grep -Fq '无法读取本地分支列表' "$LOG_FILE"
+}
+
 check '配置失败必须显式传播（非仓库目录）' configure_propagates_failure
 check '缺键容错仅接受退出码 5' configure_tolerates_absent_key
 check '完整镜像切回后恢复标签抓取' configure_full_restores_tags
@@ -265,6 +305,9 @@ check '指定分支缩范围并指向首个所选 HEAD' branch_scope_prunes_and_
 check '切回完整镜像恢复全部引用与默认 HEAD' branch_then_full_restores_mirror
 check '所选分支缺失时不清理范围外引用' prune_refuses_when_selected_missing
 check '完整镜像跟随上游默认 HEAD 变化' head_follows_upstream_default
+check '报告含 12 位短哈希、摘要与提交时间' report_short_hash_and_time
+check '空仓库明确提示无可报告分支' report_empty_repo_prompts
+check '分支枚举失败可见且非零' report_enumeration_error_not_swallowed
 
 printf '同步核心行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
 [[ $FAILURES == 0 ]]
