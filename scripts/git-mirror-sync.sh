@@ -352,6 +352,34 @@ gm_publish_short_links() {
     return 0
 }
 
+# 删除不再出现在 SHORT_LINKS 中的受管理短链接与记录，绝不触碰目标仓库或其它数据。
+gm_prune_short_links() {
+    local run=$1
+    local dir=$run/config/managed-links
+    local record name link index
+    local -A retained=()
+    [[ -d $dir ]] || return 0
+    for index in "${!GM_LINK_NAMES[@]}"; do
+        retained["${GM_LINK_NAMES[$index]}.git"]=1
+    done
+    shopt -s nullglob dotglob
+    for record in "$dir"/*; do
+        name=${record##*/}
+        [[ -n ${retained[$name]+present} ]] && continue
+        link=$run/repos/$name
+        if [[ -L $link ]]; then
+            gm_validate_managed_link "$run" "$link" || return 1
+            rm -- "$link" || return 1
+            log "移除已取消的短链接：$name"
+        elif [[ -e $link ]]; then
+            gm_error "短链接清理位置存在非链接对象，拒绝删除：$name"
+            return 1
+        fi
+        rm -- "$record" || return 1
+    done
+    return 0
+}
+
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
 gm_sync_main() (
     local index failed=0 install snapshot
@@ -382,6 +410,7 @@ gm_sync_main() (
             failed=1
         fi
     done
+    gm_prune_short_links "$RUN_ROOT" || failed=1
     return "$failed"
 )
 

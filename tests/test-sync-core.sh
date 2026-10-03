@@ -694,6 +694,27 @@ short_link_same_name_preserves_owner_dir() {
     [[ $(<"$run/repos/git/git.git/sentinel") == repository ]]
 }
 
+# 映射移除后仅删除未列出的受管理链接与记录，保留目标仓库与仍列出的链接。
+short_link_prune_removes_only_unlisted() {
+    require_function gm_create_short_link || return 1
+    require_function gm_prune_short_links || return 1
+    local run=$TEST_ROOT/shortlink-prune LOG_FILE=$TEST_ROOT/shortlink-prune.log
+    mkdir -p -- "$run/repos/owner/repo.git" "$run/repos/keep/keep.git" || return 1
+    : > "$run/repos/owner/repo.git/git-daemon-export-ok"
+    : > "$run/repos/keep/keep.git/git-daemon-export-ok"
+    : > "$LOG_FILE"
+    gm_create_short_link "$run" owner/repo dropme || return 1
+    gm_create_short_link "$run" keep/keep keepme || return 1
+    GM_LINK_TARGETS=(keep/keep)
+    GM_LINK_NAMES=(keepme)
+    gm_prune_short_links "$run" || return 1
+    [[ ! -e $run/repos/dropme.git && ! -L $run/repos/dropme.git ]] || { printf '取消的短链接未移除\n'; return 1; }
+    [[ ! -e $run/config/managed-links/dropme.git ]] || { printf '取消的记录未移除\n'; return 1; }
+    [[ -L $run/repos/keepme.git && $(readlink -- "$run/repos/keepme.git") == keep/keep.git ]] || { printf '保留的短链接被误删\n'; return 1; }
+    [[ -d $run/repos/owner/repo.git && -f $run/repos/owner/repo.git/git-daemon-export-ok ]] || { printf '目标仓库被误删\n'; return 1; }
+    return 0
+}
+
 # 发布仅作用于当前仓库匹配的映射，不触碰其他映射。
 short_link_publish_matches_target() {
     require_function gm_publish_short_links || return 1
@@ -750,6 +771,7 @@ check '既有非链接对象失败关闭不覆盖' short_link_refuses_existing_d
 check '同一映射重复创建为幂等' short_link_idempotent
 check '目标变化时更新受管理链接与记录' short_link_updates_changed_target
 check '同名短链接不覆盖 owner 目录' short_link_same_name_preserves_owner_dir
+check '映射移除仅删受管理链接与记录' short_link_prune_removes_only_unlisted
 check '发布仅作用于匹配仓库的映射' short_link_publish_matches_target
 
 printf '同步核心行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
