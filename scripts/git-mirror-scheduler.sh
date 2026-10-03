@@ -35,6 +35,8 @@ gm_cron_expand() {
         else
             start=$(( 10#$base ))
             end=$start
+            # N/step 语义：从 N 起按 step 递增到字段上限，等价 N-max/step。
+            if [[ $part == */* ]]; then end=$maximum; fi
         fi
         for (( value = start; value <= end; value += 10#$step )); do
             GM_CRON_SET[$value]=1

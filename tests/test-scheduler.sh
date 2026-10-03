@@ -168,11 +168,52 @@ scheduler_help() {
     [[ $status == 0 && $output == *'git-mirror-scheduler.sh'* ]]
 }
 
+# 验证 N/step 从起点 N 按步进递增到字段上限，与 */step、a-b/step 语义一致，且受各字段上限约束。
+cron_step_start_expansion() {
+    require_function gm_cron_matches || return 1
+    gm_cron_matches '0/15' 0 59 0 || return 1
+    gm_cron_matches '0/15' 0 59 15 || return 1
+    gm_cron_matches '0/15' 0 59 30 || return 1
+    gm_cron_matches '0/15' 0 59 45 || return 1
+    if gm_cron_matches '0/15' 0 59 1; then return 1; fi
+    gm_cron_matches '5/15' 0 59 5 || return 1
+    gm_cron_matches '5/15' 0 59 50 || return 1
+    if gm_cron_matches '5/15' 0 59 0; then return 1; fi
+    local value
+    for value in 0 15 30 45; do gm_cron_matches '*/15' 0 59 "$value" || return 1; done
+    for value in 0 15 30 45; do gm_cron_matches '0-59/15' 0 59 "$value" || return 1; done
+    # 小时字段上限 23：0/2 -> 0,2,...,22，不含 23。
+    gm_cron_matches '0/2' 0 23 22 || return 1
+    if gm_cron_matches '0/2' 0 23 23; then return 1; fi
+    # 日期字段上限 31，起点 1：1/2 -> 1,3,...,31，不含 30。
+    gm_cron_matches '1/2' 1 31 31 || return 1
+    if gm_cron_matches '1/2' 1 31 30; then return 1; fi
+    # 月份字段上限 12：1/3 -> 1,4,7,10，不含 11。
+    gm_cron_matches '1/3' 1 12 10 || return 1
+    if gm_cron_matches '1/3' 1 12 11; then return 1; fi
+    # 星期字段上限 7：0/2 -> 0,2,4,6。
+    gm_cron_matches '0/2' 0 7 6 || return 1
+    if gm_cron_matches '0/2' 0 7 1; then return 1; fi
+    return 0
+}
+
+# 验证 N/step 的下次触发时间符合标准语义。
+cron_next_trigger_step_start() {
+    require_function gm_cron_next_trigger || return 1
+    export TZ=UTC
+    [[ $(gm_cron_next_trigger '0/15 * * * *' 0) == 900 ]] || return 1
+    [[ $(gm_cron_next_trigger '0/15 * * * *' 900) == 1800 ]] || return 1
+    [[ $(gm_cron_next_trigger '5/15 * * * *' 0) == 300 ]] || return 1
+    return 0
+}
+
 check 'cron 表达式接受合法形式' cron_accepts
 check 'cron 表达式拒绝非法形式' cron_rejects
 check 'cron 单字段匹配（通配/数值/列表/范围/步进/星期）' cron_field_matches
+check 'cron N/step 从起点展开到字段上限' cron_step_start_expansion
 check 'cron 下次触发时间（分钟/小时边界）' cron_next_trigger_basic
 check 'cron 下次触发时间（跨月/跨年/闰日/星期或语义）' cron_next_trigger_calendar
+check 'cron N/step 下次触发时间' cron_next_trigger_step_start
 check 'cron 非法表达式不参与触发计算' cron_next_trigger_rejects
 check '调度开关决定任务集合（ENABLE_CRON/ENABLE_HOSTS_UPDATE）' scheduler_switches
 check '调度器复用既有同步与刷新入口且不新建锁' scheduler_reuses_entrypoints
