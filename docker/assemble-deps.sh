@@ -17,7 +17,7 @@ PACKAGES='bash git git-daemon curl flock coreutils ca-certificates tzdata openss
 # 运行时需要的 busybox 小程序；这些命令在禁用安装脚本后只有 applet 而没有符号链接。
 REQUIRED_APPLETS='cmp grep setsid'
 # 组装完成后必须存在且可执行的命令，相对替代根目录。
-REQUIRED_COMMANDS='bin/bash bin/sh bin/cmp bin/grep bin/setsid usr/bin/env usr/bin/git usr/bin/curl usr/bin/openssl usr/bin/flock usr/bin/sha256sum bin/stat usr/bin/realpath usr/libexec/git-core/git-daemon sbin/rc-service sbin/openrc-run'
+REQUIRED_COMMANDS='bin/bash bin/sh bin/cmp bin/grep bin/setsid usr/bin/env usr/bin/id usr/bin/git usr/bin/curl usr/bin/openssl usr/bin/flock usr/bin/sha256sum bin/stat usr/bin/realpath usr/libexec/git-core/git-daemon sbin/rc-service sbin/openrc-run'
 # 替代根中禁止出现的 SSH 组件路径。
 FORBIDDEN_PATHS='usr/bin/ssh usr/bin/scp usr/bin/git-remote-ssh usr/libexec/git-core/git-remote-ssh usr/sbin/sshd'
 
@@ -288,7 +288,8 @@ ensure_ca_certificates() {
     fi
     for pem in "$split"/cert-*.pem; do
         base=${pem##*/}
-        hash=$("$openssl_bin" x509 -hash -noout -in "$pem" 2>/dev/null) || die "无法计算证书哈希：$base"
+        # 树内二进制默认按宿主路径解析共享库；显式指向树内库，避免基础镜像缺少 libssl/libcrypto 时失败。
+        hash=$(LD_LIBRARY_PATH="$root/usr/lib:$root/lib" "$openssl_bin" x509 -hash -noout -in "$pem" 2>/dev/null) || die "无法计算证书哈希：$base"
         cp "$pem" "$root/etc/ssl/certs/$base" || die "无法写入证书：$base"
         ln -sf "$base" "$root/etc/ssl/certs/$hash.0" || die "无法创建证书哈希链接：$hash.0"
     done

@@ -111,6 +111,12 @@ assemble_prepares_runtime_root() {
     return 0
 }
 
+# 必需命令集合覆盖入口运行期用到的 id。
+assemble_required_commands() {
+    grep -Eq 'REQUIRED_COMMANDS=.*usr/bin/id' "$ROOT/docker/assemble-deps.sh" || return 1
+    return 0
+}
+
 # .dockerignore 覆盖版本库、文档、测试夹具、运行数据、日志与凭据。
 dockerignore_covers() {
     local file=$ROOT/.dockerignore
@@ -184,6 +190,7 @@ check '依赖包集合完整且不含 SSH 组件' assemble_packages_ok
 check '依赖组装保持签名与 TLS 校验' assemble_keeps_verification
 check '--scripts=no 缺口被显式补齐' assemble_fills_gaps
 check '组装脚本预置运行根' assemble_prepares_runtime_root
+check '必需命令集合覆盖运行期命令' assemble_required_commands
 check '.dockerignore 覆盖必须排除项' dockerignore_covers
 check '入口静态约束满足' entrypoint_static_checks
 check '入口拒绝 UID 0' entrypoint_rejects_uid_zero
