@@ -130,9 +130,10 @@ clear_proxy_environment() {
     return 0
 }
 
-# 以受控 Git 凭据助手注入同步 Token，凭据只进入子进程环境，不进入 argv 或日志。
+# 以受控 Git 凭据助手注入同步 Token，凭据只进入子进程环境，不进入 argv 或日志；
+# 助手核对 Git 传入的 host，仅在允许的同步主机（默认 github.com）返回 Token，其它主机不返回。
 prepare_credentials() {
-    local token=
+    local token= allowed=${GITHUB_HOST:-github.com}
     GM_CREDENTIAL_ARGS=()
     export GIT_TERMINAL_PROMPT=0
     if [[ -n ${GITHUB_TOKEN-} ]]; then
@@ -143,16 +144,24 @@ prepare_credentials() {
     fi
     [[ -n $token ]] || return 0
     export GM_SYNC_TOKEN="$token"
-    GM_CREDENTIAL_ARGS=(-c "credential.helper=!f() { if [ \"\$1\" = get ]; then printf 'username=%s\\n' x-access-token; printf 'password=%s\\n' \"\$GM_SYNC_TOKEN\"; fi; return 0; }; f")
+    export GM_SYNC_ALLOWED_HOST="$allowed"
+    GM_CREDENTIAL_ARGS=(-c "credential.helper=!f() { if [ \"\$1\" = get ]; then h=; while IFS= read -r l; do case \"\$l\" in host=*) h=\${l#host=} ;; esac; done; if [ \"\$h\" = \"\$GM_SYNC_ALLOWED_HOST\" ]; then printf 'username=%s\\n' x-access-token; printf 'password=%s\\n' \"\$GM_SYNC_TOKEN\"; fi; fi; return 0; }; f")
     return 0
 }
 
-# 每轮读取一次完整快照并在内存校验，构造 git http.curloptResolve 参数数组。
+# 每轮读取一次完整快照并在内存校验，构造 git http.curloptResolve 参数数组；
+# 应用陈旧快照前输出含陈旧标记与快照时间的告警，便于观察回退前的过期状态。
 load_resolve_args() {
-    local snapshot=$1 filtered record host
+    local snapshot=$1 filtered record host stale fetched
     GM_RESOLVE_ARGS=()
     [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]:-yes} == yes ]] || { log '地址刷新已禁用，使用系统 DNS'; return 0; }
     [[ -f $snapshot ]] || { log '无地址快照，使用系统 DNS'; return 0; }
+    stale=${snapshot%.snapshot}.stale
+    if [[ -e $stale ]]; then
+        fetched=$(grep -m1 '^# FETCHED=' -- "$snapshot" 2>/dev/null) || fetched=
+        fetched=${fetched#\# FETCHED=}
+        log "检测到陈旧标记，地址快照可能过期；快照时间：${fetched:-未知}"
+    fi
     filtered=$(gm_hosts_read_snapshot "$snapshot") || { log '地址快照无效，忽略动态映射'; return 0; }
     while IFS= read -r record; do
         [[ -n $record ]] || continue

@@ -374,6 +374,25 @@ resolve_args_missing_snapshot() {
     [[ ${#GM_RESOLVE_ARGS[@]} -eq 0 ]]
 }
 
+# 陈旧标记存在时应用快照必须提示陈旧与快照时间，且不打印 Token。
+resolve_args_warns_on_stale_snapshot() {
+    require_function load_resolve_args || return 1
+    local snapshot=$TEST_ROOT/stale-resolve.snapshot LOG_FILE=$TEST_ROOT/stale-resolve.log joined
+    local stale=$TEST_ROOT/stale-resolve.stale
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GITHUB_HOST=github.com
+    GM_SYNC_TOKEN=stale-secret-token
+    printf '# FORMAT=1\n# SOURCE=x\n# FETCHED=2026-01-02T03:04:05+0800\n# DIGEST=sha256:00\n# COUNT=1\n140.82.121.3 github.com\n' > "$snapshot"
+    (umask 077; : > "$stale") || return 1
+    : > "$LOG_FILE"
+    load_resolve_args "$snapshot" || return 1
+    joined=" ${GM_RESOLVE_ARGS[*]} "
+    [[ $joined == *'http.curloptResolve=github.com:443:140.82.121.3'* ]] || { printf '陈旧快照未产生映射\n'; return 1; }
+    grep -q '陈旧' "$LOG_FILE" || { printf '缺少陈旧提示\n'; return 1; }
+    grep -q '2026-01-02T03:04:05+0800' "$LOG_FILE" || { printf '缺少快照时间\n'; return 1; }
+    ! grep -q 'stale-secret-token' "$LOG_FILE"
+}
+
 # 固定回退顺序：代理 → 直连加映射 → 直连系统 DNS，并按有无代理、映射与开关裁剪。
 transport_sequence_order() {
     require_function build_transport_sequence || return 1
@@ -453,6 +472,29 @@ credentials_from_file_not_in_argv() {
     joined=" ${GM_CREDENTIAL_ARGS[*]} "
     [[ $joined != *file-secret-token* ]] || return 1
     [[ $GM_SYNC_TOKEN == file-secret-token ]]
+}
+
+# 凭据助手只在允许的同步主机返回 Token，其它主机不返回。
+credentials_scoped_to_allowed_host() {
+    require_function prepare_credentials || return 1
+    local LOG_FILE=$TEST_ROOT/cred-scope.log script allowed_out foreign_out
+    : > "$LOG_FILE"
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GM_CONFIG[GITHUB_TOKEN_FILE]=''
+    GITHUB_TOKEN=fixture-scope-token
+    export GITHUB_HOST=github.com
+    prepare_credentials || return 1
+    script=${GM_CREDENTIAL_ARGS[1]}
+    script=${script#credential.helper=}
+    allowed_out=$(printf 'protocol=https\nhost=github.com\n\n' | \
+        HOME=$TEST_ROOT GIT_CONFIG_NOSYSTEM=1 GIT_ASKPASS=echo \
+        git -C "$TEST_ROOT" -c "credential.helper=" -c "credential.helper=$script" credential fill 2>/dev/null) || return 1
+    [[ $allowed_out == *'password=fixture-scope-token'* ]] || { printf '允许主机未返回凭据\n'; return 1; }
+    foreign_out=$(printf 'protocol=https\nhost=evil.example\n\n' | \
+        HOME=$TEST_ROOT GIT_CONFIG_NOSYSTEM=1 GIT_ASKPASS=echo \
+        git -C "$TEST_ROOT" -c "credential.helper=" -c "credential.helper=$script" credential fill 2>/dev/null) || true
+    [[ $foreign_out != *'fixture-scope-token'* ]] || { printf '非允许主机返回了凭据\n'; return 1; }
+    return 0
 }
 
 # 直接路径显式清除环境代理变量，避免宿主代理影响解析结果。
@@ -550,10 +592,12 @@ check '有效快照构造多地址映射参数' resolve_args_builds_mapping
 check '快照丢弃非法地址且全非法时不产生映射' resolve_args_filter_invalid_records
 check '禁用开关不读取快照映射' resolve_args_disabled_ignores_snapshot
 check '无快照时回退系统 DNS' resolve_args_missing_snapshot
+check '陈旧快照提示陈旧与快照时间' resolve_args_warns_on_stale_snapshot
 check '固定回退顺序按开关与代理裁剪' transport_sequence_order
 check '代理与映射互斥且保持 TLS 重定向限制' transport_args_paths
 check 'Token 不进入 argv 与日志' credentials_never_in_argv_or_log
 check '凭据文件读取的 Token 不进入 argv' credentials_from_file_not_in_argv
+check '凭据仅在允许主机返回' credentials_scoped_to_allowed_host
 check '直连前清除环境代理变量' clear_proxy_environment_clears
 check 'fetch 实际应用快照映射参数' update_repo_applies_mapping
 check '系统 DNS 路径不带映射参数' update_repo_system_path_has_no_mapping
