@@ -207,6 +207,46 @@ cron_next_trigger_step_start() {
     return 0
 }
 
+# 验证任务执行中收到停止信号后，本轮另一个到期任务不再被启动。
+scheduler_stop_suppresses_due_task() {
+    require_function gm_scheduler_main || return 1
+    local work marker pid index content
+    work=$(mktemp -d "$ROOT/.scheduler-test.XXXXXX") || return 1
+    marker=$work/marker
+    mkdir -p "$work/run/logs" "$work/install"
+    : > "$marker"
+    # 桩入口：刷新任务记录后长眠，同步任务仅记录，便于观察停止后是否仍被启动。
+    printf '#!/usr/bin/env bash\necho hosts >> %q\nexec sleep 30\n' "$marker" > "$work/install/update-github-hosts.sh"
+    printf '#!/usr/bin/env bash\necho sync >> %q\n' "$marker" > "$work/install/git-mirror-sync.sh"
+    chmod +x "$work/install/update-github-hosts.sh" "$work/install/git-mirror-sync.sh"
+    export RUN_ROOT=$work/run
+    STUB_INSTALL=$work/install
+    # 以桩替换运行时准备与 cron 计算，聚焦主循环的停止判据；本地缺 setsid 时以直启替身。
+    gm_prepare_runtime() {
+        INSTALL_ROOT=$STUB_INSTALL
+        declare -gA GM_CONFIG=([ENABLE_CRON]=yes [ENABLE_HOSTS_UPDATE]=yes [CRON_SCHEDULE]='* * * * *' [HOSTS_CRON]='* * * * *')
+        return 0
+    }
+    gm_cron_next_trigger() { printf '1\n'; }
+    setsid() { exec "$@"; }
+    gm_scheduler_main >/dev/null 2>&1 &
+    pid=$!
+    for (( index = 0; index < 200; index++ )); do
+        [[ -s $marker ]] && break
+        sleep 0.05
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+    for (( index = 0; index < 100; index++ )); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    content=$(cat "$marker")
+    rm -rf "$work"
+    [[ $content == hosts ]]
+}
+
 check 'cron 表达式接受合法形式' cron_accepts
 check 'cron 表达式拒绝非法形式' cron_rejects
 check 'cron 单字段匹配（通配/数值/列表/范围/步进/星期）' cron_field_matches
@@ -216,6 +256,7 @@ check 'cron 下次触发时间（跨月/跨年/闰日/星期或语义）' cron_n
 check 'cron N/step 下次触发时间' cron_next_trigger_step_start
 check 'cron 非法表达式不参与触发计算' cron_next_trigger_rejects
 check '调度开关决定任务集合（ENABLE_CRON/ENABLE_HOSTS_UPDATE）' scheduler_switches
+check '调度停止后不再启动当轮到期任务' scheduler_stop_suppresses_due_task
 check '调度器复用既有同步与刷新入口且不新建锁' scheduler_reuses_entrypoints
 check '调度服务定义指向调度脚本并可解析' scheduler_service_definition
 check '调度入口 --help 不读取运行配置' scheduler_help

@@ -229,10 +229,11 @@ gm_scheduler_main() {
         fi
         if ! gm_scheduler_sleep_until "$next"; then break; fi
         now=$(date +%s)
-        if [[ -n $next_hosts ]] && (( now >= next_hosts )); then
+        # 停止信号可能在上一任务执行期间到达，启动下一个到期任务前再次确认未停止。
+        if (( GM_SCHEDULER_STOP == 0 )) && [[ -n $next_hosts ]] && (( now >= next_hosts )); then
             gm_scheduler_run_task '地址刷新' "$INSTALL_ROOT/update-github-hosts.sh"
         fi
-        if (( now >= next_sync )); then
+        if (( GM_SCHEDULER_STOP == 0 )) && (( now >= next_sync )); then
             gm_scheduler_run_task '仓库同步' "$INSTALL_ROOT/git-mirror-sync.sh"
         fi
     done
