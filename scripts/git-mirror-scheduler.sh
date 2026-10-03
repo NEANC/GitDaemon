@@ -205,6 +205,15 @@ gm_scheduler_main() {
     gm_prepare_runtime "${RUN_ROOT-/var/lib/git-daemon}" "$install" || return 1
     SCHEDULER_LOG_FILE=$RUN_ROOT/logs/scheduler.log
     if [[ $mode == check ]]; then
+        # 语法合法但永不触发的表达式在启动前明确失败，避免后台启动成功却立即退出。
+        if [[ ${GM_CONFIG[ENABLE_CRON]} == yes ]]; then
+            gm_cron_next_trigger "${GM_CONFIG[CRON_SCHEDULE]}" "$(date +%s)" >/dev/null \
+                || { gm_error '配置值无法触发：CRON_SCHEDULE'; return 1; }
+            if [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]} == yes ]]; then
+                gm_cron_next_trigger "${GM_CONFIG[HOSTS_CRON]}" "$(date +%s)" >/dev/null \
+                    || { gm_error '配置值无法触发：HOSTS_CRON'; return 1; }
+            fi
+        fi
         gm_scheduler_log '调度配置校验通过'
         return 0
     fi

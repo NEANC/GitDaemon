@@ -247,6 +247,28 @@ scheduler_stop_suppresses_due_task() {
     [[ $content == hosts ]]
 }
 
+# 验证语法合法但永不触发的表达式在启动前校验中明确失败，而合法表达式仍通过。
+scheduler_check_rejects_never_triggering() {
+    require_function gm_scheduler_main || return 1
+    local work status=0
+    work=$(mktemp -d "$ROOT/.scheduler-check.XXXXXX") || return 1
+    mkdir -p "$work/run/logs"
+    export RUN_ROOT=$work/run
+    gm_prepare_runtime() {
+        declare -gA GM_CONFIG=([ENABLE_CRON]=yes [ENABLE_HOSTS_UPDATE]=no [CRON_SCHEDULE]='0 0 31 2 *' [HOSTS_CRON]='* * * * *')
+        return 0
+    }
+    gm_scheduler_main --check >/dev/null 2>&1 || status=$?
+    if [[ $status == 0 ]]; then rm -rf "$work"; return 1; fi
+    gm_prepare_runtime() {
+        declare -gA GM_CONFIG=([ENABLE_CRON]=yes [ENABLE_HOSTS_UPDATE]=no [CRON_SCHEDULE]='0/15 * * * *' [HOSTS_CRON]='* * * * *')
+        return 0
+    }
+    gm_scheduler_main --check >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    rm -rf "$work"
+    return 0
+}
+
 check 'cron 表达式接受合法形式' cron_accepts
 check 'cron 表达式拒绝非法形式' cron_rejects
 check 'cron 单字段匹配（通配/数值/列表/范围/步进/星期）' cron_field_matches
@@ -257,6 +279,7 @@ check 'cron N/step 下次触发时间' cron_next_trigger_step_start
 check 'cron 非法表达式不参与触发计算' cron_next_trigger_rejects
 check '调度开关决定任务集合（ENABLE_CRON/ENABLE_HOSTS_UPDATE）' scheduler_switches
 check '调度停止后不再启动当轮到期任务' scheduler_stop_suppresses_due_task
+check '调度启动前校验拦截永不触发的表达式' scheduler_check_rejects_never_triggering
 check '调度器复用既有同步与刷新入口且不新建锁' scheduler_reuses_entrypoints
 check '调度服务定义指向调度脚本并可解析' scheduler_service_definition
 check '调度入口 --help 不读取运行配置' scheduler_help
