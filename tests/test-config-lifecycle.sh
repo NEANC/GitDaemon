@@ -1039,6 +1039,23 @@ init_read_inline_comment() {
 }
 check '实例 rc.conf 解析：引号外行内注释可用且未闭合失败关闭' init_read_inline_comment
 
+# 验证引导前检测实例 default 运行级是否已登记交付服务，命中则失败关闭，不启动业务服务。
+bootstrap_rejects_delivered_service() {
+    local work=$TEST_ROOT/init-runlevel status=0 output
+    mkdir -p -- "$work/config/rc/runlevels/default" "$work/config/rc/init.d" "$work/runtime" "$work/cache" || return 1
+    (
+        require_function gm_instance_default_runlevel_has_delivered_service || exit 1
+        require_function gm_bootstrap_user_runlevel || exit 1
+        export XDG_CONFIG_HOME=$work/config XDG_RUNTIME_DIR=$work/runtime XDG_CACHE_HOME=$work/cache
+        gm_instance_default_runlevel_has_delivered_service && { printf '空运行级不应命中交付服务\n'; exit 1; }
+        ln -s -- "$work/config/rc/init.d/git-daemon" "$work/config/rc/runlevels/default/git-daemon" || exit 1
+        gm_instance_default_runlevel_has_delivered_service || { printf '运行级含交付服务应命中\n'; exit 1; }
+        output=$(gm_bootstrap_user_runlevel 2>&1) || status=$?
+        [[ $status == 1 && $output == *'已登记交付服务'* ]] || { printf '命中交付服务必须失败关闭：status=%s，诊断=%s\n' "$status" "$output"; exit 1; }
+    )
+}
+check '实例运行级引导：default 已登记交付服务时失败关闭' bootstrap_rejects_delivered_service
+
 # 验证服务未登记或不可解析时恢复与停止失败关闭，不凭 status 报已停止。
 service_unregistered_rejected() {
     local kind=$1 work=$TEST_ROOT/unreg-$1 status=0 output

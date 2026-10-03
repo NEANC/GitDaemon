@@ -658,12 +658,26 @@ gm_register_instance_services() {
     return 0
 }
 
+# 判断实例 default 运行级是否已登记本交付服务，用于引导前失败关闭。
+gm_instance_default_runlevel_has_delivered_service() {
+    local runlevel=${XDG_CONFIG_HOME-}/rc/runlevels/default service
+    for service in git-daemon git-mirror-sync git-mirror-hosts; do
+        [[ -e $runlevel/$service || -L $runlevel/$service ]] && return 0
+    done
+    return 1
+}
+
 # 引导实例用户运行级：仅在尚未引导时执行官方会话引导，避免重复触发运行级启动。
+# 若实例 default 运行级已被登记交付服务则失败关闭，保证初始化不启动业务服务。
 gm_bootstrap_user_runlevel() {
     local bootstrap=/usr/libexec/rc/sh/openrc-user.sh
-    [[ -r $bootstrap ]] || { gm_error '缺少 OpenRC 用户会话引导脚本'; return 1; }
     [[ -n ${XDG_RUNTIME_DIR-} && -n ${XDG_CONFIG_HOME-} && -n ${XDG_CACHE_HOME-} ]] || { gm_error '实例用户环境未初始化'; return 1; }
     if [[ -e $XDG_RUNTIME_DIR/openrc/softlevel ]]; then return 0; fi
+    if gm_instance_default_runlevel_has_delivered_service; then
+        gm_error '实例 default 运行级已登记交付服务，为避免启动业务服务拒绝引导'
+        return 1
+    fi
+    [[ -r $bootstrap ]] || { gm_error '缺少 OpenRC 用户会话引导脚本'; return 1; }
     sh "$bootstrap" start >/dev/null 2>&1 || { gm_error '实例用户运行级引导失败'; return 1; }
     [[ -e $XDG_RUNTIME_DIR/openrc/softlevel ]] || { gm_error '实例用户运行级引导未生效'; return 1; }
     return 0
