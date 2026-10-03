@@ -69,6 +69,20 @@ dockerfile_pins_identity() {
     return 0
 }
 
+# 基础镜像以 linux/amd64 平台 manifest 摘要固定，避免浮动标签。
+dockerfile_pins_digest() {
+    grep -Eq '^FROM alpine:3\.[0-9]+@sha256:[0-9a-f]{64}' "$ROOT/Dockerfile" || return 1
+    return 0
+}
+
+# 构建期用交付 --install 以已组装依赖树为环境烘焙程序层，运行期无需写程序层。
+dockerfile_bakes_program_layer() {
+    local file=$ROOT/Dockerfile
+    grep -Fq '/usr/local/lib/git-mirror/deploy-git-mirror.sh --install --install-root /usr/local/lib/git-mirror' "$file" || return 1
+    grep -Fq 'ENV INSTALL_ROOT=/usr/local/lib/git-mirror' "$file" || return 1
+    return 0
+}
+
 # 最终阶段使用 COPY --from 组装，不携带测试夹具、版本库或文档。
 dockerfile_excludes_sensitive() {
     ! grep -Eq -- 'COPY[^A-Za-z]*(tests/|\.git|docs/)' "$ROOT/Dockerfile" || return 1
@@ -135,11 +149,19 @@ entrypoint_static_checks() {
     grep -Fq 'id -ru' "$file" || return 1
     grep -Fq 'id -u' "$file" || return 1
     grep -Fq 'trap on_stop_signal TERM INT' "$file" || return 1
-    grep -Fq -- '--install --install-root' "$file" || return 1
     grep -Fq -- '--init --install-root' "$file" || return 1
     ! grep -Eq 'rc-service[^|]*git-mirror-(sync|hosts)' "$file" || return 1
     ! grep -Eq '(echo|printf)[^|]*GITHUB_TOKEN' "$file" || return 1
     ! grep -Eq 'set[[:space:]]+-[a-z]*x' "$file" || return 1
+    return 0
+}
+
+# 入口不在运行期写程序层：不再调用 --install，只做 --init 与需要时的 --resume。
+entrypoint_no_runtime_program_write() {
+    local file=$ROOT/docker/docker-entrypoint.sh
+    ! grep -Eq -- '(^|[[:space:]])--install([[:space:]]|$)' "$file" || return 1
+    grep -Fq -- '--init --install-root' "$file" || return 1
+    grep -Fq -- '--resume --install-root' "$file" || return 1
     return 0
 }
 
@@ -185,6 +207,8 @@ check '容器脚本通过 Bash 语法检查' docker_scripts_syntax
 check '每个执行阶段的 RUN 之前已设置 USER' dockerfile_user_before_run
 check 'Dockerfile 无 root 执行、提权与不安全校验开关' dockerfile_no_root_or_unsafe
 check 'Dockerfile 固定 Alpine 版本与非零 UID' dockerfile_pins_identity
+check 'Dockerfile 固定 linux/amd64 基础镜像摘要' dockerfile_pins_digest
+check '构建期烘焙程序层安装记录' dockerfile_bakes_program_layer
 check 'Dockerfile 不携带测试夹具、版本库与文档' dockerfile_excludes_sensitive
 check '依赖包集合完整且不含 SSH 组件' assemble_packages_ok
 check '依赖组装保持签名与 TLS 校验' assemble_keeps_verification
@@ -193,6 +217,7 @@ check '组装脚本预置运行根' assemble_prepares_runtime_root
 check '必需命令集合覆盖运行期命令' assemble_required_commands
 check '.dockerignore 覆盖必须排除项' dockerignore_covers
 check '入口静态约束满足' entrypoint_static_checks
+check '入口不在运行期写程序层' entrypoint_no_runtime_program_write
 check '入口拒绝 UID 0' entrypoint_rejects_uid_zero
 check '入口不把 Token 写入日志' entrypoint_no_token_logging
 check 'OpenRC 服务在用户模式下可用' openrc_user_mode_ready

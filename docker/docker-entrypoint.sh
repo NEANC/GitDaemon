@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 容器前台入口：以非 root 身份完成程序层安装核验与实例初始化，启动常驻服务并监督生命周期。
+# 容器前台入口：以非 root 身份完成命名卷内实例初始化，启动常驻服务并监督生命周期。
 # 同步与地址刷新算法全部复用交付脚本，入口只负责编排、前台存活、信号转发与子进程回收。
 # 计划中的入口逻辑说明：一次性工作服务（git-mirror-sync / git-mirror-hosts）经 rc-service 运行后
 # 状态会显示 crashed（退出 32），属既有语义，因此入口只对常驻服务使用 OpenRC 状态，绝不据一次性
@@ -134,15 +134,14 @@ supervise_loop() {
     return 0
 }
 
-# 主流程：身份预检 → 环境准备 → 交付 CLI 安装与初始化 → 首次刷新/同步 → 启动并监督服务。
+# 主流程：身份预检 → 环境准备 → 交付 CLI 初始化命名卷 → 首次刷新/同步 → 启动并监督服务。
 main() {
     local scheduler_supervised=no status=0
     require_non_root
     prepare_environment
     [[ -x $INSTALL_ROOT/deploy-git-mirror.sh ]] || die "缺少交付安装入口：$INSTALL_ROOT/deploy-git-mirror.sh"
     trap on_stop_signal TERM INT
-    log '核验只读程序层安装记录'
-    "$INSTALL_ROOT/deploy-git-mirror.sh" --install --install-root "$INSTALL_ROOT" || die '程序层安装核验失败'
+    # 程序层已于构建期由交付安装器烘焙为只读；运行期只做实例初始化与恢复，避免只读根下写模式校验失败。
     log '初始化命名卷内实例'
     "$INSTALL_ROOT/deploy-git-mirror.sh" --init --install-root "$INSTALL_ROOT" --run-root "$RUN_ROOT" || die '实例初始化失败'
     if [[ -e $RUN_ROOT/runtime/stopped ]]; then
