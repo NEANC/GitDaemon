@@ -11,8 +11,9 @@ configure_unset() {
     local dir=$1 key=$2 status
     if git --git-dir="$dir" config --unset-all "$key" 2>/dev/null; then
         return 0
+    else
+        status=$?
     fi
-    status=$?
     [ "$status" -eq 5 ] || return "$status"
     return 0
 }

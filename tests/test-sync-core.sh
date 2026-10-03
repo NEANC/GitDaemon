@@ -90,6 +90,22 @@ configure_tolerates_absent_key() {
     [[ $(git --git-dir="$dir" config --get-all remote.origin.fetch) == '+refs/*:refs/*' ]]
 }
 
+# 配置键不存在（退出码 5）时必须视为已达成，返回 0。
+configure_unset_absent_key_returns_zero() {
+    require_function configure_unset || return 1
+    local dir=$TEST_ROOT/unset-absent.git
+    git init -q --bare "$dir" || return 1
+    configure_unset "$dir" remote.origin.fetch
+}
+
+# 非 Git 目录上删除配置键必须原样返回 Git 原生失败码 128，不得被吞掉。
+configure_unset_failure_returns_128() {
+    require_function configure_unset || return 1
+    local rc=0
+    configure_unset "$TEST_ROOT/unset-missing-dir" remote.origin.fetch || rc=$?
+    [[ $rc -eq 128 ]] || { printf '失败退出码应为 128，实际：%s\n' "$rc"; return 1; }
+}
+
 # 完整镜像模式不得残留 --no-tags，从指定分支切回后必须恢复标签抓取。
 configure_full_restores_tags() {
     require_function configure_fetch || return 1
@@ -293,8 +309,25 @@ report_enumeration_error_not_swallowed() {
     grep -Fq '无法读取本地分支列表' "$LOG_FILE"
 }
 
+# 完整镜像成功后报告必须枚举全部本地分支，而非仅单一指定分支。
+report_full_mirror_enumerates_branches() {
+    require_function report_branches || return 1
+    local up=$TEST_ROOT/enum-full-up.git dir=$TEST_ROOT/enum-full.git
+    local LOG_FILE=$TEST_ROOT/enum-full.log
+    build_upstream "$up" "$TEST_ROOT/enum-full-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    : > "$LOG_FILE"
+    report_branches owner/repo "$dir" "" success || return 1
+    grep -Eq 'main: [0-9a-f]{12}' "$LOG_FILE" || { printf '未报告 main 分支\n'; return 1; }
+    grep -Eq 'dev: [0-9a-f]{12}' "$LOG_FILE" || { printf '未报告 dev 分支\n'; return 1; }
+    return 0
+}
+
 check '配置失败必须显式传播（非仓库目录）' configure_propagates_failure
 check '缺键容错仅接受退出码 5' configure_tolerates_absent_key
+check '缺键时 configure_unset 返回 0' configure_unset_absent_key_returns_zero
+check '非 Git 目录 configure_unset 返回 128' configure_unset_failure_returns_128
 check '完整镜像切回后恢复标签抓取' configure_full_restores_tags
 check '拉取经由 --atomic 原子事务' update_repo_passes_atomic
 check '输出过滤保留错误与退出状态' run_cmd_preserves_status_and_filters
@@ -308,6 +341,7 @@ check '完整镜像跟随上游默认 HEAD 变化' head_follows_upstream_default
 check '报告含 12 位短哈希、摘要与提交时间' report_short_hash_and_time
 check '空仓库明确提示无可报告分支' report_empty_repo_prompts
 check '分支枚举失败可见且非零' report_enumeration_error_not_swallowed
+check '完整镜像成功枚举全部分支' report_full_mirror_enumerates_branches
 
 printf '同步核心行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
 [[ $FAILURES == 0 ]]
