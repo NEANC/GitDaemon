@@ -23,10 +23,14 @@ fi
 if ! bash "$ROOT/tests/test-readonly-install.sh"; then
     fail '只读程序层边界测试'
 fi
+if ! bash "$ROOT/tests/test-sync-core.sh"; then
+    fail '同步核心行为测试（本地 bare 上游）'
+fi
 assert_contains "$ROOT/scripts/deploy-git-mirror.sh" 'REPOS' '部署使用 REPOS 环境变量'
 assert_absent "$ROOT/scripts/deploy-git-mirror.sh" 'systemd|systemctl|apt|yum|sudo|su |doas|SSH|ssh-key|REPOS_FILE' '部署移除非 Alpine 配置与 SSH 回退'
 assert_absent "$ROOT/scripts/uninstall-git-mirror.sh" 'systemd|systemctl|apt|yum|sudo|su |doas|/etc/hosts|resolv.conf' '卸载仅操作 OpenRC 文件和应用数据'
 assert_contains "$ROOT/scripts/git-mirror-sync.sh" 'http.curloptResolve' '存在动态地址解析代码（仅静态检查，非功能验收）'
+assert_contains "$ROOT/scripts/git-mirror-sync.sh" 'fetch --progress --atomic --prune' '同步以原子事务拉取引用（静态接线检查）'
 assert_contains "$ROOT/scripts/git-mirror-sync.sh" 'git-daemon-export-ok' '存在仓库发布标记代码（仅静态检查，非发布验收）'
 assert_contains "$ROOT/scripts/git-mirror-sync.sh" 'gm_begin_operation sync' '同步接入共享锁入口（静态接线检查）'
 assert_absent "$ROOT/scripts/git-mirror-sync.sh" 'git@|known_hosts|SSH|ssh ' '同步不包含 SSH 回退和凭据'
