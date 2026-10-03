@@ -16,8 +16,10 @@ USER 10001:10001
 # 组装依赖树：以镜像自带的 POSIX sh 运行，官方源与签名校验保持开启，禁用安装脚本。
 RUN sh /work/assemble-deps.sh --root /work/rootfs --cache-dir /work/cache
 
-# 显式设置程序层执行位：Windows 检出可能丢失执行位，COPY 只保留源模式。
-RUN chmod 755 /usr/local/lib/git-mirror/*.sh /usr/local/lib/git-mirror/openrc/* /work/docker-entrypoint.sh
+# 显式收敛程序层权限：Windows 检出的文件与目录到达时可能为组/其他可写（0666/0777），
+# COPY 只保留源模式；递归去除组与其他用户的写位以满足安装器校验，再显式设置程序层执行位。
+RUN chmod -R go-w /usr/local/lib/git-mirror \
+    && chmod 755 /usr/local/lib/git-mirror/*.sh /usr/local/lib/git-mirror/openrc/* /work/docker-entrypoint.sh
 
 # 构建期以已组装的依赖树为运行环境，用交付 CLI 的 --install 烘焙程序层与安装记录：
 # 程序层自此只读，运行期只做 --init/--resume，不对程序层做写模式路径校验。
