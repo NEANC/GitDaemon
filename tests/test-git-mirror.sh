@@ -29,6 +29,9 @@ fi
 if ! bash "$ROOT/tests/test-hosts-refresh.sh"; then
     fail '地址快照刷新行为测试（本地桩下载）'
 fi
+if ! bash "$ROOT/tests/test-scheduler.sh"; then
+    fail '用户态调度行为测试'
+fi
 assert_contains "$ROOT/scripts/deploy-git-mirror.sh" 'REPOS' '部署使用 REPOS 环境变量'
 assert_absent "$ROOT/scripts/deploy-git-mirror.sh" 'systemd|systemctl|apt|yum|sudo|su |doas|SSH|ssh-key|REPOS_FILE' '部署移除非 Alpine 配置与 SSH 回退'
 assert_absent "$ROOT/scripts/uninstall-git-mirror.sh" 'systemd|systemctl|apt|yum|sudo|su |doas|/etc/hosts|resolv.conf' '卸载仅操作 OpenRC 文件和应用数据'

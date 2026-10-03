@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+command="${INSTALL_ROOT:?必须提供独立程序安装路径}/git-mirror-scheduler.sh"
+command_background=true
+pidfile="${XDG_RUNTIME_DIR:?必须提供实例运行目录}/git-mirror-scheduler.pid"
+
+# 在后台启动调度进程之前同步校验配置与调度表达式，非法表达式在启动时明确失败。
+start_pre() {
+    "${INSTALL_ROOT:?必须提供独立程序安装路径}/git-mirror-scheduler.sh" --check || return $?
+    return 0
+}
