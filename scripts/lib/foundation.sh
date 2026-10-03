@@ -613,7 +613,12 @@ gm_ensure_instance_rc_conf() {
         done
         [[ $covered == yes ]] && return 0
         union=${allowed:+$allowed }$required
-        (umask 077; printf '%s\n%s\n' '# 由 deploy-git-mirror.sh --init 追加：放行交付服务所需变量。' "rc_env_allow=\"$union\"" >> "$file") || return 1
+        # 既有文件无尾随换行时先补换行，避免注释被拼接到旧末行破坏后续解析。
+        local separator=
+        if [[ -s $file && $(tail -c 1 -- "$file" | wc -l) -eq 0 ]]; then
+            separator=$'\n'
+        fi
+        (umask 077; printf '%s%s\n%s\n' "$separator" '# 由 deploy-git-mirror.sh --init 追加：放行交付服务所需变量。' "rc_env_allow=\"$union\"" >> "$file") || return 1
         return 0
     fi
     (umask 077; set -o noclobber; printf '%s\n%s\n' '# 由 deploy-git-mirror.sh --init 维护的实例用户 OpenRC 环境白名单。' "rc_env_allow=\"$required\"" > "$file") || return 1

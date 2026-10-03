@@ -994,6 +994,29 @@ init_prepares_user_openrc() {
 check '实例 OpenRC 环境初始化：fresh（平台与引导边界桩）' init_prepares_user_openrc fresh
 check '实例 OpenRC 环境初始化：preserve 且幂等（平台与引导边界桩）' init_prepares_user_openrc preserve
 
+# 验证追加白名单时既有内容无尾随换行也不被拼接破坏，第二次初始化仍成功且字节不变。
+init_append_without_trailing_newline() {
+    local work=$TEST_ROOT/init-append-newline
+    mkdir -- "$work" || return 1
+    (
+        require_function gm_ensure_instance_rc_conf || exit 1
+        require_function gm_read_rc_env_allow || exit 1
+        local file=$work/rc.conf bytes
+        printf 'rc_env_allow="EXTRA_VAR"' > "$file" || exit 1
+        cp -- "$file" "$work/original" || exit 1
+        gm_ensure_instance_rc_conf "$file" || { printf '首次追加应成功\n'; exit 1; }
+        # 既有内容必须逐字节保留且自成一整行，新注释不得拼接到旧末行。
+        bytes=$(wc -c < "$work/original") || exit 1
+        head -c "$bytes" -- "$file" | cmp -s - "$work/original" || { printf '追加破坏了既有内容\n'; exit 1; }
+        [[ $(sed -n '2p' -- "$file") == '# 由 deploy-git-mirror.sh --init 追加：放行交付服务所需变量。' ]] || { printf '追加注释未独立成行\n'; exit 1; }
+        gm_read_rc_env_allow "$file" >/dev/null || { printf '追加后既有行应仍可解析\n'; exit 1; }
+        cp -- "$file" "$work/before" || exit 1
+        gm_ensure_instance_rc_conf "$file" || { printf '第二次初始化应成功\n'; exit 1; }
+        cmp -s -- "$work/before" "$file" || { printf '重复初始化必须幂等\n'; exit 1; }
+    )
+}
+check '实例 rc.conf 追加：既有内容无尾随换行仍幂等' init_append_without_trailing_newline
+
 # 验证服务未登记或不可解析时恢复与停止失败关闭，不凭 status 报已停止。
 service_unregistered_rejected() {
     local kind=$1 work=$TEST_ROOT/unreg-$1 status=0 output
