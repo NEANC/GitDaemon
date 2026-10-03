@@ -793,7 +793,7 @@ gm_ensure_instance_rc_conf() {
 # 在实例 XDG 配置目录内以符号链接登记交付服务定义，重复登记幂等且不覆盖异常对象。
 gm_register_instance_services() {
     local run=$1 install=$2 service link target actual
-    local -a services=(git-daemon git-mirror-sync git-mirror-hosts)
+    local -a services=(git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler)
     for service in "${services[@]}"; do
         gm_validate_file "$install/openrc/$service" read || return 1
         [[ -f $install/openrc/$service && -x $install/openrc/$service ]] || { gm_error '实例服务定义缺失'; return 1; }
@@ -817,7 +817,7 @@ gm_register_instance_services() {
 # 判断实例 default 运行级是否已登记本交付服务，用于引导前失败关闭。
 gm_instance_default_runlevel_has_delivered_service() {
     local runlevel=${XDG_CONFIG_HOME-}/rc/runlevels/default service
-    for service in git-daemon git-mirror-sync git-mirror-hosts; do
+    for service in git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler; do
         [[ -e $runlevel/$service || -L $runlevel/$service ]] && return 0
     done
     return 1

@@ -486,6 +486,11 @@ service_instance_paths() {
         case "$service" in
             git-mirror-sync) [[ $command == "$INSTALL_ROOT/git-mirror-sync.sh" ]] ;;
             git-mirror-hosts) [[ $command == "$INSTALL_ROOT/update-github-hosts.sh" ]] ;;
+            git-mirror-scheduler)
+                [[ $command == "$INSTALL_ROOT/git-mirror-scheduler.sh" ]] || exit 1
+                [[ $pidfile == "$XDG_RUNTIME_DIR/git-mirror-scheduler.pid" ]] || exit 1
+                declare -F start_pre >/dev/null
+                ;;
             git-daemon)
                 [[ $pidfile == "$XDG_RUNTIME_DIR/git-daemon.pid" ]] || exit 1
                 [[ $command == /usr/bin/git ]] || exit 1
@@ -591,13 +596,16 @@ uninstall_behavior() {
                 ;;
         esac
         case "$scenario" in
-            scheduler-installed|scheduler-missing)
+            scheduler-installed)
+                # 安装已交付调度服务；此处确认登记存在且可执行。
+                export ENABLE_CRON=no
+                [[ -x $work/program/openrc/git-mirror-scheduler ]] || exit 1
+                ;;
+            scheduler-missing)
+                # 模拟已登记调度能力但服务定义丢失，卸载必须失败关闭。
                 printf 'FORMAT=1\nSCHEDULER=present\n' > "$work/program/service-capabilities.conf"
                 export ENABLE_CRON=no
-                if [[ $scenario == scheduler-installed ]]; then
-                    printf '%s\n' '#!/sbin/openrc-run' > "$work/program/openrc/git-mirror-scheduler"
-                    chmod 755 -- "$work/program/openrc/git-mirror-scheduler" || exit 1
-                fi
+                rm -- "$work/program/openrc/git-mirror-scheduler" || exit 1
                 ;;
             capability-missing)
                 if [[ -f $work/program/service-capabilities.conf ]]; then
@@ -643,12 +651,8 @@ uninstall_behavior() {
                 if [[ $scenario == confirm-no ]]; then
                     [[ ! -e $work/services && ! -e $work/locks ]] || exit 1
                 else
-                    local expected_services= expected_service
-                    if [[ $scenario == scheduler-installed ]]; then
-                        expected_services="--user git-mirror-scheduler stop"$'\n'
-                    else
-                        [[ $(<"$work/program/service-capabilities.conf") == $'FORMAT=1\nSCHEDULER=absent' ]] || exit 1
-                    fi
+                    local expected_services="--user git-mirror-scheduler stop"$'\n' expected_service
+                    [[ $(<"$work/program/service-capabilities.conf") == $'FORMAT=1\nSCHEDULER=present' ]] || exit 1
                     for expected_service in git-mirror-sync git-mirror-hosts git-daemon; do
                         expected_services+="--user $expected_service stop"$'\n'
                     done
@@ -706,10 +710,10 @@ uninstall_behavior() {
                 [[ ! -e $run/runtime/stopped ]] || exit 1
                 case "$scenario" in
                     stop-failure)
-                        [[ $(<"$work/services") == "--user git-mirror-sync stop" && ! -e $work/locks ]] || exit 1
+                        [[ $(<"$work/services") == "--user git-mirror-scheduler stop" && ! -e $work/locks ]] || exit 1
                         ;;
                     busy|lock-error)
-                        expected_services="--user git-mirror-sync stop"$'\n'"--user git-mirror-hosts stop"
+                        expected_services="--user git-mirror-scheduler stop"$'\n'"--user git-mirror-sync stop"$'\n'"--user git-mirror-hosts stop"
                         [[ $(<"$work/services") == "$expected_services" ]] || exit 1
                         local -a lock_calls=()
                         mapfile -t lock_calls < "$work/locks"
@@ -793,7 +797,7 @@ managed_link_cleanup() {
     [[ -f $work/instance/config/mirror.env && -f $work/instance/config/installation.conf ]] || return 1
     [[ -f $work/program/installation.conf ]] || return 1
     if [[ $scenario == valid ]]; then
-        expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon'
+        expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon'
         [[ $status == 0 && ! -e $work/instance/repos && ! -L $work/instance/repos ]] || {
             printf '合法受管理相对链接必须允许分类删除：status=%s\n%s\n' "$status" "$output"
             return 1
@@ -906,7 +910,7 @@ resume_lifecycle() {
     [[ $(<"$work/instance/runtime/git-daemon.pid") == 424242 ]] || return 1
     case "$scenario" in
         success)
-            expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync\nstatus git-mirror-hosts\nstatus git-daemon'
+            expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler\nstatus git-mirror-sync\nstatus git-mirror-hosts\nstatus git-daemon'
             [[ $status == 0 && ! -e $work/instance/runtime/stopped && $(<"$work/calls") == "$expected" ]] || {
                 printf '恢复必须在三把排他锁内确认全部服务已停止\n实际调用：\n%s\n%s\n' "$(<"$work/calls")" "$output"
                 return 1
@@ -917,21 +921,21 @@ resume_lifecycle() {
             ;;
         busy)
             [[ $status == 75 && $output == *'实例锁忙：instance'* ]] || return 1
-            [[ $(<"$work/calls") == $'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive' ]] || return 1
+            [[ $(<"$work/calls") == $'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive' ]] || return 1
             ;;
         stop-failure)
-            [[ $status == 1 && $output == *'实例服务停止失败'* && $(<"$work/calls") == 'stop git-mirror-sync' ]] || return 1
+            [[ $status == 1 && $output == *'实例服务停止失败'* && $(<"$work/calls") == 'stop git-mirror-scheduler' ]] || return 1
             ;;
         still-running)
-            expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync'
-            [[ $status == 1 && $output == *'实例服务仍在运行：git-mirror-sync'* && $(<"$work/calls") == "$expected" ]] || {
+            expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler'
+            [[ $status == 1 && $output == *'实例服务仍在运行：git-mirror-scheduler'* && $(<"$work/calls") == "$expected" ]] || {
                 printf '报告运行中的服务必须拒绝恢复：status=%s\n%s\n' "$status" "$output"
                 return 1
             }
             ;;
         status-error)
-            expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync'
-            [[ $status == 1 && $output == *'无法确认实例服务状态：git-mirror-sync'* && $(<"$work/calls") == "$expected" ]] || {
+            expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler'
+            [[ $status == 1 && $output == *'无法确认实例服务状态：git-mirror-scheduler'* && $(<"$work/calls") == "$expected" ]] || {
                 printf '不可靠状态必须失败关闭：status=%s\n%s\n' "$status" "$output"
                 return 1
             }
@@ -977,7 +981,7 @@ init_prepares_user_openrc() {
         [[ -f $rc_conf ]] || { printf '初始化未生成实例 rc.conf\n'; exit 1; }
         grep -q 'rc_env_allow="[^"]*INSTALL_ROOT RUN_ROOT REPOS' "$rc_conf" || { printf 'rc_env_allow 缺少必要变量\n'; exit 1; }
         if grep -q 'GITHUB_TOKEN' "$rc_conf"; then printf 'rc_env_allow 不应包含凭据变量\n'; exit 1; fi
-        for service in git-daemon git-mirror-sync git-mirror-hosts; do
+        for service in git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler; do
             link=$work/instance/config/rc/init.d/$service
             [[ -L $link ]] || { printf '缺少实例服务登记：%s\n' "$service"; exit 1; }
             [[ $(readlink -- "$link") == "$work/program/openrc/$service" ]] || { printf '登记目标不一致：%s\n' "$service"; exit 1; }
@@ -1259,6 +1263,7 @@ for scenario in default scheduler-installed scheduler-missing capability-missing
 done
 check '同步服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-sync
 check '刷新服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-hosts
+check '调度服务使用独立安装路径（仅定义接线）' service_instance_paths git-mirror-scheduler
 check 'daemon 使用实例仓库和运行路径（仅定义接线）' service_instance_paths git-daemon
 check '操作按实例共享锁再同步排他锁进入（接口边界桩）' operation_lock_order success
 check '操作锁忙返回 75 并释放实例锁（接口边界桩）' operation_lock_order busy
