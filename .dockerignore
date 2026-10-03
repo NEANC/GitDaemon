@@ -1,0 +1,23 @@
+# 构建上下文只保留 scripts/ 与 docker/；排除版本库、文档、测试夹具、凭据、运行数据与报告日志。
+.git
+.gitignore
+.gitattributes
+.github
+.trae
+.superpowers
+docs
+tests
+logs
+log
+**/*.log
+README.md
+README_sh.md
+compose.yml
+/deploy-git-mirror.sh
+/uninstall-git-mirror.sh
+secrets
+**/*.secret
+**/*.token
+**/.env
+**/*.env
+**/*.tmp
