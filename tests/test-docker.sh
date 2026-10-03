@@ -8,6 +8,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/git-docker.XXXXXXXX") || exit 1
 FAILURES=0
 CHECKS=0
+SKIPPED=0
 
 # 仅清理本测试创建的临时目录。
 cleanup() {
@@ -203,6 +204,33 @@ openrc_user_mode_ready() {
     return 0
 }
 
+# 实机集成检查依赖可用的 docker：不可用时计入 SKIP，可用时按脚本退出码计入通过或失败。
+docker_integration_check() {
+    local status=0
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        SKIPPED=$((SKIPPED + 1))
+        printf '[SKIP] 容器实机集成检查（docker 不可用）\n'
+        return 0
+    fi
+    bash "$ROOT/tests/test-docker-integration.sh" || status=$?
+    case $status in
+        0)
+            CHECKS=$((CHECKS + 1))
+            printf '[PASS] 容器实机集成检查\n'
+            ;;
+        77)
+            SKIPPED=$((SKIPPED + 1))
+            printf '[SKIP] 容器实机集成检查（docker 不可用）\n'
+            ;;
+        *)
+            CHECKS=$((CHECKS + 1))
+            FAILURES=$((FAILURES + 1))
+            printf '[FAIL] 容器实机集成检查\n'
+            ;;
+    esac
+    return 0
+}
+
 check '容器脚本通过 Bash 语法检查' docker_scripts_syntax
 check '每个执行阶段的 RUN 之前已设置 USER' dockerfile_user_before_run
 check 'Dockerfile 无 root 执行、提权与不安全校验开关' dockerfile_no_root_or_unsafe
@@ -221,5 +249,6 @@ check '入口不在运行期写程序层' entrypoint_no_runtime_program_write
 check '入口拒绝 UID 0' entrypoint_rejects_uid_zero
 check '入口不把 Token 写入日志' entrypoint_no_token_logging
 check 'OpenRC 服务在用户模式下可用' openrc_user_mode_ready
-printf '容器镜像检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
+docker_integration_check
+printf '容器镜像检查：%s；失败：%s；跳过：%s\n' "$CHECKS" "$FAILURES" "$SKIPPED"
 [[ $FAILURES == 0 ]]
