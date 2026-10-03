@@ -18,8 +18,9 @@ if [[ -f $ROOT/scripts/git-mirror-sync.sh ]]; then
     source "$ROOT/scripts/git-mirror-sync.sh"
 fi
 
-# 同步函数读取的运行时变量固定为本地值，避免宿主环境影响断言。
-export GITHUB_HOST=github.com GITHUB_IP=
+# 同步函数读取的运行时变量固定为本地值，默认走系统 DNS 传输路径，避免宿主环境影响断言。
+export GITHUB_HOST=github.com
+GM_TRANSPORT_SEQUENCE=(system)
 export LOG_FILE=$TEST_ROOT/sync.log
 : > "$LOG_FILE"
 
@@ -324,6 +325,209 @@ report_full_mirror_enumerates_branches() {
     return 0
 }
 
+# 从有效快照在内存构造 http.curloptResolve 参数数组，多个地址全部保留。
+resolve_args_builds_mapping() {
+    require_function load_resolve_args || return 1
+    local snapshot=$TEST_ROOT/resolve.snapshot joined
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GITHUB_HOST=github.com
+    printf '# FORMAT=1\n# SOURCE=x\n# FETCHED=x\n# DIGEST=sha256:00\n# COUNT=2\n140.82.121.3 github.com\n140.82.121.4 github.com\n' > "$snapshot"
+    load_resolve_args "$snapshot" || return 1
+    joined=" ${GM_RESOLVE_ARGS[*]} "
+    [[ $joined == *' http.curloptResolve=github.com:443:140.82.121.3 '* ]] || return 1
+    [[ $joined == *' http.curloptResolve=github.com:443:140.82.121.4 '* ]]
+}
+
+# 混合快照丢弃非法记录，仅含非法地址的快照视为无效而不产生映射。
+resolve_args_filter_invalid_records() {
+    require_function load_resolve_args || return 1
+    local snapshot=$TEST_ROOT/resolve-invalid.snapshot snapshot2=$TEST_ROOT/resolve-all-invalid.snapshot joined
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GITHUB_HOST=github.com
+    printf '# FORMAT=1\n# SOURCE=x\n140.82.121.3 github.com\n10.0.0.1 github.com\n' > "$snapshot"
+    load_resolve_args "$snapshot" || return 1
+    joined=" ${GM_RESOLVE_ARGS[*]} "
+    [[ $joined == *'http.curloptResolve=github.com:443:140.82.121.3'* ]] || return 1
+    [[ $joined != *10.0.0.1* ]] || return 1
+    printf '# FORMAT=1\n# SOURCE=x\n10.0.0.1 github.com\n127.0.0.1 github.com\n' > "$snapshot2"
+    load_resolve_args "$snapshot2" || return 1
+    [[ ${#GM_RESOLVE_ARGS[@]} -eq 0 ]]
+}
+
+# ENABLE_HOSTS_UPDATE=no 时不读取也不应用快照映射。
+resolve_args_disabled_ignores_snapshot() {
+    require_function load_resolve_args || return 1
+    local snapshot=$TEST_ROOT/resolve-disabled.snapshot
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=no
+    GITHUB_HOST=github.com
+    printf '# FORMAT=1\n140.82.121.3 github.com\n' > "$snapshot"
+    load_resolve_args "$snapshot" || return 1
+    [[ ${#GM_RESOLVE_ARGS[@]} -eq 0 ]]
+}
+
+# 无快照文件时安全回退系统 DNS，不产生映射参数。
+resolve_args_missing_snapshot() {
+    require_function load_resolve_args || return 1
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GITHUB_HOST=github.com
+    load_resolve_args "$TEST_ROOT/absent.snapshot" || return 1
+    [[ ${#GM_RESOLVE_ARGS[@]} -eq 0 ]]
+}
+
+# 固定回退顺序：代理 → 直连加映射 → 直连系统 DNS，并按有无代理、映射与开关裁剪。
+transport_sequence_order() {
+    require_function build_transport_sequence || return 1
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CONFIG[PROXY_URL]=https://proxy.invalid:8443
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    build_transport_sequence || return 1
+    [[ ${GM_TRANSPORT_SEQUENCE[*]} == 'proxy mapping system' ]] || return 1
+    GM_CONFIG[PROXY_URL]=''
+    build_transport_sequence || return 1
+    [[ ${GM_TRANSPORT_SEQUENCE[*]} == 'mapping system' ]] || return 1
+    GM_RESOLVE_ARGS=()
+    build_transport_sequence || return 1
+    [[ ${GM_TRANSPORT_SEQUENCE[*]} == 'system' ]] || return 1
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=no
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CONFIG[PROXY_URL]=https://proxy.invalid:8443
+    build_transport_sequence || return 1
+    [[ ${GM_TRANSPORT_SEQUENCE[*]} == 'proxy system' ]]
+}
+
+# 代理与映射互斥且所有路径保持 TLS 与受限重定向。
+transport_args_paths() {
+    require_function transport_args || return 1
+    GM_CONFIG[PROXY_URL]=https://proxy.invalid:8443
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CREDENTIAL_ARGS=()
+    local joined
+    transport_args proxy || return 1
+    joined=" ${GM_TRANSPORT_ARGS[*]} "
+    [[ $joined == *' http.proxy=https://proxy.invalid:8443 '* ]] || return 1
+    [[ $joined != *curloptResolve* ]] || return 1
+    [[ $joined == *' http.followRedirects=initial '* ]] || return 1
+    transport_args mapping || return 1
+    joined=" ${GM_TRANSPORT_ARGS[*]} "
+    [[ $joined == *curloptResolve* ]] || return 1
+    [[ $joined != *http.proxy* ]] || return 1
+    transport_args system || return 1
+    joined=" ${GM_TRANSPORT_ARGS[*]} "
+    [[ $joined != *curloptResolve* && $joined != *http.proxy* ]] || return 1
+    [[ $joined == *' http.followRedirects=initial '* ]]
+}
+
+# Token 经受控凭据助手注入，绝不进入 Git argv 与日志。
+credentials_never_in_argv_or_log() {
+    require_function prepare_credentials || return 1
+    require_function transport_args || return 1
+    local LOG_FILE=$TEST_ROOT/cred.log cred_joined arg_joined
+    : > "$LOG_FILE"
+    GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+    GM_CONFIG[GITHUB_TOKEN_FILE]=''
+    GM_CREDENTIAL_ARGS=()
+    GITHUB_TOKEN=fixture-secret-token
+    prepare_credentials || return 1
+    cred_joined=" ${GM_CREDENTIAL_ARGS[*]} "
+    [[ $cred_joined == *'credential.helper='* ]] || return 1
+    [[ $cred_joined == *'GM_SYNC_TOKEN'* ]] || return 1
+    [[ $cred_joined != *fixture-secret-token* ]] || return 1
+    transport_args system || return 1
+    arg_joined=" ${GM_TRANSPORT_ARGS[*]} "
+    [[ $arg_joined == *'credential.helper='* ]] || return 1
+    [[ $arg_joined != *fixture-secret-token* ]] || return 1
+    ! grep -q 'fixture-secret-token' "$LOG_FILE"
+}
+
+# 凭据文件路径读取 Token 同样不进入 argv。
+credentials_from_file_not_in_argv() {
+    require_function prepare_credentials || return 1
+    local file=$TEST_ROOT/token.file LOG_FILE=$TEST_ROOT/cred-file.log joined
+    printf 'file-secret-token\n' > "$file"
+    : > "$LOG_FILE"
+    unset GITHUB_TOKEN
+    GM_CONFIG[GITHUB_TOKEN_FILE]=$file
+    GM_CREDENTIAL_ARGS=()
+    prepare_credentials || return 1
+    joined=" ${GM_CREDENTIAL_ARGS[*]} "
+    [[ $joined != *file-secret-token* ]] || return 1
+    [[ $GM_SYNC_TOKEN == file-secret-token ]]
+}
+
+# 直接路径显式清除环境代理变量，避免宿主代理影响解析结果。
+clear_proxy_environment_clears() {
+    require_function clear_proxy_environment || return 1
+    export http_proxy=http://p.invalid https_proxy=http://p.invalid all_proxy=socks5://p.invalid
+    clear_proxy_environment || return 1
+    [[ -z ${http_proxy-} && -z ${https_proxy-} && -z ${all_proxy-} ]]
+}
+
+# fetch 实际带上快照映射参数，证明映射被应用到直连传输。
+update_repo_applies_mapping() {
+    require_function update_repo || return 1
+    local dir=$TEST_ROOT/apply-mapping.git rec=$TEST_ROOT/apply-mapping.args
+    mkdir -p "$dir" || return 1
+    : > "$rec"
+    GM_TRANSPORT_SEQUENCE=(mapping)
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CREDENTIAL_ARGS=()
+    git() { printf '%s\n' "$@" >> "$rec"; return 0; }
+    update_repo owner/repo "$dir" "" || return 1
+    grep -qx -- 'http.curloptResolve=github.com:443:140.82.121.3' "$rec"
+}
+
+# 系统 DNS 路径不得携带任何映射参数。
+update_repo_system_path_has_no_mapping() {
+    require_function update_repo || return 1
+    local dir=$TEST_ROOT/system-path.git rec=$TEST_ROOT/system-path.args
+    mkdir -p "$dir" || return 1
+    : > "$rec"
+    GM_TRANSPORT_SEQUENCE=(system)
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CREDENTIAL_ARGS=()
+    git() { printf '%s\n' "$@" >> "$rec"; return 0; }
+    update_repo owner/repo "$dir" "" || return 1
+    ! grep -q 'curloptResolve' "$rec"
+}
+
+# 首个传输路径失败时按固定顺序回退，成功即停止并记录路径与原因。
+update_repo_falls_back_over_paths() {
+    require_function update_repo || return 1
+    local dir=$TEST_ROOT/fallback-sync.git LOG_FILE=$TEST_ROOT/fallback-sync.log
+    mkdir -p "$dir" || return 1
+    : > "$LOG_FILE"
+    GM_TRANSPORT_SEQUENCE=(mapping system)
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CREDENTIAL_ARGS=()
+    git() { return 0; }
+    run_cmd() {
+        if [[ " $* " == *' http.curloptResolve='* ]]; then return 1; fi
+        return 0
+    }
+    update_repo owner/repo "$dir" "" || return 1
+    grep -q '传输失败：直连加动态地址映射' "$LOG_FILE" || return 1
+    grep -q '同步传输路径：直连系统 DNS' "$LOG_FILE"
+}
+
+# 全部传输路径失败时同步失败且不写发布标记。
+update_repo_all_paths_fail() {
+    require_function update_repo || return 1
+    local dir=$TEST_ROOT/all-fail.git LOG_FILE=$TEST_ROOT/all-fail.log
+    mkdir -p "$dir" || return 1
+    : > "$LOG_FILE"
+    GM_TRANSPORT_SEQUENCE=(mapping system)
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:140.82.121.3)
+    GM_CREDENTIAL_ARGS=()
+    git() { return 0; }
+    run_cmd() { return 1; }
+    if update_repo owner/repo "$dir" "" 2>/dev/null; then
+        printf '全部传输路径失败却报告成功\n'
+        return 1
+    fi
+    [[ ! -e $dir/git-daemon-export-ok ]]
+}
+
 check '配置失败必须显式传播（非仓库目录）' configure_propagates_failure
 check '缺键容错仅接受退出码 5' configure_tolerates_absent_key
 check '缺键时 configure_unset 返回 0' configure_unset_absent_key_returns_zero
@@ -342,6 +546,19 @@ check '报告含 12 位短哈希、摘要与提交时间' report_short_hash_and_
 check '空仓库明确提示无可报告分支' report_empty_repo_prompts
 check '分支枚举失败可见且非零' report_enumeration_error_not_swallowed
 check '完整镜像成功枚举全部分支' report_full_mirror_enumerates_branches
+check '有效快照构造多地址映射参数' resolve_args_builds_mapping
+check '快照丢弃非法地址且全非法时不产生映射' resolve_args_filter_invalid_records
+check '禁用开关不读取快照映射' resolve_args_disabled_ignores_snapshot
+check '无快照时回退系统 DNS' resolve_args_missing_snapshot
+check '固定回退顺序按开关与代理裁剪' transport_sequence_order
+check '代理与映射互斥且保持 TLS 重定向限制' transport_args_paths
+check 'Token 不进入 argv 与日志' credentials_never_in_argv_or_log
+check '凭据文件读取的 Token 不进入 argv' credentials_from_file_not_in_argv
+check '直连前清除环境代理变量' clear_proxy_environment_clears
+check 'fetch 实际应用快照映射参数' update_repo_applies_mapping
+check '系统 DNS 路径不带映射参数' update_repo_system_path_has_no_mapping
+check '传输失败按固定顺序回退' update_repo_falls_back_over_paths
+check '全部传输路径失败即同步失败' update_repo_all_paths_fail
 
 printf '同步核心行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
 [[ $FAILURES == 0 ]]

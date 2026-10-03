@@ -3,6 +3,13 @@
 # 仅从程序所在位置加载可信共享实现，不执行卷内配置。
 source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/foundation.sh"
 
+# 传输相关数组在脚本加载时初始化为空，避免预检前的未绑定展开。
+declare -A GM_CONFIG=()
+GM_RESOLVE_ARGS=()
+GM_CREDENTIAL_ARGS=()
+GM_TRANSPORT_SEQUENCE=()
+GM_TRANSPORT_ARGS=()
+
 # 记录同步消息并同时输出到终端和日志。
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 
@@ -117,19 +124,107 @@ prune_unselected_refs() {
     return 0
 }
 
+# 清除环境代理变量，避免宿主代理影响直连传输路径。
+clear_proxy_environment() {
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ftp_proxy FTP_PROXY
+    return 0
+}
+
+# 以受控 Git 凭据助手注入同步 Token，凭据只进入子进程环境，不进入 argv 或日志。
+prepare_credentials() {
+    local token=
+    GM_CREDENTIAL_ARGS=()
+    export GIT_TERMINAL_PROMPT=0
+    if [[ -n ${GITHUB_TOKEN-} ]]; then
+        token=$GITHUB_TOKEN
+    elif [[ -n ${GM_CONFIG[GITHUB_TOKEN_FILE]} ]]; then
+        token=$(<"${GM_CONFIG[GITHUB_TOKEN_FILE]}") || return 1
+        token=${token%$'\n'}
+    fi
+    [[ -n $token ]] || return 0
+    export GM_SYNC_TOKEN="$token"
+    GM_CREDENTIAL_ARGS=(-c "credential.helper=!f() { if [ \"\$1\" = get ]; then printf 'username=%s\\n' x-access-token; printf 'password=%s\\n' \"\$GM_SYNC_TOKEN\"; fi; return 0; }; f")
+    return 0
+}
+
+# 每轮读取一次完整快照并在内存校验，构造 git http.curloptResolve 参数数组。
+load_resolve_args() {
+    local snapshot=$1 filtered record host
+    GM_RESOLVE_ARGS=()
+    [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]:-yes} == yes ]] || { log '地址刷新已禁用，使用系统 DNS'; return 0; }
+    [[ -f $snapshot ]] || { log '无地址快照，使用系统 DNS'; return 0; }
+    filtered=$(gm_hosts_read_snapshot "$snapshot") || { log '地址快照无效，忽略动态映射'; return 0; }
+    while IFS= read -r record; do
+        [[ -n $record ]] || continue
+        host=${record#* }
+        [[ $host == "$GITHUB_HOST" ]] || continue
+        GM_RESOLVE_ARGS+=(-c "http.curloptResolve=$host:443:${record%% *}")
+    done <<< "$filtered"
+    return 0
+}
+
+# 构造固定回退顺序：配置代理（如有）→ 直连加动态映射（如有）→ 直连系统 DNS。
+build_transport_sequence() {
+    GM_TRANSPORT_SEQUENCE=()
+    if [[ -n ${GM_CONFIG[PROXY_URL]:-} ]]; then
+        GM_TRANSPORT_SEQUENCE+=(proxy)
+    fi
+    if [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]:-yes} == yes && ${#GM_RESOLVE_ARGS[@]} -gt 0 ]]; then
+        GM_TRANSPORT_SEQUENCE+=(mapping)
+    fi
+    GM_TRANSPORT_SEQUENCE+=(system)
+    return 0
+}
+
+# 按尝试标识构造 Git 参数：代理与映射互斥，所有路径保持 TLS 与受限重定向。
+transport_args() {
+    local attempt=$1
+    GM_TRANSPORT_ARGS=(-c http.followRedirects=initial)
+    case "$attempt" in
+        proxy) GM_TRANSPORT_ARGS+=(-c "http.proxy=${GM_CONFIG[PROXY_URL]}") ;;
+        mapping) GM_TRANSPORT_ARGS+=("${GM_RESOLVE_ARGS[@]}") ;;
+        system) ;;
+        *) return 1 ;;
+    esac
+    if [[ ${#GM_CREDENTIAL_ARGS[@]} -gt 0 ]]; then
+        GM_TRANSPORT_ARGS+=("${GM_CREDENTIAL_ARGS[@]}")
+    fi
+    return 0
+}
+
+# 返回尝试标识的中文说明，用于记录路径与失败原因。
+transport_label() {
+    case "$1" in
+        proxy) printf '配置的 HTTPS 代理' ;;
+        mapping) printf '直连加动态地址映射' ;;
+        system) printf '直连系统 DNS' ;;
+        *) printf '未知路径' ;;
+    esac
+}
+
 # 拉取单个仓库，成功后缩减范围、跟随默认 HEAD 并写入发布标记。
 update_repo() {
-    local repo=$1 dir=$2 branches=$3 remote_head line
-    local -a resolve_args=()
-    if [ -n "$GITHUB_IP" ]; then
-        resolve_args=(-c "http.curloptResolve=$GITHUB_HOST:443:$GITHUB_IP")
-    fi
+    local repo=$1 dir=$2 branches=$3 remote_head line attempt label
+    local -a chosen=()
     configure_fetch "$dir" "$branches" || return 1
     log "同步 $repo；分支：${branches:-全部 refs}"
-    run_cmd git "${resolve_args[@]}" --git-dir="$dir" fetch --progress --atomic --prune origin || return 1
+    for attempt in "${GM_TRANSPORT_SEQUENCE[@]}"; do
+        transport_args "$attempt" || return 1
+        label=$(transport_label "$attempt")
+        if run_cmd git "${GM_TRANSPORT_ARGS[@]}" --git-dir="$dir" fetch --progress --atomic --prune origin; then
+            chosen=("${GM_TRANSPORT_ARGS[@]}")
+            log "同步传输路径：$label"
+            break
+        fi
+        log "传输失败：$label；尝试下一路径"
+    done
+    if [[ ${#chosen[@]} -eq 0 ]]; then
+        log "同步失败：全部传输路径均不可用：$repo"
+        return 1
+    fi
     prune_unselected_refs "$dir" "$branches" || return 1
     if [ -z "$branches" ]; then
-        if remote_head=$(git "${resolve_args[@]}" --git-dir="$dir" ls-remote --symref origin HEAD 2>>"$LOG_FILE"); then
+        if remote_head=$(git "${chosen[@]}" --git-dir="$dir" ls-remote --symref origin HEAD 2>>"$LOG_FILE"); then
             while IFS= read -r line; do
                 if [[ $line == 'ref: refs/heads/'* ]]; then
                     remote_head=${line#ref: }
@@ -206,7 +301,7 @@ sync_repo() {
 
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
 gm_sync_main() (
-    local index failed=0 install
+    local index failed=0 install snapshot
     if [[ ${1-} == --help || ${1-} == -h ]]; then
         printf '%s\n' '用法：git-mirror-sync.sh；REPOS/SHORT_LINKS 仅来自当前环境'
         return 0
@@ -222,7 +317,11 @@ gm_sync_main() (
     LOG_FILE=$LOG_DIR/sync.log
     LOCK_FILE=$RUN_DIR/sync.lock
     GITHUB_HOST=${GITHUB_HOST:-github.com}
-    GITHUB_IP=${GITHUB_IP:-}
+    snapshot=$RUN_ROOT/hosts/github-hosts.snapshot
+    clear_proxy_environment || return 1
+    prepare_credentials || return 1
+    load_resolve_args "$snapshot" || return 1
+    build_transport_sequence || return 1
     for index in "${!GM_REPOS[@]}"; do
         sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}" || failed=1
     done
