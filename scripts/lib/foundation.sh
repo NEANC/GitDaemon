@@ -140,16 +140,53 @@ gm_hosts_public_ipv4() {
     return 0
 }
 
-# 判断 IPv6 是否落在可公开路由范围，拒绝环回、未指定、唯一本地、链路本地与组播。
+# 判断 IPv6 是否落在可公开路由范围；先展开为 8 组 16 位数值，再按数值语义拒绝未指定、
+# 环回、IPv4 映射或兼容地址中的保留网段、链路本地 fe80::/10、唯一本地 fc00::/7 与组播 ff00::/8。
+# 压缩与展开写法因先展开再判定而得到一致结论。
 gm_hosts_public_ipv6() {
-    local lower=$1
-    lower=$(printf '%s' "$lower" | tr 'ABCDEF' 'abcdef')
-    case "$lower" in
-        ::*) return 1 ;;
-        fc*|fd*) return 1 ;;
-        fe8*|fe9*|fea*|feb*) return 1 ;;
-        ff*) return 1 ;;
-    esac
+    local value=$1 part octet dotted
+    local -a head=() tail=() groups=() expanded=()
+    local index first nonzero prefix_zero
+    if [[ $value == *::* ]]; then
+        local left=${value%%::*} right=${value#*::}
+        [[ -n $left ]] && IFS=: read -r -a head <<< "$left"
+        [[ -n $right ]] && IFS=: read -r -a tail <<< "$right"
+        groups=("${head[@]}")
+        for ((index = ${#head[@]} + ${#tail[@]}; index < 8; index++)); do
+            groups+=(0)
+        done
+        groups+=("${tail[@]}")
+    else
+        IFS=: read -r -a groups <<< "$value"
+    fi
+    for part in "${groups[@]}"; do
+        expanded+=("$((16#$part))")
+    done
+    nonzero=0
+    for part in "${expanded[@]}"; do
+        (( part != 0 )) && nonzero=1
+    done
+    (( nonzero == 0 )) && return 1
+    prefix_zero=1
+    for index in 0 1 2 3 4 5 6; do
+        (( expanded[index] != 0 )) && prefix_zero=0
+    done
+    (( prefix_zero == 1 && expanded[7] == 1 )) && return 1
+    first=${expanded[0]}
+    if (( (first & 0xffc0) == 0xfe80 )) || (( (first & 0xfe00) == 0xfc00 )) || (( (first & 0xff00) == 0xff00 )); then
+        return 1
+    fi
+    prefix_zero=1
+    for index in 0 1 2 3 4; do
+        (( expanded[index] != 0 )) && prefix_zero=0
+    done
+    if (( prefix_zero == 1 && ( expanded[5] == 0 || expanded[5] == 0xffff ) )); then
+        octet=$(( (expanded[6] >> 8) & 255 )); dotted=$octet
+        octet=$(( expanded[6] & 255 )); dotted+=".$octet"
+        octet=$(( (expanded[7] >> 8) & 255 )); dotted+=".$octet"
+        octet=$(( expanded[7] & 255 )); dotted+=".$octet"
+        gm_hosts_public_ipv4 "$dotted" || return 1
+    fi
     return 0
 }
 

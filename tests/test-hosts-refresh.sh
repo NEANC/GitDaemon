@@ -80,19 +80,26 @@ filter_rejects_reserved_ipv4() {
     return 0
 }
 
-# 环回、唯一本地、链路本地与组播 IPv6 必须被拒绝，公网 IPv6 必须被接受。
+# 环回、未指定、唯一本地、链路本地、组播与 IPv4 映射/兼容保留地址的压缩与展开写法都必须被拒绝，
+# 合法公网 IPv6（含 2001:db8 格式示例）的压缩与展开写法都必须被接受且不被改写。
 filter_ipv6_public_and_reserved() {
     require_function gm_hosts_filter_records || return 1
-    local ip
-    for ip in :: ::1 fc00::1 fd12:3456::1 fe80::1 feb0::1 ff02::1; do
+    local ip out
+    for ip in :: ::1 fc00::1 fd12:3456::1 fe80::1 feb0::1 ff02::1 \
+        0:0:0:0:0:0:0:0 0:0:0:0:0:0:0:1 0000:0000:0000:0000:0000:0000:0000:0001 \
+        fc00:0000:0000:0000:0000:0000:0000:0001 fd00:ec2::254 \
+        fe80:0000:0000:0000:0000:0000:0000:0001 ff02:0000:0000:0000:0000:0000:0000:0001 \
+        ::ffff:7f00:1 0:0:0:0:0:ffff:7f00:0001 ::ffff:c0a8:101 ::7f00:1; do
         if printf '%s github.com\n' "$ip" | gm_hosts_filter_records >/dev/null 2>&1; then
             printf '保留 IPv6 未被拒绝：%s\n' "$ip"
             return 1
         fi
     done
-    local out
-    out=$(printf '2606:50c0:8000::153 github.com\n' | gm_hosts_filter_records) || return 1
-    [[ $out == '2606:50c0:8000::153 github.com' ]]
+    for ip in 2606:50c0:8000::153 2001:db8::1 2606:50c0:8000:0000:0000:0000:0000:0153; do
+        out=$(printf '%s github.com\n' "$ip" | gm_hosts_filter_records) || { printf '公网 IPv6 被拒绝：%s\n' "$ip"; return 1; }
+        [[ $out == "$ip github.com" ]] || { printf '公网 IPv6 被改写：%s\n' "$ip"; return 1; }
+    done
+    return 0
 }
 
 # 通配符、非白名单域名与格式错误记录必须被拒绝或过滤。
