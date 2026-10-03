@@ -182,6 +182,77 @@ update_repo_marker_failure() {
     return 0
 }
 
+# 指定分支模式成功后删除范围外引用并把 HEAD 指向首个所选分支。
+branch_scope_prunes_and_sets_head() {
+    require_function update_repo || return 1
+    require_function prune_unselected_refs || return 1
+    local up=$TEST_ROOT/scope-up.git dir=$TEST_ROOT/scope.git
+    build_upstream "$up" "$TEST_ROOT/scope-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    update_repo owner/repo "$dir" dev || return 1
+    git --git-dir="$dir" show-ref --verify --quiet refs/heads/dev || return 1
+    if git --git-dir="$dir" show-ref --verify --quiet refs/heads/main; then
+        printf '范围外分支未删除\n'
+        return 1
+    fi
+    if git --git-dir="$dir" show-ref --verify --quiet refs/tags/v1; then
+        printf '范围外标签未删除\n'
+        return 1
+    fi
+    if git --git-dir="$dir" show-ref --verify --quiet refs/notes/commits; then
+        printf '范围外 notes 未删除\n'
+        return 1
+    fi
+    [[ $(git --git-dir="$dir" symbolic-ref HEAD) == refs/heads/dev ]] || return 1
+    [[ -f $dir/git-daemon-export-ok ]]
+}
+
+# 从指定分支切回完整镜像必须恢复全部分支、标签与默认 HEAD。
+branch_then_full_restores_mirror() {
+    require_function update_repo || return 1
+    local up=$TEST_ROOT/restore-up.git dir=$TEST_ROOT/restore.git
+    build_upstream "$up" "$TEST_ROOT/restore-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    update_repo owner/repo "$dir" dev || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    git --git-dir="$dir" show-ref --verify --quiet refs/heads/main || return 1
+    git --git-dir="$dir" show-ref --verify --quiet refs/heads/dev || return 1
+    git --git-dir="$dir" show-ref --verify --quiet refs/tags/v1 || return 1
+    git --git-dir="$dir" show-ref --verify --quiet refs/notes/commits || return 1
+    [[ $(git --git-dir="$dir" symbolic-ref HEAD) == refs/heads/main ]]
+}
+
+# 所选分支缺失时不得删除任何范围外引用。
+prune_refuses_when_selected_missing() {
+    require_function prune_unselected_refs || return 1
+    local up=$TEST_ROOT/prune-up.git dir=$TEST_ROOT/prune.git
+    build_upstream "$up" "$TEST_ROOT/prune-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    if prune_unselected_refs "$dir" dev,missing 2>/dev/null; then
+        printf '所选分支缺失却报告成功\n'
+        return 1
+    fi
+    git --git-dir="$dir" show-ref --verify --quiet refs/heads/main || { printf '缺失时误删分支\n'; return 1; }
+    git --git-dir="$dir" show-ref --verify --quiet refs/tags/v1 || { printf '缺失时误删标签\n'; return 1; }
+    return 0
+}
+
+# 完整镜像模式跟随上游默认 HEAD 的变化。
+head_follows_upstream_default() {
+    require_function update_repo || return 1
+    local up=$TEST_ROOT/head-up.git dir=$TEST_ROOT/head.git
+    build_upstream "$up" "$TEST_ROOT/head-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    [[ $(git --git-dir="$dir" symbolic-ref HEAD) == refs/heads/main ]] || return 1
+    git --git-dir="$up" symbolic-ref HEAD refs/heads/dev || return 1
+    update_repo owner/repo "$dir" "" || return 1
+    [[ $(git --git-dir="$dir" symbolic-ref HEAD) == refs/heads/dev ]]
+}
+
 check '配置失败必须显式传播（非仓库目录）' configure_propagates_failure
 check '缺键容错仅接受退出码 5' configure_tolerates_absent_key
 check '完整镜像切回后恢复标签抓取' configure_full_restores_tags
@@ -190,6 +261,10 @@ check '输出过滤保留错误与退出状态' run_cmd_preserves_status_and_fil
 check '完整镜像拉取写入全部分支标签与 notes' update_repo_mirror_fetch
 check '拉取失败保留缓存引用且不发布' update_repo_failure_retains_cache
 check '发布标记写入失败视为同步失败' update_repo_marker_failure
+check '指定分支缩范围并指向首个所选 HEAD' branch_scope_prunes_and_sets_head
+check '切回完整镜像恢复全部引用与默认 HEAD' branch_then_full_restores_mirror
+check '所选分支缺失时不清理范围外引用' prune_refuses_when_selected_missing
+check '完整镜像跟随上游默认 HEAD 变化' head_follows_upstream_default
 
 printf '同步核心行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
 [[ $FAILURES == 0 ]]

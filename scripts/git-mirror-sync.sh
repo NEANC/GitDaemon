@@ -87,9 +87,38 @@ run_cmd() {
     return "${PIPESTATUS[0]}"
 }
 
-# 拉取单个仓库，配置、拉取与发布标记任一步失败即返回非零。
+# 仅在成功拉取后删除范围外引用，并把 HEAD 指向首个所选分支。
+prune_unselected_refs() {
+    local dir=$1 branches=$2 ref branch keep refs
+    local -a selected=()
+    if [ -z "$branches" ]; then
+        return 0
+    fi
+    IFS=, read -r -a selected <<< "$branches"
+    for branch in "${selected[@]}"; do
+        git --git-dir="$dir" show-ref --verify --quiet "refs/heads/$branch" || return 1
+    done
+    refs=$(git --git-dir="$dir" for-each-ref --format='%(refname)') || return 1
+    while IFS= read -r ref; do
+        [ -z "$ref" ] && continue
+        keep=no
+        for branch in "${selected[@]}"; do
+            if [ "$ref" = "refs/heads/$branch" ]; then
+                keep=yes
+                break
+            fi
+        done
+        if [ "$keep" = no ]; then
+            git --git-dir="$dir" update-ref -d "$ref" || return 1
+        fi
+    done <<< "$refs"
+    git --git-dir="$dir" symbolic-ref HEAD "refs/heads/${selected[0]}" || return 1
+    return 0
+}
+
+# 拉取单个仓库，成功后缩减范围、跟随默认 HEAD 并写入发布标记。
 update_repo() {
-    local repo=$1 dir=$2 branches=$3
+    local repo=$1 dir=$2 branches=$3 remote_head line
     local -a resolve_args=()
     if [ -n "$GITHUB_IP" ]; then
         resolve_args=(-c "http.curloptResolve=$GITHUB_HOST:443:$GITHUB_IP")
@@ -97,6 +126,21 @@ update_repo() {
     configure_fetch "$dir" "$branches" || return 1
     log "同步 $repo；分支：${branches:-全部 refs}"
     run_cmd git "${resolve_args[@]}" --git-dir="$dir" fetch --progress --atomic --prune origin || return 1
+    prune_unselected_refs "$dir" "$branches" || return 1
+    if [ -z "$branches" ]; then
+        if remote_head=$(git "${resolve_args[@]}" --git-dir="$dir" ls-remote --symref origin HEAD 2>>"$LOG_FILE"); then
+            while IFS= read -r line; do
+                if [[ $line == 'ref: refs/heads/'* ]]; then
+                    remote_head=${line#ref: }
+                    remote_head=${remote_head%%[[:space:]]*}
+                    git --git-dir="$dir" symbolic-ref HEAD "$remote_head" || return 1
+                    break
+                fi
+            done <<< "$remote_head"
+        else
+            log "无法查询上游默认分支，保留当前 HEAD：$repo"
+        fi
+    fi
     : > "$dir/git-daemon-export-ok" || return 1
     return 0
 }
