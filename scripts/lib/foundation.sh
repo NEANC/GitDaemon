@@ -570,6 +570,104 @@ gm_prepare_runtime() {
     return 0
 }
 
+# 生成交付服务在实例用户 OpenRC 下真正需要的非凭据环境变量集合。
+# 凭据类变量不纳入白名单，daemon 启动前仍显式清除凭据，保留既有隔离行为。
+gm_required_env_allow() {
+    printf '%s' 'INSTALL_ROOT RUN_ROOT REPOS'
+}
+
+# 解析实例 rc.conf 中全部 rc_env_allow 赋值标记，无法安全解析时返回非零交由调用方失败关闭。
+gm_read_rc_env_allow() {
+    local file=$1 line value token
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?rc_env_allow= ]] || continue
+        value=${line#*=}
+        value=${value#"${value%%[![:space:]]*}"}
+        value=${value%"${value##*[![:space:]]}"}
+        case "$value" in
+            \"*) value=${value#\"}; value=${value%\"} ;;
+            \'*) value=${value#\'}; value=${value%\'} ;;
+        esac
+        [[ $value != *[\"\'\`\$\\\;\&\|\<\>]* ]] || return 1
+        for token in $value; do printf '%s\n' "$token"; done
+    done < "$file"
+    return 0
+}
+
+# 确保实例 rc.conf 放行交付服务所需变量：缺失时创建，不足时追加并保留用户设置。
+gm_ensure_instance_rc_conf() {
+    local file=$1 required allowed tokens union token covered=yes
+    required=$(gm_required_env_allow)
+    gm_validate_file "$file" || return 1
+    if [[ -e $file ]]; then
+        [[ -f $file && -O $file ]] || { gm_error '实例 rc.conf 类型或所有权异常'; return 1; }
+        tokens=$(gm_read_rc_env_allow "$file") || { gm_error '实例 rc.conf 的 rc_env_allow 无法安全解析'; return 1; }
+        allowed=
+        for token in $tokens; do allowed+=${allowed:+ }$token; done
+        case " $allowed " in *' * '*) return 0 ;; esac
+        for token in $required; do
+            case " $allowed " in
+                *" $token "*) ;;
+                *) covered=no ;;
+            esac
+        done
+        [[ $covered == yes ]] && return 0
+        union=${allowed:+$allowed }$required
+        (umask 077; printf '%s\n%s\n' '# 由 deploy-git-mirror.sh --init 追加：放行交付服务所需变量。' "rc_env_allow=\"$union\"" >> "$file") || return 1
+        return 0
+    fi
+    (umask 077; set -o noclobber; printf '%s\n%s\n' '# 由 deploy-git-mirror.sh --init 维护的实例用户 OpenRC 环境白名单。' "rc_env_allow=\"$required\"" > "$file") || return 1
+    return 0
+}
+
+# 在实例 XDG 配置目录内以符号链接登记交付服务定义，重复登记幂等且不覆盖异常对象。
+gm_register_instance_services() {
+    local run=$1 install=$2 service link target actual
+    local -a services=(git-daemon git-mirror-sync git-mirror-hosts)
+    for service in "${services[@]}"; do
+        gm_validate_file "$install/openrc/$service" read || return 1
+        [[ -f $install/openrc/$service && -x $install/openrc/$service ]] || { gm_error '实例服务定义缺失'; return 1; }
+        link=$run/config/rc/init.d/$service
+        target=$install/openrc/$service
+        if [[ -L $link ]]; then
+            actual=$(readlink -- "$link") || return 1
+            [[ $actual == "$target" ]] || { gm_error "实例服务登记目标不一致：$service"; return 1; }
+        elif [[ -e $link ]]; then
+            gm_error "实例服务登记位置已存在非链接对象：$service"
+            return 1
+        else
+            ln -s -- "$target" "$link" || return 1
+            [[ -L $link ]] || { gm_error '实例服务登记链接创建失败'; return 1; }
+            [[ $(readlink -- "$link") == "$target" ]] || { gm_error '实例服务登记链接目标异常'; return 1; }
+        fi
+    done
+    return 0
+}
+
+# 引导实例用户运行级：仅在尚未引导时执行官方会话引导，避免重复触发运行级启动。
+gm_bootstrap_user_runlevel() {
+    local bootstrap=/usr/libexec/rc/sh/openrc-user.sh
+    [[ -r $bootstrap ]] || { gm_error '缺少 OpenRC 用户会话引导脚本'; return 1; }
+    [[ -n ${XDG_RUNTIME_DIR-} && -n ${XDG_CONFIG_HOME-} && -n ${XDG_CACHE_HOME-} ]] || { gm_error '实例用户环境未初始化'; return 1; }
+    if [[ -e $XDG_RUNTIME_DIR/openrc/softlevel ]]; then return 0; fi
+    sh "$bootstrap" start >/dev/null 2>&1 || { gm_error '实例用户运行级引导失败'; return 1; }
+    [[ -e $XDG_RUNTIME_DIR/openrc/softlevel ]] || { gm_error '实例用户运行级引导未生效'; return 1; }
+    return 0
+}
+
+# 在实例范围内准备用户 OpenRC 环境：rc.conf 白名单、init.d 服务登记与运行级引导。
+gm_prepare_instance_openrc() {
+    local run=$1 install=$2
+    gm_set_instance_environment "$run" "$install"
+    (umask 077; mkdir -p -- "$run/config/rc/init.d") || return 1
+    gm_validate_path "$run/config/rc" || return 1
+    gm_validate_path "$run/config/rc/init.d" || return 1
+    gm_ensure_instance_rc_conf "$run/config/rc/rc.conf" || return 1
+    gm_register_instance_services "$run" "$install" || return 1
+    gm_bootstrap_user_runlevel || return 1
+    return 0
+}
+
 # 仅控制安装目录中的本实例用户服务，任何停止失败均向上传播。
 gm_stop_instance_service() {
     local service=$1 path

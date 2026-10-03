@@ -4,6 +4,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/git-openrc-config.XXXXXXXX") || exit 1
 CHECKS=0
 FAILURES=0
+# Git Bash 需要真实符号链接表示，初始化登记链接的行为才与 Alpine 一致。
+export MSYS=winsymlinks:sys
 
 # 仅删除本轮测试自行创建的临时树。
 cleanup() {
@@ -38,6 +40,8 @@ prepare_fixture() {
     gm_check_platform() { return 0; }
     gm_check_private_directory() { return 0; }
     flock() { return 0; }
+    # 用户运行级引导边界桩：Windows 无 OpenRC，实例内登记产物仍由真实代码生成。
+    gm_bootstrap_user_runlevel() { return 0; }
     gm_deploy_main --install --install-root "$work/program" || return 1
     export REPOS=git/git
     ( gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" ) || return 1

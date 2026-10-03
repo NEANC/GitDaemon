@@ -4,6 +4,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/git-foundation.XXXXXXXX") || exit 1
 FAILURES=0
 CHECKS=0
+# Git Bash 需要真实符号链接表示，初始化登记链接的行为才与 Alpine 一致。
+export MSYS=winsymlinks:sys
 
 # 仅清理本测试通过 mktemp 创建的目录。
 cleanup() {
@@ -290,6 +292,8 @@ initialize_preserves_config() {
         # 权限与锁边界桩：Windows 不提供 Alpine 模式位及 flock 集成证据。
         gm_check_private_directory() { return 0; }
         flock() { return 0; }
+        # 用户运行级引导边界桩：Windows 无 OpenRC，仅验证实例内登记产物。
+        gm_bootstrap_user_runlevel() { return 0; }
         export REPOS=git/git SHORT_LINKS='git/git git' GIT_PORT=12345
         gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
         [[ -f $work/instance/config/mirror.env ]] || { printf '初始化缺少配置：%s\n' "$work/instance/config/mirror.env"; exit 1; }
@@ -536,6 +540,7 @@ uninstall_behavior() {
         gm_check_platform() { return 0; }
         gm_check_private_directory() { return 0; }
         flock() { return 0; }
+        gm_bootstrap_user_runlevel() { return 0; }
         gm_deploy_main --install --install-root "$work/program" || exit 1
         export REPOS=git/git
         gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
@@ -727,6 +732,7 @@ managed_link_cleanup() {
     gm_check_platform() { return 0; }
     gm_check_private_directory() { return 0; }
     flock() { return 0; }
+    gm_bootstrap_user_runlevel() { return 0; }
     gm_deploy_main --install --install-root "$work/program" || return 1
     export REPOS=owner/repo
     gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
@@ -833,6 +839,7 @@ resume_lifecycle() {
     gm_check_platform() { return 0; }
     gm_check_private_directory() { return 0; }
     flock() { return 0; }
+    gm_bootstrap_user_runlevel() { return 0; }
     gm_deploy_main --install --install-root "$work/program" || return 1
     export REPOS=git/git
     gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
@@ -840,6 +847,8 @@ resume_lifecycle() {
     source "$work/program/uninstall-git-mirror.sh"
     gm_check_platform() { return 0; }
     gm_check_private_directory() { return 0; }
+    # 重新加载共享实现后重建运行级引导桩，后续再次初始化才可在本地执行。
+    gm_bootstrap_user_runlevel() { return 0; }
     # 初次默认停止成功，不运行真实 OpenRC。
     rc-service() { return 0; }
     gm_uninstall_main --run-root "$work/instance" || return 1
@@ -926,6 +935,50 @@ for scenario in success busy stop-failure forged-record still-running status-err
     check "显式恢复生命周期：$scenario（服务及锁边界桩）" resume_lifecycle "$scenario"
 done
 
+# 验证 --init 在实例内准备用户 OpenRC 环境：白名单、服务登记与幂等，且不启动服务。
+init_prepares_user_openrc() {
+    local scenario=$1 work=$TEST_ROOT/init-openrc-$1
+    mkdir -- "$work" || return 1
+    (
+        clear_config_environment
+        source "$ROOT/scripts/deploy-git-mirror.sh"
+        require_function gm_deploy_main || exit 1
+        # 平台、私有权限与锁边界桩；运行级引导桩不掩盖实例内登记产物。
+        gm_check_platform() { return 0; }
+        gm_check_private_directory() { return 0; }
+        flock() { return 0; }
+        gm_bootstrap_user_runlevel() { return 0; }
+        # 服务控制边界桩：初始化一旦启动业务服务即失败。
+        rc-service() { printf 'called\n' >> "$work/rc-service-calls"; return 99; }
+        gm_deploy_main --install --install-root "$work/program" || exit 1
+        export REPOS=git/git
+        if [[ $scenario == preserve ]]; then
+            mkdir -p -- "$work/instance/config/rc" || exit 1
+            printf '%s\n' '# 用户已有配置' 'rc_env_allow="EXTRA_VAR"' > "$work/instance/config/rc/rc.conf"
+        fi
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
+        [[ ! -e $work/rc-service-calls ]] || { printf '初始化不应启动业务服务\n'; exit 1; }
+        local rc_conf=$work/instance/config/rc/rc.conf service link
+        [[ -f $rc_conf ]] || { printf '初始化未生成实例 rc.conf\n'; exit 1; }
+        grep -q 'rc_env_allow="[^"]*INSTALL_ROOT RUN_ROOT REPOS' "$rc_conf" || { printf 'rc_env_allow 缺少必要变量\n'; exit 1; }
+        if grep -q 'GITHUB_TOKEN' "$rc_conf"; then printf 'rc_env_allow 不应包含凭据变量\n'; exit 1; fi
+        for service in git-daemon git-mirror-sync git-mirror-hosts; do
+            link=$work/instance/config/rc/init.d/$service
+            [[ -L $link ]] || { printf '缺少实例服务登记：%s\n' "$service"; exit 1; }
+            [[ $(readlink -- "$link") == "$work/program/openrc/$service" ]] || { printf '登记目标不一致：%s\n' "$service"; exit 1; }
+        done
+        if [[ $scenario == preserve ]]; then
+            [[ $(head -n 1 "$rc_conf") == '# 用户已有配置' ]] || { printf '用户已有配置未被保留\n'; exit 1; }
+            grep -q 'EXTRA_VAR' "$rc_conf" || { printf '用户已有白名单未被保留\n'; exit 1; }
+        fi
+        cp -- "$rc_conf" "$work/before" || exit 1
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
+        cmp -s -- "$work/before" "$rc_conf" || { printf '重复初始化必须幂等\n'; exit 1; }
+    )
+}
+check '实例 OpenRC 环境初始化：fresh（平台与引导边界桩）' init_prepares_user_openrc fresh
+check '实例 OpenRC 环境初始化：preserve 且幂等（平台与引导边界桩）' init_prepares_user_openrc preserve
+
 # 用真实配置读取和独立消费者进程验证服务传参，仅替换平台、私有权限与锁边界。
 service_effective_config() {
     local scenario=$1 work=$TEST_ROOT/service-config-$1 status=0 output
@@ -938,6 +991,7 @@ service_effective_config() {
     gm_check_platform() { return 0; }
     gm_check_private_directory() { return 0; }
     flock() { return 0; }
+    gm_bootstrap_user_runlevel() { return 0; }
     gm_deploy_main --install --install-root "$work/program" || return 1
     export REPOS=git/git
     gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || return 1
