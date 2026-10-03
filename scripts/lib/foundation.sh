@@ -729,7 +729,7 @@ gm_prepare_runtime() {
 # 生成交付服务在实例用户 OpenRC 下真正需要的非凭据环境变量集合。
 # 凭据类变量不纳入白名单，daemon 启动前仍显式清除凭据，保留既有隔离行为。
 gm_required_env_allow() {
-    printf '%s' 'INSTALL_ROOT RUN_ROOT REPOS'
+    printf '%s' 'INSTALL_ROOT RUN_ROOT REPOS SHORT_LINKS GIT_PORT LISTEN_ADDRESS TZ ENABLE_CRON CRON_SCHEDULE ENABLE_HOSTS_UPDATE HOSTS_CRON HOSTS_URL HOSTS_URL_FALLBACK PROXY_URL'
 }
 
 # 解析实例 rc.conf 中全部 rc_env_allow 赋值标记，无法安全解析时返回非零交由调用方失败关闭。

@@ -93,6 +93,18 @@ FIXTURE
 # OpenRC 调度边界桩仅执行服务自己的 start_pre 和 command，不补任何配置接线。
 run_service() {
     bash -c '
+        if [[ ${SERVICE_FILTER_ENVIRONMENT-} == 1 ]]; then
+            source "$INSTALL_ROOT/lib/foundation.sh"
+            allowed=$(gm_read_rc_env_allow "$RUN_ROOT/config/rc/rc.conf" | tr "\n" " ") || exit 1
+            for key in GIT_PORT LISTEN_ADDRESS TZ ENABLE_CRON CRON_SCHEDULE ENABLE_HOSTS_UPDATE HOSTS_CRON HOSTS_URL HOSTS_URL_FALLBACK PROXY_URL SHORT_LINKS; do
+                case " $allowed " in *" $key "*) ;; *) unset "$key" ;; esac
+            done
+            gm_load_config "$RUN_ROOT/config/mirror.env" || exit 1
+            for key in ENABLE_CRON CRON_SCHEDULE ENABLE_HOSTS_UPDATE HOSTS_CRON HOSTS_URL HOSTS_URL_FALLBACK PROXY_URL; do
+                [[ ${GM_CONFIG[$key]} == "${!key-}" ]] || { printf "配置未一致传递：%s\n" "$key"; exit 1; }
+            done
+            [[ ${SHORT_LINKS-} == "git/git fixture" ]] || exit 1
+        fi
         source "$INSTALL_ROOT/openrc/git-daemon" || exit $?
         printf "%s\n" "${pidfile-}" > "$SERVICE_CAPTURE/pidfile"
         if [[ ${SERVICE_DISCONNECT-} == 1 ]]; then
@@ -152,6 +164,11 @@ daemon_configuration() {
             ;;
         environment)
             export GIT_PORT=23456 LISTEN_ADDRESS=::1 TZ=Asia/Hong_Kong
+            if [[ ${SERVICE_FILTER_ENVIRONMENT-} == 1 ]]; then
+                export ENABLE_CRON=no CRON_SCHEDULE='5 4 * * *' ENABLE_HOSTS_UPDATE=no HOSTS_CRON='6 4 * * *'
+                export HOSTS_URL=https://example.invalid/primary HOSTS_URL_FALLBACK=https://example.invalid/fallback
+                export PROXY_URL=https://example.invalid:8443 SHORT_LINKS='git/git fixture'
+            fi
             expected_port=23456; expected_address=::1; expected_timezone=Asia/Hong_Kong
             ;;
         invalid-address)
@@ -332,6 +349,13 @@ FIXTURE
     cmp -s -- "$work/config.before" "$RUN_ROOT/config/mirror.env"
 }
 
+# 使用初始化生成的白名单模拟真实 OpenRC 过滤，验证环境仍优先且不回写。
+filtered_environment_configuration() {
+    export SERVICE_FILTER_ENVIRONMENT=1
+    daemon_configuration environment
+}
+
+check 'OpenRC 白名单过滤后环境优先且不回写' filtered_environment_configuration
 check '同步交付入口使用文件时区（外部边界桩）' worker_configuration git-mirror-sync
 check '刷新交付入口使用文件 URL 与时区（外部边界桩）' worker_configuration git-mirror-hosts
 check 'OpenRC 生产接线断开必须失败（故障注入）' disconnected_wiring_guard
