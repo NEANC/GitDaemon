@@ -309,7 +309,7 @@ git() {
 curl() {
     printf '%s\n' "$@" > "$SERVICE_CAPTURE/curl-argv"
     printf '%s\n' "${TZ-unset}" >> "$SERVICE_CAPTURE/worker-timezone"
-    printf '%s\n' snapshot > "$RUN_ROOT/hosts/github-hosts.snapshot.tmp"
+    printf '%s\n' '140.82.121.3 github.com' > "$RUN_ROOT/hosts/github-hosts.snapshot.tmp"
 }
 FIXTURE
     mkdir -p -- "$RUN_ROOT/repos/git/git.git" || return 1

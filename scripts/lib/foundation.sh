@@ -104,6 +104,123 @@ gm_validate_address() {
     return 0
 }
 
+# hosts 数据下载体积上限（字节），同时用于 curl 限制与下载后复核。
+GM_HOSTS_MAX_BYTES=1048576
+
+# 判断地址是否为可公开路由的 IPv4 或 IPv6，拒绝回环、私网、链路本地、元数据与保留段。
+gm_hosts_public_address() {
+    local value=$1
+    gm_validate_address "$value" || return 1
+    if [[ $value == *:* ]]; then
+        gm_hosts_public_ipv6 "$value"
+    else
+        gm_hosts_public_ipv4 "$value"
+    fi
+}
+
+# 判断 IPv4 是否落在可公开路由范围，拒绝各类保留、专用与元数据网段。
+gm_hosts_public_ipv4() {
+    local value=$1 a b c
+    local -a octets=()
+    IFS=. read -r -a octets <<< "$value"
+    a=$((10#${octets[0]}))
+    b=$((10#${octets[1]}))
+    c=$((10#${octets[2]}))
+    (( a == 0 || a == 10 || a == 127 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 0 )) && return 1
+    (( a == 192 && b == 88 && c == 99 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+    (( a == 198 && b == 51 && c == 100 )) && return 1
+    (( a == 203 && b == 0 && c == 113 )) && return 1
+    (( a >= 224 )) && return 1
+    return 0
+}
+
+# 判断 IPv6 是否落在可公开路由范围，拒绝环回、未指定、唯一本地、链路本地与组播。
+gm_hosts_public_ipv6() {
+    local lower=$1
+    lower=$(printf '%s' "$lower" | tr 'ABCDEF' 'abcdef')
+    case "$lower" in
+        ::*) return 1 ;;
+        fc*|fd*) return 1 ;;
+        fe8*|fe9*|fea*|feb*) return 1 ;;
+        ff*) return 1 ;;
+    esac
+    return 0
+}
+
+# 域名必须在固定白名单内，数据源不得扩展白名单。
+gm_hosts_domain_allowed() {
+    case "$1" in
+        github.com) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 解析 hosts 文本，仅保留白名单域名与合法公网地址，去重排序后输出 "IP 域名" 记录。
+gm_hosts_filter_records() {
+    local line ip hostname extra record
+    local -A seen=()
+    local -a records=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}
+        [[ -z $line || $line == \#* ]] && continue
+        read -r ip hostname extra <<< "$line"
+        [[ -n $ip && -n $hostname ]] || continue
+        [[ $ip != *'*'* && $hostname != *'*'* ]] || continue
+        gm_hosts_public_address "$ip" || continue
+        gm_hosts_domain_allowed "$hostname" || continue
+        record="$ip $hostname"
+        [[ ! ${seen[$record]+present} ]] || continue
+        seen[$record]=1
+        records+=("$record")
+    done
+    [[ ${#records[@]} -gt 0 ]] || return 1
+    printf '%s\n' "${records[@]}" | LC_ALL=C sort -u
+    return 0
+}
+
+# 读取卷内快照的纯数据部分并重新校验，无效、空响应或缺必需域名时返回非零。
+gm_hosts_read_snapshot() {
+    local file=$1
+    [[ -f $file && -r $file ]] || return 1
+    grep -v '^#' -- "$file" | gm_hosts_filter_records
+}
+
+# 从 stdin 读取已校验记录，输出带来源、获取时间、记录数与摘要头的纯数据快照。
+gm_hosts_render_snapshot() {
+    local source=$1 fetched=$2 line payload digest count
+    local -a lines=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] && lines+=("$line")
+    done
+    (( ${#lines[@]} > 0 )) || return 1
+    payload=$(printf '%s\n' "${lines[@]}")
+    digest=$(printf '%s\n' "$payload" | sha256sum)
+    digest=${digest%% *}
+    count=${#lines[@]}
+    printf '# FORMAT=1\n# SOURCE=%s\n# FETCHED=%s\n# DIGEST=sha256:%s\n# COUNT=%s\n' "$source" "$fetched" "$digest" "$count"
+    printf '%s\n' "${lines[@]}"
+    return 0
+}
+
+# 从 HTTPS 来源下载 hosts 数据到卷内文件；限制体积、超时与重定向并始终校验 TLS。
+gm_hosts_download() {
+    local url=$1 out=$2 size
+    : > "$out" || return 1
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --fail --silent --show-error --location --max-redirs 3 \
+        --connect-timeout 10 --max-time 30 --max-filesize "$GM_HOSTS_MAX_BYTES" \
+        --output "$out" -- "$url" || return 1
+    size=$(wc -c < "$out") || return 1
+    (( size > 0 && size <= GM_HOSTS_MAX_BYTES ))
+}
+
 # 对固定配置键分别校验，错误诊断只报告键名。
 gm_validate_config_value() {
     local key=$1 value=$2
@@ -140,8 +257,8 @@ gm_load_config() {
         [CRON_SCHEDULE]='0 * * * *'
         [ENABLE_HOSTS_UPDATE]=yes
         [HOSTS_CRON]='0 3 * * *'
-        [HOSTS_URL]=https://api.github.com/meta
-        [HOSTS_URL_FALLBACK]=''
+        [HOSTS_URL]=https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts
+        [HOSTS_URL_FALLBACK]=https://raw.hellogithub.com/hosts
         [PROXY_URL]=''
         [GITHUB_TOKEN_FILE]=''
     )
@@ -539,7 +656,7 @@ gm_prepare_runtime() {
     local run=$1 install=$2 directory repo credential executable
     gm_check_identity || return 1
     gm_check_platform || return 1
-    for executable in git curl flock stat realpath; do
+    for executable in git curl flock stat realpath sha256sum; do
         command -v "$executable" >/dev/null 2>&1 || { gm_error "缺少必要依赖：$executable"; return 1; }
     done
     gm_validate_instance_paths "$run" "$install" || return 1
