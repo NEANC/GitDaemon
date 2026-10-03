@@ -668,7 +668,37 @@ gm_prepare_instance_openrc() {
     return 0
 }
 
-# 仅控制安装目录中的本实例用户服务，任何停止失败均向上传播。
+# 判断 PID 当前是否为存活进程，用于服务状态之外的进程证据核对。
+gm_process_alive() {
+    local pid=$1
+    [[ $pid =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+# 在实例内确认服务已登记可解析且确实停止；未登记时不伪报已停止。
+gm_confirm_service_stopped() {
+    local run=$1 service=$2 status=0 pidfile pid
+    rc-service --user -e "$service" >/dev/null 2>&1 || { gm_error "实例用户服务未登记或不可解析：$service"; return 1; }
+    rc-service --user "$service" status >/dev/null 2>&1 || status=$?
+    case "$status" in
+        0) gm_error "实例服务仍在运行：$service"; return 1 ;;
+        3) ;;
+        *) gm_error "无法确认实例服务状态：$service"; return 1 ;;
+    esac
+    if [[ $service == git-daemon ]]; then
+        pidfile=$run/runtime/git-daemon.pid
+        if [[ -f $pidfile && -r $pidfile ]]; then
+            IFS= read -r pid < "$pidfile" || pid=
+            if gm_process_alive "$pid"; then
+                gm_error '实例服务仍有存活进程：git-daemon'
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+# 仅控制实例内已登记的用户服务，未登记或不可解析时不伪报已停止。
 gm_stop_instance_service() {
     local service=$1 path
     case "$service" in git-mirror-scheduler|git-mirror-sync|git-mirror-hosts|git-daemon) ;;
@@ -677,13 +707,14 @@ gm_stop_instance_service() {
     path=$INSTALL_ROOT/openrc/$service
     gm_validate_file "$path" read || return 1
     [[ -f $path && -x $path ]] || { gm_error '所需实例服务定义缺失'; return 1; }
-    rc-service --user "$path" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
+    rc-service --user -e "$service" >/dev/null 2>&1 || { gm_error "实例用户服务未登记或不可解析：$service"; return 1; }
+    rc-service --user "$service" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
     return 0
 }
 
 # 显式恢复先停止旧服务，再按既有锁序核验实例；仅解除停止标记，不启动服务或删除 PID。
 gm_resume_instance() (
-    local run=$1 install=$2 service status
+    local run=$1 install=$2 service
     local -a services=(git-mirror-sync git-mirror-hosts git-daemon)
     gm_prepare_runtime "$run" "$install" || return $?
     command -v rc-service >/dev/null 2>&1 || { gm_error '缺少必要依赖：rc-service'; return 1; }
@@ -707,9 +738,7 @@ gm_resume_instance() (
         services=(git-mirror-scheduler "${services[@]}")
     fi
     for service in "${services[@]}"; do
-        status=0
-        rc-service --user "$install/openrc/$service" status >/dev/null 2>&1 || status=$?
-        [[ $status == 3 ]] || { gm_error '实例服务未确认停止，保留停止标记'; return 1; }
+        gm_confirm_service_stopped "$run" "$service" || return 1
     done
     if [[ -e $run/runtime/stopped ]]; then
         gm_match_record "$run/runtime/stopped" 'STOPPED=1' || return 1

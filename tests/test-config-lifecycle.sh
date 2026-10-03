@@ -562,9 +562,13 @@ uninstall_behavior() {
         gm_check_private_directory() { return 0; }
         local status=0 output category run=$work/instance
         local -a options=(--run-root "$run" --install-root "$work/program")
-        # 服务控制边界桩只允许本测试程序目录的用户模式停止调用。
+        # 服务控制边界桩：按登记名接受，-e 计数到独立文件，stop 记录到 services。
         rc-service() {
-            [[ ${1-} == --user && ${2-} == "$work/program/openrc/"* && ${3-} == stop && $# == 3 ]] || return 90
+            if [[ ${1-} == --user && ${2-} == -e && $# == 3 ]]; then
+                printf 'exists %s\n' "${3-}" >> "$work/checks"
+                return 0
+            fi
+            [[ $# == 3 && ${1-} == --user && ${3-} == stop ]] || return 90
             printf '%s\n' "$*" >> "$work/services"
             if [[ $scenario == stop-failure ]]; then return 23; fi
             return 0
@@ -641,12 +645,12 @@ uninstall_behavior() {
                 else
                     local expected_services= expected_service
                     if [[ $scenario == scheduler-installed ]]; then
-                        expected_services="--user $work/program/openrc/git-mirror-scheduler stop"$'\n'
+                        expected_services="--user git-mirror-scheduler stop"$'\n'
                     else
                         [[ $(<"$work/program/service-capabilities.conf") == $'FORMAT=1\nSCHEDULER=absent' ]] || exit 1
                     fi
                     for expected_service in git-mirror-sync git-mirror-hosts git-daemon; do
-                        expected_services+="--user $work/program/openrc/$expected_service stop"$'\n'
+                        expected_services+="--user $expected_service stop"$'\n'
                     done
                     [[ -f $work/services && $(<"$work/services") == "${expected_services%$'\n'}" ]] || exit 1
                     [[ -s $work/locks && $(<"$run/runtime/stopped") == STOPPED=1 ]] || exit 1
@@ -702,10 +706,10 @@ uninstall_behavior() {
                 [[ ! -e $run/runtime/stopped ]] || exit 1
                 case "$scenario" in
                     stop-failure)
-                        [[ $(<"$work/services") == "--user $work/program/openrc/git-mirror-sync stop" && ! -e $work/locks ]] || exit 1
+                        [[ $(<"$work/services") == "--user git-mirror-sync stop" && ! -e $work/locks ]] || exit 1
                         ;;
                     busy|lock-error)
-                        expected_services="--user $work/program/openrc/git-mirror-sync stop"$'\n'"--user $work/program/openrc/git-mirror-hosts stop"
+                        expected_services="--user git-mirror-sync stop"$'\n'"--user git-mirror-hosts stop"
                         [[ $(<"$work/services") == "$expected_services" ]] || exit 1
                         local -a lock_calls=()
                         mapfile -t lock_calls < "$work/locks"
@@ -762,8 +766,9 @@ managed_link_cleanup() {
     gm_check_private_directory() { return 0; }
     # 记录跨层停止与锁序，拒绝其他实例及非停止服务操作。
     rc-service() {
-        [[ $# == 3 && $1 == --user && $2 == "$work/program/openrc/"* && $3 == stop ]] || return 90
-        printf 'stop %s\n' "${2##*/}" >> "$work/calls"
+        if [[ $# == 3 && $1 == --user && $2 == -e ]]; then return 0; fi
+        [[ $# == 3 && $1 == --user && $3 == stop ]] || return 90
+        printf 'stop %s\n' "$2" >> "$work/calls"
         return 0
     }
     gm_lock_acquire() {
@@ -868,22 +873,25 @@ resume_lifecycle() {
     }
     # 服务边界桩记录停止与状态查询；返回码契约不代表真实 OpenRC 验证。
     rc-service() {
-        [[ $# == 3 && $1 == --user && $2 == "$work/program/openrc/"* ]] || return 90
+        if [[ ${1-} == --user && ${2-} == -e && $# == 3 ]]; then
+            printf 'exists %s\n' "${3-}" >> "$work/checks"
+            return 0
+        fi
+        [[ $# == 3 && ${1-} == --user && ( ${3-} == stop || ${3-} == status ) ]] || return 90
         case "$3" in
             stop)
-                printf 'stop %s\n' "${2##*/}" >> "$work/calls"
+                printf 'stop %s\n' "$2" >> "$work/calls"
                 if [[ $scenario == stop-failure ]]; then return 23; fi
                 return 0
                 ;;
             status)
-                printf 'status %s\n' "${2##*/}" >> "$work/calls"
+                printf 'status %s\n' "$2" >> "$work/calls"
                 case "$scenario" in
                     still-running) return 0 ;;
                     status-error) return 23 ;;
                     *) return 3 ;;
                 esac
                 ;;
-            *) return 90 ;;
         esac
     }
     if [[ $scenario == forged-record ]]; then
@@ -914,10 +922,17 @@ resume_lifecycle() {
         stop-failure)
             [[ $status == 1 && $output == *'实例服务停止失败'* && $(<"$work/calls") == 'stop git-mirror-sync' ]] || return 1
             ;;
-        still-running|status-error)
+        still-running)
             expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync'
-            [[ $status == 1 && $output == *'实例服务未确认停止，保留停止标记'* && $(<"$work/calls") == "$expected" ]] || {
-                printf '未确认服务停止时必须拒绝恢复：status=%s\n%s\n' "$status" "$output"
+            [[ $status == 1 && $output == *'实例服务仍在运行：git-mirror-sync'* && $(<"$work/calls") == "$expected" ]] || {
+                printf '报告运行中的服务必须拒绝恢复：status=%s\n%s\n' "$status" "$output"
+                return 1
+            }
+            ;;
+        status-error)
+            expected=$'stop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-sync'
+            [[ $status == 1 && $output == *'无法确认实例服务状态：git-mirror-sync'* && $(<"$work/calls") == "$expected" ]] || {
+                printf '不可靠状态必须失败关闭：status=%s\n%s\n' "$status" "$output"
                 return 1
             }
             ;;
@@ -978,6 +993,50 @@ init_prepares_user_openrc() {
 }
 check '实例 OpenRC 环境初始化：fresh（平台与引导边界桩）' init_prepares_user_openrc fresh
 check '实例 OpenRC 环境初始化：preserve 且幂等（平台与引导边界桩）' init_prepares_user_openrc preserve
+
+# 验证服务未登记或不可解析时恢复与停止失败关闭，不凭 status 报已停止。
+service_unregistered_rejected() {
+    local kind=$1 work=$TEST_ROOT/unreg-$1 status=0 output
+    mkdir -- "$work" || return 1
+    (
+        clear_config_environment
+        source "$ROOT/scripts/deploy-git-mirror.sh"
+        require_function gm_deploy_main || exit 1
+        gm_check_platform() { return 0; }
+        gm_check_private_directory() { return 0; }
+        flock() { return 0; }
+        gm_bootstrap_user_runlevel() { return 0; }
+        gm_deploy_main --install --install-root "$work/program" || exit 1
+        export REPOS=git/git
+        gm_deploy_main --init --install-root "$work/program" --run-root "$work/instance" || exit 1
+        # 服务控制桩：按名字 -e 报未登记，绝对路径 status 仍报 3（旧实现的误导信号）。
+        rc-service() {
+            if [[ ${1-} == --user && ${2-} == -e ]]; then
+                printf 'exists %s\n' "${3-}" >> "$work/calls"
+                return 1
+            fi
+            printf '%s\n' "$*" >> "$work/calls"
+            case "${3-}" in
+                status) return 3 ;;
+                stop) return 0 ;;
+                *) return 90 ;;
+            esac
+        }
+        printf stopped > "$work/instance/runtime/stopped"
+        status=0
+        case "$kind" in
+            resume) output=$(gm_resume_instance "$work/instance" "$work/program" 2>&1) || status=$? ;;
+            stop) output=$(gm_stop_instance_service git-daemon 2>&1) || status=$? ;;
+        esac
+        [[ $status == 1 && $output == *'未登记或不可解析'* ]] || {
+            printf '未登记服务必须失败关闭：kind=%s，status=%s，诊断=%s\n' "$kind" "$status" "$output"
+            exit 1
+        }
+        [[ $(<"$work/instance/runtime/stopped") == stopped ]] || exit 1
+    )
+}
+check '未登记服务恢复失败关闭（服务边界桩）' service_unregistered_rejected resume
+check '未登记服务停止失败关闭（服务边界桩）' service_unregistered_rejected stop
 
 # 用真实配置读取和独立消费者进程验证服务传参，仅替换平台、私有权限与锁边界。
 service_effective_config() {

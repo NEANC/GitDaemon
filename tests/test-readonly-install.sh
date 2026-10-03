@@ -97,8 +97,11 @@ service_uses_read_boundary() {
     chmod 755 -- "$INSTALL_ROOT/openrc/git-daemon" || return 1
     # 文件访问模式边界桩，验证停止操作仅请求读取服务文件。
     gm_validate_file() { [[ $1 == "$INSTALL_ROOT/openrc/git-daemon" && ${2-} == read ]]; }
-    # 服务边界桩只允许本临时安装的用户模式停止命令。
-    rc-service() { [[ $# == 3 && $1 == --user && $2 == "$INSTALL_ROOT/openrc/git-daemon" && $3 == stop ]]; }
+    # 服务边界桩只允许本临时安装的已登记用户模式服务操作。
+    rc-service() {
+        if [[ $# == 3 && $1 == --user && $2 == -e && $3 == git-daemon ]]; then return 0; fi
+        [[ $# == 3 && $1 == --user && $2 == git-daemon && $3 == stop ]]
+    }
     gm_stop_instance_service git-daemon
 }
 
