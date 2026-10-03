@@ -105,6 +105,12 @@ assemble_fills_gaps() {
     return 0
 }
 
+# 组装脚本预置运行根 /var/lib/git-daemon（usermode 下归属非 root），供命名卷首次挂载继承属主。
+assemble_prepares_runtime_root() {
+    grep -Fq 'ensure_directory "$root/var/lib/git-daemon"' "$ROOT/docker/assemble-deps.sh" || return 1
+    return 0
+}
+
 # .dockerignore 覆盖版本库、文档、测试夹具、运行数据、日志与凭据。
 dockerignore_covers() {
     local file=$ROOT/.dockerignore
@@ -177,6 +183,7 @@ check 'Dockerfile 不携带测试夹具、版本库与文档' dockerfile_exclude
 check '依赖包集合完整且不含 SSH 组件' assemble_packages_ok
 check '依赖组装保持签名与 TLS 校验' assemble_keeps_verification
 check '--scripts=no 缺口被显式补齐' assemble_fills_gaps
+check '组装脚本预置运行根' assemble_prepares_runtime_root
 check '.dockerignore 覆盖必须排除项' dockerignore_covers
 check '入口静态约束满足' entrypoint_static_checks
 check '入口拒绝 UID 0' entrypoint_rejects_uid_zero

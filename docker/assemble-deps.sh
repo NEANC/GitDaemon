@@ -228,10 +228,13 @@ ensure_baselayout_files() {
 }
 
 # 创建 OpenRC 运行目录与临时目录，并把 /var/run 指向 /run。
+# 同时预置运行根 /var/lib/git-daemon：usermode 下归属执行用户（镜像内为 UID 10001），
+# 使全新空命名卷首次挂载时按镜像内属主与权限初始化，入口无需 root 预初始化。
 ensure_runtime_directories() {
     ensure_directory "$root/run" 755
     ensure_directory "$root/tmp" 1777
     ensure_symlink ../run "$root/var/run"
+    ensure_directory "$root/var/lib/git-daemon" 755
     return 0
 }
 
