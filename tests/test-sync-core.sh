@@ -5,6 +5,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/git-sync-core.XXXXXXXX") || exit 1
 CHECKS=0
 FAILURES=0
+# Git Bash 需要真实符号链接表示，短链接行为才与 Alpine 一致。
+export MSYS=winsymlinks:sys
 
 # 仅清理本测试通过 mktemp 创建的目录。
 cleanup() {
@@ -570,6 +572,143 @@ update_repo_all_paths_fail() {
     [[ ! -e $dir/git-daemon-export-ok ]]
 }
 
+# 创建本地符号链接，Git Bash 下强制使用真实链接表示。
+make_link() {
+    local target=$1 link=$2
+    case "$(uname -s)" in
+        MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$target" "$link" ;;
+        *) ln -s -- "$target" "$link" ;;
+    esac
+}
+
+# 已发布仓库的短链接为指向同级 owner/repo.git 的相对链接，并写入受管理记录。
+short_link_created_relative() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-create LOG_FILE=$TEST_ROOT/shortlink-create.log
+    mkdir -p -- "$run/repos/owner/repo.git" || return 1
+    printf '%s\n' repository > "$run/repos/owner/repo.git/sentinel"
+    : > "$run/repos/owner/repo.git/git-daemon-export-ok"
+    : > "$LOG_FILE"
+    gm_create_short_link "$run" owner/repo alias || return 1
+    [[ -L $run/repos/alias.git ]] || { printf '短链接未创建\n'; return 1; }
+    [[ $(readlink -- "$run/repos/alias.git") == owner/repo.git ]] || { printf '相对目标不正确\n'; return 1; }
+    [[ $(<"$run/config/managed-links/alias.git") == $'FORMAT=1\nTARGET=owner/repo.git' ]] || { printf '管理记录不正确\n'; return 1; }
+    [[ $(<"$run/repos/owner/repo.git/sentinel") == repository ]] || return 1
+    [[ ! -e $run/repos/alias && ! -L $run/repos/alias ]]
+}
+
+# 未写发布标记的仓库不得产生短链接。
+short_link_requires_published_target() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-unpublished LOG_FILE=$TEST_ROOT/shortlink-unpublished.log
+    mkdir -p -- "$run/repos/owner/repo.git" || return 1
+    : > "$LOG_FILE"
+    if gm_create_short_link "$run" owner/repo alias 2>/dev/null; then
+        printf '未发布仓库创建了短链接\n'
+        return 1
+    fi
+    [[ ! -e $run/repos/alias.git && ! -L $run/repos/alias.git ]]
+}
+
+# 目标仓库缺失时不得创建短链接。
+short_link_missing_target_fails() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-missing LOG_FILE=$TEST_ROOT/shortlink-missing.log
+    mkdir -p -- "$run/repos" || return 1
+    : > "$LOG_FILE"
+    if gm_create_short_link "$run" owner/repo alias 2>/dev/null; then
+        printf '缺失目标创建了短链接\n'
+        return 1
+    fi
+    [[ ! -e $run/repos/alias.git && ! -L $run/repos/alias.git ]]
+}
+
+# 指向他处的非受管理链接必须失败关闭，绝不覆盖。
+short_link_refuses_foreign_link() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-foreign LOG_FILE=$TEST_ROOT/shortlink-foreign.log
+    mkdir -p -- "$run/repos/owner/repo.git" "$run/repos/other" || return 1
+    : > "$run/repos/owner/repo.git/git-daemon-export-ok"
+    : > "$LOG_FILE"
+    make_link other "$run/repos/alias.git" || return 1
+    if gm_create_short_link "$run" owner/repo alias 2>/dev/null; then
+        printf '非受管理链接被覆盖\n'
+        return 1
+    fi
+    [[ -L $run/repos/alias.git && $(readlink -- "$run/repos/alias.git") == other ]]
+}
+
+# 短链接位置已存在非链接对象时必须失败关闭，绝不覆盖。
+short_link_refuses_existing_directory() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-dir LOG_FILE=$TEST_ROOT/shortlink-dir.log
+    mkdir -p -- "$run/repos/owner/repo.git" "$run/repos/alias.git" || return 1
+    : > "$run/repos/owner/repo.git/git-daemon-export-ok"
+    printf '%s\n' data > "$run/repos/alias.git/sentinel"
+    : > "$LOG_FILE"
+    if gm_create_short_link "$run" owner/repo alias 2>/dev/null; then
+        printf '既有目录被覆盖\n'
+        return 1
+    fi
+    [[ -d $run/repos/alias.git && $(<"$run/repos/alias.git/sentinel") == data ]]
+}
+
+# 受管理短链接重复创建为幂等动作，链接与记录保持不变。
+short_link_idempotent() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-idem LOG_FILE=$TEST_ROOT/shortlink-idem.log
+    mkdir -p -- "$run/repos/owner/repo.git" || return 1
+    : > "$run/repos/owner/repo.git/git-daemon-export-ok"
+    : > "$LOG_FILE"
+    gm_create_short_link "$run" owner/repo alias || return 1
+    gm_create_short_link "$run" owner/repo alias || return 1
+    [[ -L $run/repos/alias.git && $(readlink -- "$run/repos/alias.git") == owner/repo.git ]]
+}
+
+# 同一短名指向目标变化时按受管理协议更新链接与记录。
+short_link_updates_changed_target() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-update LOG_FILE=$TEST_ROOT/shortlink-update.log
+    mkdir -p -- "$run/repos/old/repo.git" "$run/repos/new/repo.git" || return 1
+    : > "$run/repos/old/repo.git/git-daemon-export-ok"
+    : > "$run/repos/new/repo.git/git-daemon-export-ok"
+    : > "$LOG_FILE"
+    gm_create_short_link "$run" old/repo alias || return 1
+    gm_create_short_link "$run" new/repo alias || return 1
+    [[ $(readlink -- "$run/repos/alias.git") == new/repo.git ]] || return 1
+    [[ $(<"$run/config/managed-links/alias.git") == $'FORMAT=1\nTARGET=new/repo.git' ]]
+}
+
+# 同名短名 git/git git 创建 repos/git.git 且绝不覆盖 owner 目录 repos/git。
+short_link_same_name_preserves_owner_dir() {
+    require_function gm_create_short_link || return 1
+    local run=$TEST_ROOT/shortlink-samename LOG_FILE=$TEST_ROOT/shortlink-samename.log
+    mkdir -p -- "$run/repos/git/git.git" || return 1
+    : > "$run/repos/git/git.git/git-daemon-export-ok"
+    printf '%s\n' repository > "$run/repos/git/git.git/sentinel"
+    : > "$LOG_FILE"
+    gm_create_short_link "$run" git/git git || return 1
+    [[ -L $run/repos/git.git ]] || { printf '同名短链接未创建\n'; return 1; }
+    [[ $(readlink -- "$run/repos/git.git") == git/git.git ]] || return 1
+    [[ -d $run/repos/git && ! -L $run/repos/git ]] || { printf 'owner 目录被替换\n'; return 1; }
+    [[ $(<"$run/repos/git/git.git/sentinel") == repository ]]
+}
+
+# 发布仅作用于当前仓库匹配的映射，不触碰其他映射。
+short_link_publish_matches_target() {
+    require_function gm_publish_short_links || return 1
+    local run=$TEST_ROOT/shortlink-publish LOG_FILE=$TEST_ROOT/shortlink-publish.log
+    mkdir -p -- "$run/repos/owner/repo.git" || return 1
+    : > "$run/repos/owner/repo.git/git-daemon-export-ok"
+    : > "$LOG_FILE"
+    GM_LINK_TARGETS=(owner/repo other/repo)
+    GM_LINK_NAMES=(alias other)
+    gm_publish_short_links "$run" owner/repo || return 1
+    [[ -L $run/repos/alias.git ]] || return 1
+    [[ ! -e $run/repos/other.git && ! -L $run/repos/other.git ]] || { printf '非目标仓库创建了短链接\n'; return 1; }
+    return 0
+}
+
 check '配置失败必须显式传播（非仓库目录）' configure_propagates_failure
 check '缺键容错仅接受退出码 5' configure_tolerates_absent_key
 check '缺键时 configure_unset 返回 0' configure_unset_absent_key_returns_zero
@@ -603,6 +742,15 @@ check 'fetch 实际应用快照映射参数' update_repo_applies_mapping
 check '系统 DNS 路径不带映射参数' update_repo_system_path_has_no_mapping
 check '传输失败按固定顺序回退' update_repo_falls_back_over_paths
 check '全部传输路径失败即同步失败' update_repo_all_paths_fail
+check '短链接为相对目标并写入受管理记录' short_link_created_relative
+check '未发布仓库不创建短链接' short_link_requires_published_target
+check '目标仓库缺失不创建短链接' short_link_missing_target_fails
+check '非受管理链接失败关闭不覆盖' short_link_refuses_foreign_link
+check '既有非链接对象失败关闭不覆盖' short_link_refuses_existing_directory
+check '同一映射重复创建为幂等' short_link_idempotent
+check '目标变化时更新受管理链接与记录' short_link_updates_changed_target
+check '同名短链接不覆盖 owner 目录' short_link_same_name_preserves_owner_dir
+check '发布仅作用于匹配仓库的映射' short_link_publish_matches_target
 
 printf '同步核心行为检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
 [[ $FAILURES == 0 ]]

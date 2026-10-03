@@ -753,14 +753,14 @@ managed_link_cleanup() {
         *) return 1 ;;
     esac
     if [[ $scenario != unknown ]]; then
-        gm_create_data_file "$work/instance/config/managed-links/alias" "$(printf 'FORMAT=1\nTARGET=%s' "$record_target")" || return 1
+        gm_create_data_file "$work/instance/config/managed-links/alias.git" "$(printf 'FORMAT=1\nTARGET=%s' "$record_target")" || return 1
     fi
     # Git Bash 链接表示仅提供本地行为证据，不等同于 Linux 原生链接验收。
     case "$(uname -s)" in
-        MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$target" "$work/instance/repos/alias" || return 1 ;;
-        *) ln -s -- "$target" "$work/instance/repos/alias" || return 1 ;;
+        MINGW*|MSYS*) MSYS=winsymlinks:sys ln -s -- "$target" "$work/instance/repos/alias.git" || return 1 ;;
+        *) ln -s -- "$target" "$work/instance/repos/alias.git" || return 1 ;;
     esac
-    [[ -L $work/instance/repos/alias ]] || return 1
+    [[ -L $work/instance/repos/alias.git ]] || return 1
     source "$work/program/uninstall-git-mirror.sh"
     gm_check_platform() { return 0; }
     gm_check_private_directory() { return 0; }
@@ -778,11 +778,11 @@ managed_link_cleanup() {
     # 记录真实删除命令；解除链接时目标仍存在，递归清理前链接已解除。
     rm() {
         printf '%s\n' "$*" >> "$work/removals"
-        if [[ ${2-} == "$work/instance/repos/alias" ]]; then
+        if [[ ${2-} == "$work/instance/repos/alias.git" ]]; then
             [[ $# == 2 && $1 == -- && -L $2 ]] || return 91
             [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 92
         elif [[ ${3-} == "$work/instance/repos" ]]; then
-            [[ $# == 3 && $1 == -rf && $2 == -- && ! -L $work/instance/repos/alias ]] || return 93
+            [[ $# == 3 && $1 == -rf && $2 == -- && ! -L $work/instance/repos/alias.git ]] || return 93
             [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 94
         fi
         command rm "$@"
@@ -799,9 +799,9 @@ managed_link_cleanup() {
             return 1
         }
         [[ $(<"$work/calls") == "$expected" && $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
-        [[ ! -e $work/instance/config/managed-links/alias ]] || return 1
+        [[ ! -e $work/instance/config/managed-links/alias.git ]] || return 1
         local expected_removals
-        expected_removals="-- $work/instance/repos/alias"$'\n'"-- $work/instance/config/managed-links/alias"$'\n'"-rf -- $work/instance/repos"
+        expected_removals="-- $work/instance/repos/alias.git"$'\n'"-- $work/instance/config/managed-links/alias.git"$'\n'"-rf -- $work/instance/repos"
         [[ $(<"$work/removals") == "$expected_removals" ]] || return 1
     else
         [[ $status == 1 && $output == *"$expected"* ]] || {
@@ -809,23 +809,23 @@ managed_link_cleanup() {
             return 1
         }
         [[ ! -e $work/calls && ! -e $work/removals && ! -e $work/instance/runtime/stopped ]] || return 1
-        [[ -L $work/instance/repos/alias && $(readlink -- "$work/instance/repos/alias") == "$target" ]] || return 1
+        [[ -L $work/instance/repos/alias.git && $(readlink -- "$work/instance/repos/alias.git") == "$target" ]] || return 1
         [[ $(<"$work/instance/repos/owner/repo.git/sentinel") == repository ]] || return 1
     fi
     return 0
 }
 
-# 已有 owner 目录即使有同名管理记录也不是可解除的链接对象。
+# owner 目录永不被当作受管理短链接，同名短名也不得覆盖 owner 目录内容。
 managed_link_owner_preserved() {
     local run=$TEST_ROOT/managed-owner status=0 output
     mkdir -p -- "$run/repos/git/git.git" "$run/config/managed-links" || return 1
     printf '%s\n' repository > "$run/repos/git/git.git/sentinel"
-    gm_create_data_file "$run/config/managed-links/git" $'FORMAT=1\nTARGET=git/git.git' || return 1
+    gm_create_data_file "$run/config/managed-links/git.git" $'FORMAT=1\nTARGET=git/git.git' || return 1
     output=$(gm_validate_managed_link "$run" "$run/repos/git" 2>&1) || status=$?
-    [[ $status == 1 && $output == 'git-mirror: 受管理短链接对象类型异常' ]] || return 1
+    [[ $status == 1 && $output == 'git-mirror: 未登记短链接' ]] || return 1
     [[ -d $run/repos/git && ! -L $run/repos/git ]] || return 1
     [[ $(<"$run/repos/git/git.git/sentinel") == repository ]] || return 1
-    gm_match_record "$run/config/managed-links/git" $'FORMAT=1\nTARGET=git/git.git'
+    [[ -f $run/config/managed-links/git.git ]]
 }
 
 for scenario in valid unknown dangling outside mismatch; do

@@ -418,13 +418,15 @@ gm_parse_repos() {
 }
 
 # 清理仅接受 repos 根下已登记的相对链接；记录是数据，不作为配置或代码加载。
-# 创建者须在实例排他锁内用 gm_create_data_file 写入 config/managed-links/短名，
-# 内容固定为 FORMAT=1 换行 TARGET=owner/repo.git；不得覆盖同名 owner 目录。
+# 链接固定位于 repos/<短名>.git，故 owner 目录 repos/<owner> 永不被当作链接；
+# 记录位于 config/managed-links/<短名>.git，内容固定为 FORMAT=1 换行 TARGET=owner/repo.git。
 gm_validate_managed_link() {
-    local run=$1 path=$2 name record content target actual owner
+    local run=$1 path=$2 name short_name record content target actual owner
     [[ ${path%/*} == "$run/repos" ]] || { gm_error '未登记短链接'; return 1; }
     name=${path##*/}
-    [[ $name =~ ^[A-Za-z0-9._-]+$ && $name != . && $name != *..* && $name != *.git ]] || {
+    [[ $name == *.git ]] || { gm_error '未登记短链接'; return 1; }
+    short_name=${name%.git}
+    [[ $short_name =~ ^[A-Za-z0-9._-]+$ && $short_name != . && $short_name != *..* ]] || {
         gm_error '未登记短链接'; return 1;
     }
     gm_validate_path "$run/repos" read || return 1

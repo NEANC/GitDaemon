@@ -308,6 +308,50 @@ sync_repo() {
     return 1
 }
 
+# 以固定纯数据格式刷新受管理链接记录：先写同目录临时文件，再原子改名到位。
+gm_write_link_record() {
+    local record=$1 target=$2 tmp=$1.tmp
+    gm_validate_file "$record" || return 1
+    gm_validate_file "$tmp" || return 1
+    (umask 077; printf 'FORMAT=1\nTARGET=%s\n' "$target" > "$tmp") || return 1
+    mv -f -- "$tmp" "$record" || return 1
+    return 0
+}
+
+# 仅为已发布仓库创建受管理短链接：链接为 repos/<短名>.git 指向同级 owner/repo.git；
+# 同名旧链接按受管理协议更新，非受管理对象或指向他处的链接失败关闭，绝不覆盖。
+gm_create_short_link() {
+    local run=$1 target=$2 name=$3
+    local link=$run/repos/$name.git rel=$target.git actual
+    [[ -d $run/repos/$rel ]] || { log "短链接目标仓库缺失：$target"; return 1; }
+    [[ -f $run/repos/$rel/git-daemon-export-ok ]] || { log "短链接目标仓库未发布：$target"; return 1; }
+    (umask 077; mkdir -p -- "$run/config/managed-links") || return 1
+    if [[ -L $link ]]; then
+        gm_validate_managed_link "$run" "$link" || return 1
+        actual=$(readlink -- "$link") || return 1
+        [[ $actual == "$rel" ]] && return 0
+        rm -- "$link" || return 1
+    elif [[ -e $link ]]; then
+        gm_error "短链接位置已存在非链接对象，拒绝覆盖：$name"
+        return 1
+    fi
+    ln -s -- "$rel" "$link" || return 1
+    [[ -L $link && $(readlink -- "$link") == "$rel" ]] || { gm_error '短链接创建失败'; return 1; }
+    gm_write_link_record "$run/config/managed-links/$name.git" "$rel" || return 1
+    log "创建短链接：$name -> $target"
+    return 0
+}
+
+# 按当前映射为单个已发布仓库创建全部短链接，任一失败即视为该仓库同步失败。
+gm_publish_short_links() {
+    local run=$1 target=$2 index
+    for index in "${!GM_LINK_TARGETS[@]}"; do
+        [[ ${GM_LINK_TARGETS[$index]} == "$target" ]] || continue
+        gm_create_short_link "$run" "$target" "${GM_LINK_NAMES[$index]}" || return 1
+    done
+    return 0
+}
+
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
 gm_sync_main() (
     local index failed=0 install snapshot
@@ -332,7 +376,11 @@ gm_sync_main() (
     load_resolve_args "$snapshot" || return 1
     build_transport_sequence || return 1
     for index in "${!GM_REPOS[@]}"; do
-        sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}" || failed=1
+        if sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}"; then
+            gm_publish_short_links "$RUN_ROOT" "${GM_REPOS[$index]}" || failed=1
+        else
+            failed=1
+        fi
     done
     return "$failed"
 )
