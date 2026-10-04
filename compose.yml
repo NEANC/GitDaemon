@@ -16,26 +16,24 @@ services:
       - target: 9418
         published: "${PUBLISHED_PORT:-9418}"
         protocol: tcp
+    # 列表形式只透传宿主机同名变量；未设置时不注入，容器内该变量不存在，
+    # 从而让“显式环境变量 → 卷内配置 → 默认值”的中间层（卷内配置）可达。
+    # 取值校验与默认值由交付脚本 scripts/lib/foundation.sh 的 gm_load_config 提供。
     environment:
-      # 配置键取值由交付脚本 scripts/lib/foundation.sh 校验，默认值与程序默认值保持一致。
-      TZ: "${TZ:-Asia/Shanghai}"
-      GIT_PORT: "${GIT_PORT:-9418}"
-      LISTEN_ADDRESS: "${LISTEN_ADDRESS:-0.0.0.0}"
-      # 必填：分号分隔多个仓库，每项为 owner/repo 或 owner/repo branch1,branch2。
-      REPOS: "${REPOS:?必须显式设置 REPOS}"
-      # 可选：分号分隔 owner/repo 与短链接名。
-      SHORT_LINKS: "${SHORT_LINKS:-}"
-      ENABLE_CRON: "${ENABLE_CRON:-yes}"
-      CRON_SCHEDULE: "${CRON_SCHEDULE:-0 * * * *}"
-      ENABLE_HOSTS_UPDATE: "${ENABLE_HOSTS_UPDATE:-yes}"
-      HOSTS_CRON: "${HOSTS_CRON:-0 3 * * *}"
-      HOSTS_URL: "${HOSTS_URL:-https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts}"
-      HOSTS_URL_FALLBACK: "${HOSTS_URL_FALLBACK:-https://raw.hellogithub.com/hosts}"
-      # 可选：HTTPS 上游代理。
-      PROXY_URL: "${PROXY_URL:-}"
-      # 可选：Token 二选一，建议使用命名卷内凭据文件而非直接写入本文件。
-      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
-      GITHUB_TOKEN_FILE: "${GITHUB_TOKEN_FILE:-}"
+      - TZ                    # 默认 Asia/Shanghai
+      - GIT_PORT              # 默认 9418
+      - LISTEN_ADDRESS        # 默认 0.0.0.0
+      - REPOS                 # 必填：分号分隔 owner/repo 或 owner/repo branch1,branch2；缺失时由程序启动校验拒绝
+      - SHORT_LINKS           # 可选：分号分隔 owner/repo 与短链接名
+      - ENABLE_CRON           # 默认 yes
+      - CRON_SCHEDULE         # 默认 0 * * * *
+      - ENABLE_HOSTS_UPDATE   # 默认 yes
+      - HOSTS_CRON            # 默认 0 3 * * *
+      - HOSTS_URL             # 默认 https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts
+      - HOSTS_URL_FALLBACK    # 默认 https://raw.hellogithub.com/hosts
+      - PROXY_URL             # 可选：HTTPS 上游代理
+      - GITHUB_TOKEN          # 可选：Token 二选一，建议改用命名卷内凭据文件
+      - GITHUB_TOKEN_FILE     # 可选：建议使用命名卷内凭据文件而非 Token 变量
     volumes:
       - type: volume
         source: git-daemon-data
