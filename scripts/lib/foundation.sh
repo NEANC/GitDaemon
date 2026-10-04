@@ -732,30 +732,31 @@ gm_required_env_allow() {
     printf '%s' 'INSTALL_ROOT RUN_ROOT REPOS SHORT_LINKS GIT_PORT LISTEN_ADDRESS TZ ENABLE_CRON CRON_SCHEDULE ENABLE_HOSTS_UPDATE HOSTS_CRON HOSTS_URL HOSTS_URL_FALLBACK PROXY_URL'
 }
 
-# 解析实例 rc.conf 中全部 rc_env_allow 赋值标记，无法安全解析时返回非零交由调用方失败关闭。
+# 解析实例 rc.conf 的最后一条有效 rc_env_allow 赋值；仅接受字面值，不执行 shell。
 gm_read_rc_env_allow() {
-    local file=$1 line value token
+    local file=$1 line value tail quote token allowed=
     while IFS= read -r line || [[ -n $line ]]; do
         [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?rc_env_allow= ]] || continue
         value=${line#*=}
-        value=${value#"${value%%[![:space:]]*}"}
-        value=${value%"${value##*[![:space:]]}"}
-        # 引号值只取到首个闭合引号，其后注释与空白忽略；无法确定闭合时失败关闭。
         case "$value" in
-            \"*)
-                value=${value#\"}
-                [[ $value == *\"* ]] || return 1
-                value=${value%%\"*}
+            \"*|\'*)
+                quote=${value:0:1}
+                value=${value:1}
+                [[ $value == *"$quote"* ]] || return 1
+                tail=${value#*"$quote"}
+                value=${value%%"$quote"*}
                 ;;
-            \'*)
-                value=${value#\'}
-                [[ $value == *\'* ]] || return 1
-                value=${value%%\'*}
+            *)
+                tail=${value#"${value%%[[:space:]]*}"}
+                value=${value%%[[:space:]]*}
                 ;;
         esac
+        tail=${tail#"${tail%%[![:space:]]*}"}
+        [[ -z $tail || $tail == \#* ]] || return 1
         [[ $value != *[\"\'\`\$\\\;\&\|\<\>]* ]] || return 1
-        for token in $value; do printf '%s\n' "$token"; done
+        allowed=$value
     done < "$file"
+    for token in $allowed; do printf '%s\n' "$token"; done
     return 0
 }
 
