@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # 容器实机集成检查：真实执行 docker build 与容器命令，核验非 root Alpine 镜像的构建与运行身份、
-# 命名卷属主继承、依赖完整性以及无 SSH 组件。docker 不可用时明确跳过并返回 77，不伪报成功。
+# 命名卷属主继承、依赖完整性以及无 SSH 组件；并基于 compose.yml 真实编排一次，核验只读根、
+# cap_drop ALL、no-new-privileges 与命名卷挂载。docker 或 compose 不可用时明确跳过并返回 77。
 
 set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -11,9 +12,17 @@ CHECKS=0
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/git-docker-it.XXXXXXXX") || exit 1
 BUILD_LOG=$TEST_ROOT/build.log
 VOLUME=git-daemon-it-$$
+COMPOSE_FILE=$ROOT/compose.yml
+COMPOSE_TAG=it-$$
+COMPOSE_IMAGE=ghcr.io/neanc/git-daemon:$COMPOSE_TAG
+COMPOSE_PROJECT=gm-it-$$
+COMPOSE_PORT=$((40000 + ($$ % 10000)))
 
-# 仅清理本脚本创建的临时目录与命名卷；被检查镜像保留给后续任务使用。
+# 仅清理本脚本创建的临时目录、命名卷、compose 项目与本脚本附加的镜像标签；被检查镜像保留。
 cleanup() {
+    IMAGE_TAG=$COMPOSE_TAG REPOS=octocat/Hello-World \
+        docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+    docker image rm -f "$COMPOSE_IMAGE" >/dev/null 2>&1 || true
     if [[ -n ${VOLUME:-} ]]; then
         docker volume rm -f "$VOLUME" >/dev/null 2>&1 || true
     fi
@@ -36,10 +45,11 @@ check() {
     fi
 }
 
-# 探测 docker：命令缺失或守护进程不可用即明确跳过并返回 77，绝不伪报成功。
+# 探测 docker 与 compose：命令缺失或守护进程不可用即明确跳过并返回 77，绝不伪报成功。
 require_docker() {
     command -v docker >/dev/null 2>&1 || { printf 'SKIP：docker 不可用，未执行\n'; exit 77; }
     docker info >/dev/null 2>&1 || { printf 'SKIP：docker 不可用，未执行\n'; exit 77; }
+    docker compose version >/dev/null 2>&1 || { printf 'SKIP：docker compose 不可用，未执行\n'; exit 77; }
     return 0
 }
 
@@ -109,6 +119,121 @@ entry_rejects_root() {
     [[ $output == *'禁止以 root'* ]]
 }
 
+# 为本地构建镜像附加 registry 前缀标签，供 compose 引用且无需拉取远端镜像。
+compose_tag_local_image() {
+    docker tag "$IMAGE" "$COMPOSE_IMAGE" 2>/dev/null
+}
+
+# 显式提供 IMAGE_TAG 时 compose 配置渲染成功。
+compose_config_accepts_explicit_tag() {
+    IMAGE_TAG=$COMPOSE_TAG REPOS=octocat/Hello-World \
+        docker compose -f "$COMPOSE_FILE" config >/dev/null 2>&1
+}
+
+# 缺少 IMAGE_TAG 时 compose 配置必须失败，且诊断指向 IMAGE_TAG。
+compose_config_rejects_missing_tag() {
+    local output status=0
+    output=$(env -u IMAGE_TAG REPOS=octocat/Hello-World docker compose -f "$COMPOSE_FILE" config 2>&1) || status=$?
+    [[ $status != 0 ]] || return 1
+    [[ $output == *IMAGE_TAG* ]] || return 1
+    return 0
+}
+
+# 以独立项目名与空闲高位端口真实编排启动一次；关闭外网依赖并给出占位仓库。
+compose_start() {
+    IMAGE_TAG=$COMPOSE_TAG REPOS=octocat/Hello-World ENABLE_HOSTS_UPDATE=no ENABLE_CRON=no \
+        PUBLISHED_PORT=$COMPOSE_PORT \
+        docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d >/dev/null 2>&1
+}
+
+# 等待 compose 容器进入运行状态（入口首次同步失败属既有 best-effort 语义，不影响常驻）。
+# 超时未运行则打印日志尾部到标准错误，便于定位容器退出原因。
+compose_wait_running() {
+    local id i
+    for i in $(seq 1 40); do
+        id=$(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps -q git-daemon 2>/dev/null) || id=
+        if [[ -n $id && $(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null) == true ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    printf 'Compose 容器未运行，日志尾部：\n' >&2
+    docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" logs --no-color --tail 30 >&2 2>&1 || true
+    return 1
+}
+
+# 返回 compose 服务容器 ID，供后续断言使用。
+compose_container_id() {
+    docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps -q git-daemon 2>/dev/null
+}
+
+# 容器以固定的非 root 身份 10001 运行。
+compose_runs_as_nonroot() {
+    local id
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    [[ $(docker inspect -f '{{.Config.User}}' "$id") == '10001:10001' ]] || return 1
+    [[ $(docker exec "$id" id -u) == '10001' ]] || return 1
+    return 0
+}
+
+# 根文件系统只读：HostConfig 标记为真且容器内无法在 / 下写入。
+compose_readonly_rootfs() {
+    local id
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    [[ $(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$id") == true ]] || return 1
+    docker exec "$id" sh -c 'touch /git-daemon-rootfs-probe' >/dev/null 2>&1 && return 1
+    return 0
+}
+
+# 已丢弃全部 Linux 能力。
+compose_cap_drop_all() {
+    local id
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    [[ $(docker inspect -f '{{json .HostConfig.CapDrop}}' "$id") == '["ALL"]' ]] || return 1
+    return 0
+}
+
+# 安全选项包含 no-new-privileges。
+compose_no_new_privileges() {
+    local id json
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    json=$(docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$id") || return 1
+    [[ $json == *'"no-new-privileges:true"'* || $json == *'"no-new-privileges"'* ]] || return 1
+    return 0
+}
+
+# 唯一命名卷 git-daemon-data 以 volume 类型挂载到 /var/lib/git-daemon。
+compose_named_volume_mounted() {
+    local id json
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    json=$(docker inspect -f '{{json .Mounts}}' "$id") || return 1
+    [[ $json == *'"Type":"volume"'* ]] || return 1
+    [[ $json == *'"Destination":"/var/lib/git-daemon"'* ]] || return 1
+    [[ $json == *'"Name":"git-daemon-data"'* ]] || return 1
+    return 0
+}
+
+# 命名卷以 10001 身份可写，应用数据落在卷内。
+compose_volume_writable() {
+    local id
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    docker exec "$id" sh -c 'touch /var/lib/git-daemon/it-probe' >/dev/null 2>&1
+}
+
+# 停止并删除 compose 项目、网络与卷，并移除本脚本附加的镜像标签；无残留。
+compose_teardown() {
+    IMAGE_TAG=$COMPOSE_TAG REPOS=octocat/Hello-World \
+        docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1 || true
+    docker image rm -f "$COMPOSE_IMAGE" >/dev/null 2>&1 || true
+    return 0
+}
+
 require_docker
 check 'docker build --no-cache 退出码为 0' build_image
 check '镜像默认运行身份为 10001:10001' image_user_is_nonroot
@@ -119,5 +244,23 @@ check '空命名卷首次挂载后以 10001 可写入' named_volume_writable
 check '运行时依赖命令与 CA/时区文件齐备' runtime_dependencies_present
 check '镜像不含 SSH 组件' no_ssh_components
 check '入口拒绝 UID 0' entry_rejects_root
+# 后续所有 compose 子命令（ps/logs/down）都需成功渲染镜像引用与环境变量插值，故在此统一导出。
+export IMAGE_TAG=$COMPOSE_TAG
+export REPOS=octocat/Hello-World
+export ENABLE_HOSTS_UPDATE=no
+export ENABLE_CRON=no
+export PUBLISHED_PORT=$COMPOSE_PORT
+check 'Compose 为本地镜像附加 registry 标签' compose_tag_local_image
+check 'Compose 显式 IMAGE_TAG 时 config 有效' compose_config_accepts_explicit_tag
+check 'Compose 缺少 IMAGE_TAG 时 config 失败' compose_config_rejects_missing_tag
+check 'Compose 独立项目名与空闲端口启动' compose_start
+check 'Compose 容器进入运行状态' compose_wait_running
+check 'Compose 容器以 UID 10001 运行' compose_runs_as_nonroot
+check 'Compose 根文件系统只读' compose_readonly_rootfs
+check 'Compose 丢弃全部能力' compose_cap_drop_all
+check 'Compose 禁止提权' compose_no_new_privileges
+check 'Compose 命名卷挂载到 /var/lib/git-daemon' compose_named_volume_mounted
+check 'Compose 命名卷内可写' compose_volume_writable
+compose_teardown
 printf '容器实机集成检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
 [[ $FAILURES == 0 ]]
