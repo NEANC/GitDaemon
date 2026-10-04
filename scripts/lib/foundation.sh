@@ -353,7 +353,7 @@ gm_load_config() {
 # 校验仓库必须包含两个安全非空分量，且不使用 .git 后缀。
 gm_validate_repo_name() {
     local value=$1
-    [[ $value =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ && $value != *.git ]]
+    [[ $value =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ && $value != *.git && ${value%%/*} != *.git ]]
 }
 
 # 全量解析仓库和短名，成功后一次性发布数组，不创建任何仓库或链接。
