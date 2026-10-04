@@ -1,0 +1,46 @@
+# Git 镜像加速节点的 Docker Compose 部署定义。
+# 只使用一个 Docker 命名卷保存全部运行数据，不挂载任何宿主机路径，也不在本地构建镜像。
+services:
+  git-daemon:
+    # 镜像标签必须显式提供，缺少 IMAGE_TAG 时拒绝渲染配置，避免静默使用浮动标签。
+    image: ghcr.io/neanc/git-daemon:${IMAGE_TAG:?必须显式设置 IMAGE_TAG}
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - target: 9418
+        published: "${PUBLISHED_PORT:-9418}"
+        protocol: tcp
+    environment:
+      # 配置键取值由交付脚本 scripts/lib/foundation.sh 校验，默认值与程序默认值保持一致。
+      TZ: "${TZ:-Asia/Shanghai}"
+      GIT_PORT: "${GIT_PORT:-9418}"
+      LISTEN_ADDRESS: "${LISTEN_ADDRESS:-0.0.0.0}"
+      # 必填：分号分隔多个仓库，每项为 owner/repo 或 owner/repo branch1,branch2。
+      REPOS: "${REPOS:?必须显式设置 REPOS}"
+      # 可选：分号分隔 owner/repo 与短链接名。
+      SHORT_LINKS: "${SHORT_LINKS:-}"
+      ENABLE_CRON: "${ENABLE_CRON:-yes}"
+      CRON_SCHEDULE: "${CRON_SCHEDULE:-0 * * * *}"
+      ENABLE_HOSTS_UPDATE: "${ENABLE_HOSTS_UPDATE:-yes}"
+      HOSTS_CRON: "${HOSTS_CRON:-0 3 * * *}"
+      HOSTS_URL: "${HOSTS_URL:-https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts}"
+      HOSTS_URL_FALLBACK: "${HOSTS_URL_FALLBACK:-https://raw.hellogithub.com/hosts}"
+      # 可选：HTTPS 上游代理。
+      PROXY_URL: "${PROXY_URL:-}"
+      # 可选：Token 二选一，建议使用命名卷内凭据文件而非直接写入本文件。
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_TOKEN_FILE: "${GITHUB_TOKEN_FILE:-}"
+    volumes:
+      - type: volume
+        source: git-daemon-data
+        target: /var/lib/git-daemon
+
+volumes:
+  git-daemon-data:
+    name: git-daemon-data
