@@ -432,10 +432,11 @@ transport_args_paths() {
     transport_args mapping || return 1
     joined=" ${GM_TRANSPORT_ARGS[*]} "
     [[ $joined == *curloptResolve* ]] || return 1
-    [[ $joined != *http.proxy* ]] || return 1
+    [[ $joined == *' http.proxy= '* && $joined != *'http.proxy=https://proxy.invalid:8443'* ]] || return 1
     transport_args system || return 1
     joined=" ${GM_TRANSPORT_ARGS[*]} "
-    [[ $joined != *curloptResolve* && $joined != *http.proxy* ]] || return 1
+    [[ $joined != *curloptResolve* && $joined == *' http.proxy= '* ]] || return 1
+    [[ $joined != *'http.proxy=https://proxy.invalid:8443'* ]] || return 1
     [[ $joined == *' http.followRedirects=initial '* ]]
 }
 

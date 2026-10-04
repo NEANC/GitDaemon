@@ -113,6 +113,26 @@ config_unchanged() {
     cmp -s -- "$file" "$file.before"
 }
 
+# 验证显式凭据来源写入私密状态，配置卷保持原始字节且状态权限收紧。
+sync_credentials_state_is_private() {
+    require_function gm_save_sync_credentials || return 1
+    require_function gm_load_sync_credentials || return 1
+    local run=$TEST_ROOT/credential-state before
+    mkdir -p -- "$run/runtime" "$run/config" || return 1
+    printf '%s\n' '# 保留原始配置' 'TZ=UTC' > "$run/config/mirror.env"
+    cp -- "$run/config/mirror.env" "$run/config/mirror.env.before" || return 1
+    export GITHUB_TOKEN=lifecycle-secret-token
+    unset GITHUB_TOKEN_FILE
+    gm_save_sync_credentials "$run" || return 1
+    [[ $(stat -c %a -- "$run/runtime/sync-credentials") == 600 ]] || return 1
+    before=$(<"$run/config/mirror.env")
+    unset GITHUB_TOKEN
+    gm_load_sync_credentials "$run" || return 1
+    [[ ${GITHUB_TOKEN-} == lifecycle-secret-token ]] || return 1
+    [[ $before == "$(<"$run/config/mirror.env")" ]] || return 1
+    ! grep -q lifecycle-secret-token "$run/config/mirror.env"
+}
+
 # 验证互斥凭据来源不会被接受或输出到诊断中。
 config_credentials() {
     require_function gm_load_config || return 1
@@ -1294,6 +1314,7 @@ check '安装不要求 REPOS、不读取凭据、不创建运行目录（平台�
 check '重复初始化保留配置与实例环境（平台边界桩）' initialize_preserves_config
 check '同步入口加载无副作用并提供显式主函数' entry_source_safe git-mirror-sync.sh gm_sync_main
 check '刷新入口加载无副作用并提供显式主函数' entry_source_safe update-github-hosts.sh gm_hosts_main
+check '同步凭据写入私密状态且保持配置字节不变' sync_credentials_state_is_private
 # 向负向断言注入不相关错误，验证断言不会把任意非零误当成预期失败。
 negative_assertion_reason_guard() {
     local scenario=$1
