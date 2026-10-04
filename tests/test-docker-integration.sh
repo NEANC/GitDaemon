@@ -4,7 +4,8 @@
 # 命名卷属主继承、依赖完整性以及无 SSH 组件；并在 compose 可用时基于 compose.yml 真实编排，
 # 核验只读根、cap_drop ALL、no-new-privileges、命名卷挂载、卷内配置层、运行期全进程非 root、
 # 实例数据落卷、数据重建保留、停止与信号回收、关键服务停止退出、非法配置启动失败、
-# 调度真实派发、发布边界（export-ok/receive-pack）以及自签名 HTTPS 地址刷新被拒绝。
+# 调度真实派发、发布边界（export-ok/receive-pack）、自签名 HTTPS 地址刷新被拒绝、
+# 显式环境变量对卷内配置的优先级以及强杀（SIGKILL）后同卷重建的真实可达性。
 # docker 完全不可用时整段跳过并返回 77；仅 compose 缺失时 docker-only 覆盖照常执行。
 
 set -euo pipefail
@@ -25,6 +26,10 @@ COMPOSE_PORT=$((40000 + ($$ % 10000)))
 # 卷内配置层回归断言用的非默认值：容器内 daemon 必须实际生效这些值而非默认值。
 COMPOSE_VOL_CONFIG_ADDR=127.0.0.1
 COMPOSE_VOL_CONFIG_PORT=19418
+# 显式环境变量优先断言的取值：与卷内配置（127.0.0.1:19418）刻意不同，宿主显式设置后必须生效该值。
+# 0.0.0.0:19428 在内核监听表中为 00000000:4BE4。
+COMPOSE_ENV_CONFIG_ADDR=0.0.0.0
+COMPOSE_ENV_CONFIG_PORT=19428
 # 上游占位仓库名刻意不存在于 GitHub：同步预期失败且快速返回，测试不依赖真实上游内容与体积。
 TEST_REPO=octocat/Nonexistent-$COMPOSE_TAG
 # 地址刷新夹具：与目标容器共享网络命名空间的自签名 HTTPS 服务名与端口。
@@ -35,7 +40,9 @@ COMPOSE_ENV=()
 
 # 测试通过 override 文件把 compose.yml 的固定全局卷名改写到测试作用域，
 # 从而绝不触碰宿主上真实部署使用的 git-daemon-data 卷（即使它已存在）。
-# 同时关闭重启策略，保证“非零退出”类事件可被稳定观测，不影响容器内安全选项。
+# 关闭重启策略（restart: "no"）仅为测试作用域策略：用于稳定观测“容器非零退出”类事件，
+# 不代表真实部署行为；compose.yml 的生产策略为 restart: unless-stopped，由静态断言
+# compose_production_restart_policy 单独核对，保证测试未改动生产重启语义。容器内安全选项不受影响。
 write_compose_override() {
     cat > "$COMPOSE_OVERRIDE" <<EOF
 services:
@@ -45,6 +52,12 @@ volumes:
   git-daemon-data:
     name: $COMPOSE_VOLUME
 EOF
+}
+
+# 静态断言 compose.yml 的生产重启策略仍为 unless-stopped，避免读者把 override 的测试作用域
+# restart: "no" 误解为真实部署行为。
+compose_production_restart_policy() {
+    grep -Eq '^[[:space:]]*restart:[[:space:]]*unless-stopped[[:space:]]*$' "$COMPOSE_FILE"
 }
 
 # 统一以测试项目名与 override 文件调用 compose，保证所有子命令作用域一致。
@@ -197,13 +210,14 @@ compose_prepare_publish_volume() {
         -c 'mkdir -p /var/lib/git-daemon/config && printf "%s\n" "LISTEN_ADDRESS=0.0.0.0" "GIT_PORT=9418" > /var/lib/git-daemon/config/mirror.env'
 }
 
-# 以当前 COMPOSE_ENV 编排启动/重建一次；宿主机未设置 GIT_PORT/LISTEN_ADDRESS 时回退到卷内配置。
+# 以当前 COMPOSE_ENV 编排启动/重建一次；宿主机未在 COMPOSE_ENV 中显式给出 GIT_PORT/LISTEN_ADDRESS 时
+# 清空这两个变量，使容器回退到卷内配置（验证卷内配置层可达）；显式给出时以环境变量优先。
 compose_up() {
     local log=$TEST_ROOT/compose-up.log status=0
     (
         export IMAGE_TAG="$COMPOSE_TAG" PUBLISHED_PORT="$COMPOSE_PORT"
-        if [[ ${#COMPOSE_ENV[@]} -gt 0 ]]; then export "${COMPOSE_ENV[@]}"; fi
         unset GIT_PORT LISTEN_ADDRESS
+        if [[ ${#COMPOSE_ENV[@]} -gt 0 ]]; then export "${COMPOSE_ENV[@]}"; fi
         compose up -d --force-recreate
     ) >"$log" 2>&1 || status=$?
     if (( status != 0 )); then
@@ -242,8 +256,8 @@ compose_container_id() {
 }
 
 # 删除当前场景容器，保留命名卷与镜像标签；用于“停止并删除容器再重建”的保留性验证。
-# 先优雅停止再删除：SIGTERM 会让入口停止 OpenRC 用户服务并落定运行状态，避免持久化在卷内的
-# 陈旧用户态状态使下一个容器误判服务已启动。已退出的容器忽略停止错误。
+# 先优雅停止再删除：SIGTERM 让入口停止 OpenRC 用户服务并落定运行状态，这是“停止并删除”的正确语义；
+# 已退出的容器忽略停止错误。强制删除（SIGKILL）后的残留状态由入口自愈，由强杀重建场景单独覆盖。
 compose_remove_container() {
     local id
     id=$(compose_container_id) || id=
@@ -251,6 +265,17 @@ compose_remove_container() {
         docker stop -t 30 "$id" >/dev/null 2>&1 || true
         docker rm -f "$id" >/dev/null 2>&1 || true
     fi
+    return 0
+}
+
+# 以 SIGKILL（docker kill，不发送 SIGTERM）强制终止当前场景容器再删除，模拟断电/强杀后同卷重建；
+# 此时入口信号处理不会执行，卷内会残留 OpenRC 用户态“已启动”状态与陈旧 pidfile。
+compose_kill_container() {
+    local id
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    docker kill "$id" >/dev/null 2>&1 || return 1
+    docker rm -f "$id" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -332,6 +357,28 @@ compose_daemon_listens_from_volume() {
     id=$(compose_container_id) || return 1
     [[ -n $id ]] || return 1
     docker exec "$id" sh -c 'grep -q "0100007F:4BDA" /proc/net/tcp'
+}
+
+# 显式环境变量优先于卷内配置：卷内 mirror.env 为 127.0.0.1:19418，宿主机显式设置
+# LISTEN_ADDRESS/GIT_PORT 后，交付配置入口解析出的生效端口/地址必须为环境变量值。
+compose_env_overrides_volume_config() {
+    local id output
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    output=$(docker exec -e HOME=/var/lib/git-daemon/home "$id" \
+        /usr/local/lib/git-mirror/git-daemon-config.sh --token-state=empty 2>/dev/null) || return 1
+    [[ $(printf '%s\n' "$output" | sed -n '1p') == "$COMPOSE_ENV_CONFIG_PORT" ]] || return 1
+    [[ $(printf '%s\n' "$output" | sed -n '2p') == "$COMPOSE_ENV_CONFIG_ADDR" ]] || return 1
+    return 0
+}
+
+# 显式环境变量在真实监听上生效：daemon 实际监听 0.0.0.0:19428（LE hex 00000000:4BE4），
+# 而不是卷内配置的 127.0.0.1:19418。
+compose_daemon_listens_from_env() {
+    local id
+    id=$(compose_container_id) || return 1
+    [[ -n $id ]] || return 1
+    docker exec "$id" sh -c 'grep -q "00000000:4BE4" /proc/net/tcp'
 }
 
 # 以宿主侧 docker top 取容器全部 PID，逐个读取 /proc/<pid>/status 的 Uid 行；
@@ -812,6 +859,7 @@ if [[ $COMPOSE_ENABLED == 1 ]]; then
     check 'Compose 为本地镜像附加 registry 标签' compose_tag_local_image
     check 'Compose 显式 IMAGE_TAG 时 config 有效' compose_config_accepts_explicit_tag
     check 'Compose 缺少 IMAGE_TAG 时 config 失败' compose_config_rejects_missing_tag
+    check 'Compose 生产重启策略未被测试改动（unless-stopped）' compose_production_restart_policy
 
     # 场景 S0：卷内非默认配置回归（沿用既有断言）。
     COMPOSE_ENV=("REPOS=$TEST_REPO" "ENABLE_HOSTS_UPDATE=no" "ENABLE_CRON=no")
@@ -826,6 +874,16 @@ if [[ $COMPOSE_ENABLED == 1 ]]; then
     check 'Compose 命名卷内可写' compose_volume_writable
     check 'Compose 卷内配置覆盖默认值（配置入口）' compose_volume_config_reachable
     check 'Compose 卷内配置在真实监听上生效' compose_daemon_listens_from_volume
+    compose_remove_container
+
+    # 场景 S0b：显式环境变量优先于卷内配置。卷内 mirror.env 为 127.0.0.1:19418，
+    # 宿主机显式设置 LISTEN_ADDRESS=0.0.0.0 与 GIT_PORT=19428，容器必须实际生效环境变量值。
+    COMPOSE_ENV=("REPOS=$TEST_REPO" "ENABLE_HOSTS_UPDATE=no" "ENABLE_CRON=no" \
+        "LISTEN_ADDRESS=$COMPOSE_ENV_CONFIG_ADDR" "GIT_PORT=$COMPOSE_ENV_CONFIG_PORT")
+    check 'Compose 环境变量覆盖场景启动' compose_start
+    check 'Compose 环境变量覆盖场景就绪' compose_wait_running
+    check '显式环境变量覆盖卷内配置（配置入口）' compose_env_overrides_volume_config
+    check '显式环境变量覆盖卷内配置（真实监听）' compose_daemon_listens_from_env
     compose_remove_container
 
     # 场景 S1：运行期只读根与全进程非 root、实例数据落卷、发布边界、失败保留、数据重建保留。
@@ -888,6 +946,22 @@ if [[ $COMPOSE_ENABLED == 1 ]]; then
     check '地址刷新：旧快照保留且标记陈旧' compose_hosts_snapshot_retained
     check '地址刷新：刷新日志记录数据源失败告警' compose_hosts_warning_logged
     check '地址刷新：来源不可达仍保留旧快照且容器不退出' compose_hosts_unreachable_retained
+    compose_remove_container
+
+    # 场景 S6：docker kill（SIGKILL）终止容器后同卷重建。SIGKILL 不触发入口信号处理，
+    # 卷内残留 OpenRC 用户态“已启动”状态与陈旧 pidfile；重建后 daemon 必须真实恢复监听，
+    # 并通过发布端口对外可达（而非仅 .State.Running 为真）。
+    COMPOSE_ENV=("REPOS=$TEST_REPO" "ENABLE_HOSTS_UPDATE=no" "ENABLE_CRON=no")
+    check 'Compose 强杀重建场景预置发布用卷内配置' compose_prepare_publish_volume
+    check 'Compose 强杀重建场景启动' compose_start
+    check 'Compose 强杀重建场景就绪' compose_wait_running
+    check '卷内预置夹具（强杀重建场景）' compose_create_fixtures
+    check '强杀重建场景：强杀前发布端口真实可达' compose_publish_exported_readable
+    check '强杀重建场景：docker kill（SIGKILL）并删除容器' compose_kill_container
+    check 'Compose 强杀后同卷重建启动' compose_start
+    check 'Compose 强杀后同卷重建就绪' compose_wait_running
+    check '强杀重建后 daemon 真实监听 9418' compose_publish_daemon_listens_9418
+    check '强杀重建后发布端口真实可达（非仅 State.Running）' compose_publish_exported_readable
     compose_remove_container
 
     compose_teardown
