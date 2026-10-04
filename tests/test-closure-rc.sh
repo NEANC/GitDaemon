@@ -30,9 +30,34 @@ reject_unquoted_words() {
     printf 'rc_env_allow=REPOS GIT_PORT\n' > "$work/rc.conf"
     ! gm_read_rc_env_allow "$work/rc.conf"
 }
+# boot 运行级中的交付服务必须在引导前被识别。
+boot_registration() {
+    XDG_CONFIG_HOME=$work/config
+    mkdir -p "$XDG_CONFIG_HOME/rc/runlevels/boot"
+    ln -s /missing "$XDG_CONFIG_HOME/rc/runlevels/boot/git-daemon"
+    gm_instance_default_runlevel_has_delivered_service
+}
+# 自定义默认运行级按最终字面赋值检查，不执行配置中的命令。
+custom_registration() {
+    XDG_CONFIG_HOME=$work/custom
+    mkdir -p "$XDG_CONFIG_HOME/rc/runlevels/night"
+    printf 'rc_default_runlevel=default\nrc_default_runlevel="night" # selected\n' > "$XDG_CONFIG_HOME/rc/rc.conf"
+    ln -s /missing "$XDG_CONFIG_HOME/rc/runlevels/night/git-mirror-sync"
+    gm_instance_default_runlevel_has_delivered_service
+}
+# 动态默认运行级无法静态确认，必须拒绝引导。
+dynamic_registration() {
+    XDG_CONFIG_HOME=$work/dynamic
+    mkdir -p "$XDG_CONFIG_HOME/rc"
+    printf 'rc_default_runlevel=$(touch "%s/executed")\n' "$work" > "$XDG_CONFIG_HOME/rc/rc.conf"
+    gm_instance_default_runlevel_has_delivered_service && [[ ! -e $work/executed ]]
+}
 check last_assignment
 check reject_trailing
 check accept_comment
 check reject_unquoted_words
-printf 'checks=4 failed=%s uid=%s\n' "$failed" "$UID"
+check boot_registration
+check custom_registration
+check dynamic_registration
+printf 'checks=7 failed=%s uid=%s\n' "$failed" "$UID"
 exit "$((failed != 0))"
