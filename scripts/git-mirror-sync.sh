@@ -187,8 +187,12 @@ build_transport_sequence() {
 
 # 按尝试标识构造 Git 参数：代理与映射互斥，所有路径保持 TLS 与受限重定向。
 transport_args() {
-    local attempt=$1
+    local attempt=$1 remote_url=${2-} proxy=
     GM_TRANSPORT_ARGS=(-c http.followRedirects=initial)
+    if [[ $attempt == proxy ]]; then proxy=${GM_CONFIG[PROXY_URL]}; fi
+    if [[ -n $remote_url ]]; then
+        GM_TRANSPORT_ARGS+=(-c "http.${remote_url}.proxy=$proxy" -c "remote.origin.proxy=$proxy")
+    fi
     case "$attempt" in
         proxy) GM_TRANSPORT_ARGS+=(-c "http.proxy=${GM_CONFIG[PROXY_URL]}") ;;
         mapping) GM_TRANSPORT_ARGS+=(-c http.proxy= -c "http.https://${GITHUB_HOST:-github.com}/.proxy=" "${GM_RESOLVE_ARGS[@]}") ;;
@@ -213,12 +217,13 @@ transport_label() {
 
 # 拉取单个仓库，成功后缩减范围、跟随默认 HEAD 并写入发布标记。
 update_repo() {
-    local repo=$1 dir=$2 branches=$3 remote_head line attempt label
+    local repo=$1 dir=$2 branches=$3 remote_head line attempt label remote_url
     local -a chosen=()
     configure_fetch "$dir" "$branches" || return 1
+    remote_url=$(git --git-dir="$dir" remote get-url origin) || return 1
     log "同步 $repo；分支：${branches:-全部 refs}"
     for attempt in "${GM_TRANSPORT_SEQUENCE[@]}"; do
-        transport_args "$attempt" || return 1
+        transport_args "$attempt" "$remote_url" || return 1
         label=$(transport_label "$attempt")
         if run_cmd git "${GM_TRANSPORT_ARGS[@]}" --git-dir="$dir" fetch --progress --atomic --prune origin; then
             chosen=("${GM_TRANSPORT_ARGS[@]}")
@@ -320,24 +325,72 @@ gm_write_link_record() {
 
 # 仅为已发布仓库创建受管理短链接：链接为 repos/<短名>.git 指向同级 owner/repo.git；
 # 同名旧链接按受管理协议更新，非受管理对象或指向他处的链接失败关闭，绝不覆盖。
+# 从私密意图记录恢复未完成发布；仅接受记录声明的旧/新目标，拒绝接管未知对象。
+gm_recover_short_link() {
+    local run=$1 name=$2 link=$1/repos/$2.git record=$1/config/managed-links/$2.git
+    local journal=$1/runtime/shortlink-$2.pending content old new actual=
+    [[ -e $journal || -L $journal ]] || return 0
+    gm_validate_file "$journal" || return 1
+    content=$(<"$journal")
+    [[ $content == $'FORMAT=1\nOLD='*$'\nNEW='* ]] || return 1
+    old=${content#*$'\nOLD='}; old=${old%%$'\nNEW='*}
+    new=${content##*$'\nNEW='}
+    [[ $new == *.git ]] && gm_validate_repo_name "${new%.git}" || return 1
+    if [[ -n $old ]]; then
+        [[ $old == *.git ]] && gm_validate_repo_name "${old%.git}" || return 1
+    fi
+    if [[ -L $link ]]; then
+        [[ $(stat -c %u -- "$link") == "$EUID" ]] || return 1
+        actual=$(readlink -- "$link") || return 1
+        [[ $actual == "$old" || $actual == "$new" ]] || return 1
+        rm -- "$link" || return 1
+    elif [[ -e $link ]]; then
+        return 1
+    fi
+    if [[ -n $old ]]; then
+        ln -s -- "$old" "$link" || return 1
+        gm_write_link_record "$record" "$old" || return 1
+    elif [[ -e $record ]]; then
+        gm_validate_file "$record" || return 1
+        rm -- "$record" || return 1
+    fi
+    rm -- "$journal" || return 1
+    return 0
+}
+
+# 在修改链接前发布私密意图记录，普通失败回滚；崩溃后下轮按记录恢复，非双 rename 事务。
 gm_create_short_link() {
     local run=$1 target=$2 name=$3
-    local link=$run/repos/$name.git rel=$target.git actual
+    local link=$run/repos/$name.git rel=$target.git actual old_target=
+    local record=$run/config/managed-links/$name.git journal=$run/runtime/shortlink-$name.pending tmp
     [[ -d $run/repos/$rel ]] || { log "短链接目标仓库缺失：$target"; return 1; }
     [[ -f $run/repos/$rel/git-daemon-export-ok ]] || { log "短链接目标仓库未发布：$target"; return 1; }
-    (umask 077; mkdir -p -- "$run/config/managed-links") || return 1
+    (umask 077; mkdir -p -- "$run/config/managed-links" "$run/runtime") || return 1
+    gm_check_private_directory "$run/runtime" || return 1
+    gm_recover_short_link "$run" "$name" || return 1
     if [[ -L $link ]]; then
         gm_validate_managed_link "$run" "$link" || return 1
         actual=$(readlink -- "$link") || return 1
         [[ $actual == "$rel" ]] && return 0
-        rm -- "$link" || return 1
+        old_target=$actual
     elif [[ -e $link ]]; then
         gm_error "短链接位置已存在非链接对象，拒绝覆盖：$name"
         return 1
     fi
-    ln -s -- "$rel" "$link" || return 1
-    [[ -L $link && $(readlink -- "$link") == "$rel" ]] || { gm_error '短链接创建失败'; return 1; }
-    gm_write_link_record "$run/config/managed-links/$name.git" "$rel" || return 1
+    gm_validate_file "$journal" || return 1
+    tmp=$(mktemp "$run/runtime/shortlink-$name.XXXXXXXX") || return 1
+    if ! (umask 077; printf 'FORMAT=1\nOLD=%s\nNEW=%s\n' "$old_target" "$rel" > "$tmp" && mv -f -- "$tmp" "$journal"); then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [[ -n $old_target ]]; then
+        rm -- "$link" || { gm_recover_short_link "$run" "$name"; return 1; }
+    fi
+    if ! ln -s -- "$rel" "$link" || ! gm_write_link_record "$record" "$rel"; then
+        gm_recover_short_link "$run" "$name" || return 1
+        return 1
+    fi
+    rm -- "$journal" || { gm_recover_short_link "$run" "$name"; return 1; }
     log "创建短链接：$name -> $target"
     return 0
 }
@@ -356,9 +409,16 @@ gm_publish_short_links() {
 gm_prune_short_links() {
     local run=$1
     local dir=$run/config/managed-links
-    local record name link index
+    local record name link index journal
     local -A retained=()
     [[ -d $dir ]] || return 0
+    shopt -s nullglob dotglob
+    for journal in "$run/runtime"/shortlink-*.pending; do
+        [[ -f $journal ]] || return 1
+        name=${journal##*/shortlink-}
+        name=${name%.pending}
+        gm_recover_short_link "$run" "$name" || return 1
+    done
     for index in "${!GM_LINK_NAMES[@]}"; do
         retained["${GM_LINK_NAMES[$index]}.git"]=1
     done
