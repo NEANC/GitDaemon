@@ -191,8 +191,8 @@ transport_args() {
     GM_TRANSPORT_ARGS=(-c http.followRedirects=initial)
     case "$attempt" in
         proxy) GM_TRANSPORT_ARGS+=(-c "http.proxy=${GM_CONFIG[PROXY_URL]}") ;;
-        mapping) GM_TRANSPORT_ARGS+=("${GM_RESOLVE_ARGS[@]}") ;;
-        system) ;;
+        mapping) GM_TRANSPORT_ARGS+=(-c http.proxy= -c "http.https://${GITHUB_HOST:-github.com}/.proxy=" "${GM_RESOLVE_ARGS[@]}") ;;
+        system) GM_TRANSPORT_ARGS+=(-c http.proxy= -c "http.https://${GITHUB_HOST:-github.com}/.proxy=") ;;
         *) return 1 ;;
     esac
     if [[ ${#GM_CREDENTIAL_ARGS[@]} -gt 0 ]]; then
@@ -300,7 +300,7 @@ sync_repo() {
         git --git-dir="$dir" remote add origin "$url" || return 1
     fi
     if update_repo "$repo" "$dir" "$branches"; then
-        report_branches "$repo" "$dir" "$branches" success || return 1
+        report_branches "$repo" "$dir" "$branches" success || log "分支报告失败，不改变同步结果：$repo"
         return 0
     fi
     log "同步失败，保留已有缓存：$repo"
