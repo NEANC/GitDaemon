@@ -4,7 +4,8 @@
 # 同步与地址刷新算法全部复用交付脚本，入口只负责编排、前台存活、信号转发与子进程回收。
 # 计划中的入口逻辑说明：一次性工作服务（git-mirror-sync / git-mirror-hosts）经 rc-service 运行后
 # 状态会显示 crashed（退出 32），属既有语义，因此入口只对常驻服务使用 OpenRC 状态，绝不据一次性
-# 工作服务的状态判断成功；跨容器残留运行状态由交付 CLI 的 --resume 语义处理，不把持久化 PID 当作存活服务。
+# 工作服务的状态判断成功；跨容器残留运行状态先以 zap 复位再启动，并以真实监听确认存活，
+# 不把持久化 PID 或卷内残留的“已启动”状态当作存活服务。
 
 set -uo pipefail
 
@@ -109,6 +110,37 @@ shutdown_services() {
     return 0
 }
 
+# 复位实例 OpenRC 用户态常驻服务的残留状态：卷内持久化的“已启动”记录与陈旧 pidfile 不代表真实存活，
+# 新容器内残留活动使 start 被判为“已启动”而跳过真正启动；先 zap 清除状态，使 start 确实拉起服务。
+reset_stale_service_state() {
+    rc-service --user "$1" zap >/dev/null 2>&1 || true
+    return 0
+}
+
+# 以真实监听为判据确认 git-daemon 已就绪：读取交付配置入口解析出的生效端口，
+# 在内核监听表中确认该端口进入 LISTEN 状态；超时返回非零，不把持久化 PID 当作存活服务。
+confirm_daemon_listening() {
+    local output port hex i
+    output=$("$INSTALL_ROOT/git-daemon-config.sh" --token-state=empty 2>/dev/null) || {
+        log '无法读取 git-daemon 生效配置，判定常驻服务启动失败'
+        return 1
+    }
+    port=${output%%$'\n'*}
+    if [[ ! $port =~ ^[0-9]+$ ]]; then
+        log 'git-daemon 生效端口非法，判定常驻服务启动失败'
+        return 1
+    fi
+    hex=$(printf '%04X' "$((10#$port))")
+    for i in $(seq 1 20); do
+        if grep -q ":$hex " /proc/net/tcp 2>/dev/null || grep -q ":$hex " /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "git-daemon 启动后未在端口 $port 上监听，判定常驻服务启动失败"
+    return 1
+}
+
 # 前台监督循环：可中断休眠并周期性确认常驻服务仍在运行，任一关键服务退出即返回非零。
 supervise_loop() {
     local scheduler_supervised=$1
@@ -155,7 +187,9 @@ main() {
         return 0
     fi
     log '启动 git-daemon'
+    reset_stale_service_state git-daemon
     rc-service --user git-daemon start || die 'git-daemon 启动失败'
+    confirm_daemon_listening || die 'git-daemon 启动后未真实监听，容器退出'
     if run_task_best_effort '首次仓库同步' "$INSTALL_ROOT/git-mirror-sync.sh"; then
         :
     else
@@ -164,6 +198,7 @@ main() {
     fi
     if scheduler_enabled; then
         log '启动调度服务'
+        reset_stale_service_state git-mirror-scheduler
         rc-service --user git-mirror-scheduler start || die '调度服务启动失败'
         scheduler_supervised=yes
     else
