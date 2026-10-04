@@ -271,7 +271,8 @@ gm_validate_config_value() {
         ENABLE_CRON|ENABLE_HOSTS_UPDATE) [[ $value == yes || $value == no ]] ;;
         CRON_SCHEDULE|HOSTS_CRON) gm_validate_cron "$value" ;;
         TZ)
-            [[ $value =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]
+            [[ $value =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || return 1
+            [[ $value == UTC || $value == GMT || -f /usr/share/zoneinfo/$value ]]
             ;;
         HOSTS_URL) gm_validate_https_url "$value" ;;
         HOSTS_URL_FALLBACK|PROXY_URL)

@@ -78,14 +78,13 @@ gm_cron_next_trigger() {
     local cron=$1 now=$2
     local -a fields=()
     local zone sign offset start limit day last dow base day_ok minutes hours k h m cand
+    local sample wall actual earliest local_date
+    local -A offsets=()
     local -A doms=() months=() dows=()
     read -r -a fields <<< "$cron"
     [[ ${#fields[@]} == 5 ]] || return 1
     gm_validate_cron "$cron" || return 1
-    zone=$(date '+%z') || return 1
-    sign=${zone:0:1}
-    offset=$(( 10#${zone:1:2} * 3600 + 10#${zone:3:2} * 60 ))
-    if [[ $sign == - ]]; then offset=$(( -offset )); fi
+    # 初始日期由给定时刻的当地墙钟决定，不使用执行当天的固定偏移。
     gm_cron_expand "${fields[0]}" 0 59 || return 1
     minutes=$(printf '%s\n' "${!GM_CRON_SET[@]}" | sort -n)
     gm_cron_expand "${fields[1]}" 0 23 || return 1
@@ -99,9 +98,9 @@ gm_cron_next_trigger() {
     local dom_restricted=no dow_restricted=no
     if [[ ${fields[2]} != '*' ]]; then dom_restricted=yes; fi
     if [[ ${fields[4]} != '*' ]]; then dow_restricted=yes; fi
-    start=$(( now + offset ))
-    start=$(( start - start % 60 + 60 ))
-    limit=$(( start + 1830 * 86400 ))
+    local_date=$(date -d "@$now" '+%Y-%m-%d') || return 1
+    start=$(TZ=UTC date -d "$local_date 00:00:00" '+%s') || return 1
+    limit=$(( start + 366 * 9 * 86400 ))
     day=$(( start / 86400 ))
     last=$(( limit / 86400 ))
     while (( day <= last )); do
@@ -119,15 +118,30 @@ gm_cron_next_trigger() {
         fi
         if [[ $day_ok == yes && ${months[$GM_CIVIL_MONTH]+present} ]]; then
             base=$(( day * 86400 ))
+            offsets=()
+            earliest=
+            # 采样候选日期前后真实偏移，回转墙钟验证以跳过缺失分钟并保留重复分钟。
+            for sample in $((base - 86400)) "$base" $((base + 86400)); do
+                zone=$(date -d "@$sample" '+%z') || return 1
+                offset=$((10#${zone:1:2} * 3600 + 10#${zone:3:2} * 60))
+                [[ ${zone:0:1} != - ]] || offset=$((-offset))
+                offsets[$offset]=1
+            done
             while IFS= read -r h; do
                 while IFS= read -r m; do
-                    cand=$(( base + h * 3600 + m * 60 ))
-                    if (( cand >= start )); then
-                        printf '%s\n' $(( cand - offset ))
-                        return 0
-                    fi
+                    wall=$((base + h * 3600 + m * 60))
+                    for offset in "${!offsets[@]}"; do
+                        cand=$((wall - offset))
+                        ((cand > now)) || continue
+                        if [[ -n $earliest ]] && ((cand >= earliest)); then continue; fi
+                        actual=$(date -d "@$cand" '+%Y-%m-%d %H:%M') || return 1
+                        printf -v local_date '%04d-%02d-%02d %02d:%02d' "$GM_CIVIL_YEAR" "$GM_CIVIL_MONTH" "$GM_CIVIL_DAY" "$h" "$m"
+                        [[ $actual == "$local_date" ]] || continue
+                        if [[ -z $earliest ]] || ((cand < earliest)); then earliest=$cand; fi
+                    done
                 done <<< "$minutes"
             done <<< "$hours"
+            if [[ -n $earliest ]]; then printf '%s\n' "$earliest"; return 0; fi
         fi
         day=$(( day + 1 ))
     done
