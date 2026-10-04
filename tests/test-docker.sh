@@ -272,21 +272,31 @@ compose_port_publish_long_syntax() {
     return 0
 }
 
-# 全部配置键作为环境变量入口暴露给容器。
+# 全部配置键以列表形式透传（未设置时不注入），且不写任何静默默认值，
+# 使卷内配置层在宿主机未设置时可达。
 compose_env_entrypoints() {
     local file=$ROOT/compose.yml key
     local -a keys=(TZ GIT_PORT LISTEN_ADDRESS REPOS SHORT_LINKS ENABLE_CRON CRON_SCHEDULE
         ENABLE_HOSTS_UPDATE HOSTS_CRON HOSTS_URL HOSTS_URL_FALLBACK PROXY_URL GITHUB_TOKEN GITHUB_TOKEN_FILE)
+    grep -Eq '^[[:space:]]*environment:[[:space:]]*$' "$file" || return 1
     for key in "${keys[@]}"; do
-        grep -Eq "^[[:space:]]+$key:" "$file" || return 1
+        grep -Eq "^[[:space:]]*-[[:space:]]+$key([[:space:]]|\$)" "$file" || return 1
+        ! grep -Fq "\${$key:-" "$file" || return 1
+        ! grep -Eq "^[[:space:]]+$key:" "$file" || return 1
     done
     return 0
 }
 
-# 实机集成检查依赖可用的 docker：不可用时计入 SKIP，可用时按脚本退出码计入通过或失败。
+# docker 守护进程与 CLI 均可用才算可用。
+docker_available() {
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+# 实机集成检查按依赖分别判定：docker 不可用整段 SKIP 并区分原因；
+# docker 可用而 compose 缺失时，docker-only 覆盖照常执行，Compose 编排段单列 SKIP 并单独计数。
 docker_integration_check() {
     local status=0
-    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    if ! docker_available; then
         SKIPPED=$((SKIPPED + 1))
         printf '[SKIP] 容器实机集成检查（docker 不可用）\n'
         return 0
@@ -307,6 +317,10 @@ docker_integration_check() {
             printf '[FAIL] 容器实机集成检查\n'
             ;;
     esac
+    if ! docker compose version >/dev/null 2>&1; then
+        SKIPPED=$((SKIPPED + 1))
+        printf '[SKIP] Compose 编排实机检查（docker compose 不可用）\n'
+    fi
     return 0
 }
 
