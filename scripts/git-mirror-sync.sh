@@ -389,7 +389,9 @@ gm_sync_main() (
     fi
     [[ $# == 0 ]] || { gm_error '同步入口不接受此参数'; return 2; }
     install=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
+    gm_check_identity || return 1
     gm_prepare_runtime "${RUN_ROOT-/var/lib/git-daemon}" "$install" || return 1
+    gm_load_sync_credentials "${RUN_ROOT-/var/lib/git-daemon}" || return 1
     gm_begin_operation sync || return $?
     CONFIG_DIR=$RUN_ROOT/config
     MIRROR_ROOT=$RUN_ROOT/repos

@@ -285,6 +285,44 @@ gm_validate_config_value() {
     esac
 }
 
+# 保存本次实例显式凭据来源到私密运行状态，不回写卷配置或放行 OpenRC 全局环境。
+gm_save_sync_credentials() {
+    local run=$1 kind=none value= file=$1/runtime/sync-credentials tmp
+    if [[ -v GITHUB_TOKEN ]]; then kind=token; value=$GITHUB_TOKEN;
+    elif [[ -v GITHUB_TOKEN_FILE ]]; then kind=file; value=$GITHUB_TOKEN_FILE; fi
+    [[ $value != *[[:cntrl:]]* ]] || { gm_error '凭据包含非法控制字符'; return 1; }
+    gm_check_private_directory "$run/runtime" || return 1
+    gm_validate_file "$file" || return 1
+    tmp=$(mktemp "$run/runtime/sync-credentials.XXXXXXXX") || return 1
+    if ! printf 'KIND=%s\nVALUE=%s\n' "$kind" "$value" > "$tmp" || ! mv -f -- "$tmp" "$file"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# 仅同步入口恢复环境来源；当前显式环境优先，缺失状态回退到卷配置。
+gm_load_sync_credentials() {
+    local run=$1 file=$1/runtime/sync-credentials content kind value
+    [[ ! -v GITHUB_TOKEN && ! -v GITHUB_TOKEN_FILE ]] || return 0
+    [[ -z ${GM_CONFIG[GITHUB_TOKEN_FILE]-} ]] || return 0
+    [[ -e $file || -L $file ]] || return 0
+    gm_validate_file "$file" || return 1
+    [[ $(stat -c %a -- "$file") == 600 ]] || return 1
+    content=$(<"$file")
+    [[ $content == KIND=*$'\nVALUE='* ]] || return 1
+    kind=${content%%$'\nVALUE='*}; kind=${kind#KIND=}
+    value=${content#*$'\nVALUE='}
+    [[ $value != *[[:cntrl:]]* ]] || return 1
+    case "$kind" in
+        token) export GITHUB_TOKEN="$value" ;;
+        file) export GITHUB_TOKEN_FILE="$value" ;;
+        none) [[ -z $value ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
 # 按固定键读取纯数据文件，先验证文件，再合并显式环境和默认值。
 gm_load_config() {
     local file=$1 line key value line_number=0

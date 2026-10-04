@@ -90,6 +90,7 @@ gm_initialize_instance() {
         done
         gm_create_data_file "$run/config/mirror.env" '# 固定允许键的 KEY=VALUE 纯数据配置；环境参数不自动回写。' || exit 1
         gm_create_data_file "$run/config/installation.conf" "$record" || exit 1
+        gm_save_sync_credentials "$run" || exit 1
         # 在实例范围内准备用户 OpenRC 环境并登记服务定义，不把服务加入运行级。
         gm_prepare_instance_openrc "$run" "$install" || exit 1
     )
