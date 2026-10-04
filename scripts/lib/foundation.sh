@@ -173,9 +173,12 @@ gm_hosts_public_ipv6() {
     done
     (( prefix_zero == 1 && expanded[7] == 1 )) && return 1
     first=${expanded[0]}
-    if (( (first & 0xffc0) == 0xfe80 )) || (( (first & 0xfe00) == 0xfc00 )) || (( (first & 0xff00) == 0xff00 )); then
-        return 1
-    fi
+    # 只接受已分配全球单播 2000::/3，排除协议专用、文档与弃用的 6to4 地址。
+    (( (first & 0xe000) == 0x2000 )) || return 1
+    (( first == 0x2001 && expanded[1] < 0x200 )) && return 1
+    (( first == 0x2001 && expanded[1] == 0xdb8 )) && return 1
+    (( first == 0x2002 )) && return 1
+    (( first == 0x3fff && expanded[1] < 0x1000 )) && return 1
     prefix_zero=1
     for index in 0 1 2 3 4; do
         (( expanded[index] != 0 )) && prefix_zero=0
