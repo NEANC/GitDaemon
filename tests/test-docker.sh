@@ -204,6 +204,85 @@ openrc_user_mode_ready() {
     return 0
 }
 
+# Compose 文件存在且非空。
+compose_file_present() {
+    [[ -f $ROOT/compose.yml && -s $ROOT/compose.yml ]]
+}
+
+# Compose 只声明一个 type: volume 的命名卷，并映射到固定目标路径。
+compose_named_volume_only() {
+    local file=$ROOT/compose.yml
+    [[ $(grep -Ec 'type:[[:space:]]*volume' "$file") == 1 ]] || return 1
+    grep -Eq '^[[:space:]]*source:[[:space:]]*git-daemon-data[[:space:]]*$' "$file" || return 1
+    grep -Eq '^[[:space:]]*target:[[:space:]]*/var/lib/git-daemon[[:space:]]*$' "$file" || return 1
+    grep -Eq '^[[:space:]]*git-daemon-data:[[:space:]]*$' "$file" || return 1
+    grep -Eq '^[[:space:]]*name:[[:space:]]*git-daemon-data[[:space:]]*$' "$file" || return 1
+    return 0
+}
+
+# Compose 不含 bind、匿名卷、宿主机路径、设备、tmpfs 或 Docker socket 映射。
+compose_no_host_sources() {
+    local file=$ROOT/compose.yml
+    ! grep -Eq 'type:[[:space:]]*bind' "$file" || return 1
+    ! grep -Eq 'driver_opts' "$file" || return 1
+    ! grep -Eq '(^|[[:space:]])(device|tmpfs):' "$file" || return 1
+    ! grep -Eq 'docker\.sock' "$file" || return 1
+    ! grep -Eq '^[[:space:]]*-[[:space:]]*[/.~]' "$file" || return 1
+    return 0
+}
+
+# Compose 不含 configs/secrets 文件映射、本地 build 或特权运行。
+compose_no_build_or_privileges() {
+    local file=$ROOT/compose.yml
+    ! grep -Eq '^[[:space:]]*(configs|secrets):' "$file" || return 1
+    ! grep -Eq '^[[:space:]]*build:' "$file" || return 1
+    ! grep -Eq 'privileged:[[:space:]]*true' "$file" || return 1
+    return 0
+}
+
+# 镜像引用显式要求 IMAGE_TAG，且不存在静默回退默认值。
+compose_image_tag_explicit() {
+    local file=$ROOT/compose.yml
+    grep -Fq 'ghcr.io/neanc/git-daemon:${IMAGE_TAG:?' "$file" || return 1
+    ! grep -Fq '${IMAGE_TAG:-' "$file" || return 1
+    return 0
+}
+
+# 非 root、只读根、cap_drop ALL、no-new-privileges、重启策略与停止宽限期齐备。
+compose_hardening_options() {
+    local file=$ROOT/compose.yml
+    grep -Fq 'user: "10001:10001"' "$file" || return 1
+    grep -Eq 'read_only:[[:space:]]*true' "$file" || return 1
+    grep -Eq '^[[:space:]]*cap_drop:' "$file" || return 1
+    grep -Eq '^[[:space:]]*-[[:space:]]*ALL[[:space:]]*$' "$file" || return 1
+    grep -Eq '^[[:space:]]*security_opt:' "$file" || return 1
+    grep -Fq 'no-new-privileges:true' "$file" || return 1
+    grep -Eq 'restart:[[:space:]]*unless-stopped' "$file" || return 1
+    grep -Eq '^[[:space:]]*stop_grace_period:' "$file" || return 1
+    return 0
+}
+
+# 端口发布使用长语法并声明容器端口与协议。
+compose_port_publish_long_syntax() {
+    local file=$ROOT/compose.yml
+    grep -Eq '^[[:space:]]*ports:' "$file" || return 1
+    grep -Eq '^[[:space:]]*-[[:space:]]+target:[[:space:]]*9418[[:space:]]*$' "$file" || return 1
+    grep -Eq '^[[:space:]]*published:' "$file" || return 1
+    grep -Eq '^[[:space:]]*protocol:[[:space:]]*tcp[[:space:]]*$' "$file" || return 1
+    return 0
+}
+
+# 全部配置键作为环境变量入口暴露给容器。
+compose_env_entrypoints() {
+    local file=$ROOT/compose.yml key
+    local -a keys=(TZ GIT_PORT LISTEN_ADDRESS REPOS SHORT_LINKS ENABLE_CRON CRON_SCHEDULE
+        ENABLE_HOSTS_UPDATE HOSTS_CRON HOSTS_URL HOSTS_URL_FALLBACK PROXY_URL GITHUB_TOKEN GITHUB_TOKEN_FILE)
+    for key in "${keys[@]}"; do
+        grep -Eq "^[[:space:]]+$key:" "$file" || return 1
+    done
+    return 0
+}
+
 # 实机集成检查依赖可用的 docker：不可用时计入 SKIP，可用时按脚本退出码计入通过或失败。
 docker_integration_check() {
     local status=0
@@ -249,6 +328,14 @@ check '入口不在运行期写程序层' entrypoint_no_runtime_program_write
 check '入口拒绝 UID 0' entrypoint_rejects_uid_zero
 check '入口不把 Token 写入日志' entrypoint_no_token_logging
 check 'OpenRC 服务在用户模式下可用' openrc_user_mode_ready
+check 'Compose 文件存在' compose_file_present
+check 'Compose 只声明一个 type: volume 命名卷' compose_named_volume_only
+check 'Compose 无 bind/匿名卷/宿主机路径/tmpfs/Docker socket' compose_no_host_sources
+check 'Compose 无 configs/secrets/build/privileged' compose_no_build_or_privileges
+check 'Compose IMAGE_TAG 无静默默认' compose_image_tag_explicit
+check 'Compose 强化选项齐备' compose_hardening_options
+check 'Compose 端口发布使用长语法' compose_port_publish_long_syntax
+check 'Compose 环境变量入口齐备' compose_env_entrypoints
 docker_integration_check
 printf '容器镜像检查：%s；失败：%s；跳过：%s\n' "$CHECKS" "$FAILURES" "$SKIPPED"
 [[ $FAILURES == 0 ]]
