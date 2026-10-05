@@ -117,8 +117,22 @@ reset_stale_service_state() {
     return 0
 }
 
+# 在内核 TCP 表内按「本地地址端口字段匹配 + TCP 状态为 LISTEN（0A）」判定监听：
+# 逐行读取，先确认状态为 0A，再比较本地地址（字段 2）冒号后的端口，绝不使用子串匹配，
+# 从而不会把同端口的非 LISTEN 连接（本地端口恰为该端口的已建立/时间等待等连接）误判为就绪。
+port_is_listening() {
+    local hex=$1 table=$2 local_address state
+    [[ -r $table ]] || return 1
+    while read -r _ local_address _ state _; do
+        [[ ${state^^} == 0A ]] || continue
+        [[ ${local_address##*:} == "${hex^^}" ]] || continue
+        return 0
+    done < "$table"
+    return 1
+}
+
 # 以真实监听为判据确认 git-daemon 已就绪：读取交付配置入口解析出的生效端口，
-# 在内核监听表中确认该端口进入 LISTEN 状态；超时返回非零，不把持久化 PID 当作存活服务。
+# 在内核监听表中确认该端口以 LISTEN 状态被本地地址占用；超时返回非零，不把持久化 PID 当作存活服务。
 confirm_daemon_listening() {
     local output port hex i
     output=$("$INSTALL_ROOT/git-daemon-config.sh" --token-state=empty 2>/dev/null) || {
@@ -132,7 +146,7 @@ confirm_daemon_listening() {
     fi
     hex=$(printf '%04X' "$((10#$port))")
     for i in $(seq 1 20); do
-        if grep -q ":$hex " /proc/net/tcp 2>/dev/null || grep -q ":$hex " /proc/net/tcp6 2>/dev/null; then
+        if port_is_listening "$hex" /proc/net/tcp || port_is_listening "$hex" /proc/net/tcp6; then
             return 0
         fi
         sleep 0.5
@@ -211,4 +225,7 @@ main() {
     return "$status"
 }
 
-main "$@"
+# 直接执行时进入主流程；被测试脚本 source 时只加载函数与变量，不触发启动，直接执行行为不变。
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
