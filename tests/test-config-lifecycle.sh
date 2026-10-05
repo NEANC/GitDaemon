@@ -19,6 +19,21 @@ if [[ -f $ROOT/scripts/lib/foundation.sh ]]; then
     source "$ROOT/scripts/lib/foundation.sh"
 fi
 
+# 同步入口加载时即声明空配置数组，再由 gm_load_config 填充；
+# 直接调用凭据 helper 的夹具须复现该前置状态，避免 nounset 下数组下标按算术求值。
+declare -A GM_CONFIG=()
+
+# 运行环境只带 busybox 的 sed 小程序而没有独立 sed 可执行入口；
+# 在测试私有目录内提供等价入口，保持断言不变且不扩大生产镜像依赖。
+if ! command -v sed >/dev/null 2>&1; then
+    TEST_TOOLS=$TEST_ROOT/tools
+    mkdir -p -- "$TEST_TOOLS" || exit 1
+    printf '#!/bin/sh\nexec busybox sed "$@"\n' > "$TEST_TOOLS/sed" || exit 1
+    chmod 755 -- "$TEST_TOOLS/sed" || exit 1
+    PATH=$TEST_TOOLS:$PATH
+    export PATH
+fi
+
 # 每个用例在独立子 Shell 中运行，避免环境优先级互相污染。
 check() {
     local label=$1
@@ -119,6 +134,8 @@ sync_credentials_state_is_private() {
     require_function gm_load_sync_credentials || return 1
     local run=$TEST_ROOT/credential-state before
     mkdir -p -- "$run/runtime" "$run/config" || return 1
+    # 生产私密目录校验要求运行目录为 0700；夹具须显式收紧，而非放宽产品校验。
+    chmod 700 -- "$run/runtime" || return 1
     printf '%s\n' '# 保留原始配置' 'TZ=UTC' > "$run/config/mirror.env"
     cp -- "$run/config/mirror.env" "$run/config/mirror.env.before" || return 1
     export GITHUB_TOKEN=lifecycle-secret-token
@@ -1075,7 +1092,9 @@ bootstrap_rejects_delivered_service() {
         ln -s -- "$work/config/rc/init.d/git-daemon" "$work/config/rc/runlevels/default/git-daemon" || exit 1
         gm_instance_default_runlevel_has_delivered_service || { printf '运行级含交付服务应命中\n'; exit 1; }
         output=$(gm_bootstrap_user_runlevel 2>&1) || status=$?
-        [[ $status == 1 && $output == *'已登记交付服务'* ]] || { printf '命中交付服务必须失败关闭：status=%s，诊断=%s\n' "$status" "$output"; exit 1; }
+        # 真正校验失败关闭：拒绝退出码、明确诊断，且未启动引导（无用户运行级状态副作用）。
+        [[ $status == 1 && $output == *'存在交付服务或无法确定'* ]] || { printf '命中交付服务必须失败关闭：status=%s，诊断=%s\n' "$status" "$output"; exit 1; }
+        [[ ! -e $XDG_RUNTIME_DIR/openrc/softlevel ]] || { printf '拒绝引导时不得创建用户运行级状态\n'; exit 1; }
     )
 }
 check '实例运行级引导：default 已登记交付服务时失败关闭' bootstrap_rejects_delivered_service
