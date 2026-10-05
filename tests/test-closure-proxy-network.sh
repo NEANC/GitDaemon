@@ -19,9 +19,54 @@ git init -q "$work/source" || exit 1
 git -C "$work/source" -c user.name=fixture -c user.email=fixture@example.invalid commit -q --allow-empty -m fixture || exit 1
 git clone -q --bare "$work/source" "$work/www/source.git" || exit 1
 git --git-dir="$work/www/source.git" update-server-info || exit 1
-busybox httpd -f -p "127.0.0.1:$port" -h "$work/www" &
+# 镜像内 busybox 未编译 httpd 小程序；改用 nc 持久监听 + 每连接静态文件处理器，
+# 在测试容器内提供真实 TCP HTTP 服务，并在运行断言前显式探测就绪。
+cat > "$work/handler" <<'HANDLER'
+#!/bin/sh
+DOCROOT=${DOCROOT:?}
+read -r req
+req=$(printf '%s' "$req" | tr -d '\r')
+rest=${req#* }
+path=${rest%% *}
+while IFS= read -r line; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    [ -z "$line" ] && break
+done
+path=${path%%\?*}
+case "$path" in
+    *..*) path=/__forbidden__ ;;
+esac
+file=$DOCROOT$path
+if [ -f "$file" ]; then
+    size=$(wc -c < "$file" | tr -d ' ')
+    printf 'HTTP/1.0 200 OK\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "$size"
+    cat -- "$file"
+else
+    printf 'HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+fi
+HANDLER
+chmod 755 "$work/handler" || exit 1
+export DOCROOT=$work/www
+busybox nc -lk -s 127.0.0.1 -p "$port" -e "$work/handler" >"$work/server.log" 2>&1 &
 server=$!
-sleep 1
+# 就绪探测：夹具未就绪必须明确报告失败，不得把连接拒绝当成代理断言结果。
+ready=no
+tries=0
+while [[ $tries -lt 50 ]]; do
+    if code=$(curl -s --noproxy '*' --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/source.git/info/refs" 2>/dev/null) && [[ $code == 200 ]]; then
+        ready=yes
+        break
+    fi
+    kill -0 "$server" 2>/dev/null || break
+    tries=$((tries + 1))
+    sleep 0.1
+done
+if [[ $ready != yes ]]; then
+    printf 'FIXTURE FAILED：本地 HTTP 夹具未就绪（port=%s）\n' "$port" >&2
+    cat -- "$work/server.log" >&2 || true
+    printf 'checks=2 failed=2 fixture=1 uid=%s\n' "$UID"
+    exit 2
+fi
 git config --global "http.$url.proxy" http://127.0.0.1:1 || exit 1
 export http_proxy=http://127.0.0.1:3 HTTP_PROXY=http://127.0.0.1:3 all_proxy=http://127.0.0.1:3
 unset no_proxy NO_PROXY
