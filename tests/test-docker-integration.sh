@@ -274,15 +274,22 @@ entry_rejects_root() {
 
 # 就绪判据探针：在正式镜像内以桩程序层（仅含 git-daemon-config.sh 输出指定端口）驱动正式入口的
 # confirm_daemon_listening。mode=listen 时在容器内建立真实 LISTEN；mode=connect 时建立一条本地端口恰为
-# 该端口的已建立（非 LISTEN）连接。随后 source 正式入口（源引保护使其不进入 main）并比对返回码。
+# 该端口的已建立（非 LISTEN）连接。
+# 关键：调用目标函数之前先在探针内 grep 内核 TCP 表自证夹具成立——存在本地地址端口 == GM_PORT 且状态
+# 符合模式（listen 为 0A；connect 为非 0A）的条目；缺失即视为夹具失效（返回码 2），绝不静默空转通过。
+# 返回码约定：0 = 断言通过，1 = 产品断言不符预期，2 = 夹具失效（未建立预期条目 / 未执行到目标函数）。
 readiness_probe() {
     local port=$1 mode=$2 expect=$3
-    local script out rc=0 ok=0
+    local script out rc=0 ok=0 fixture_line=
     script=$(cat <<'PROBE'
 set -u
 umask 022
 stub=/var/lib/git-daemon/readiness-stub
 peer=$((GM_PORT + 1))
+port_hex=$(printf '%04X' "$GM_PORT")
+if [ "$GM_MODE" = listen ]; then want=0A wantdesc='=0A'; else want=nonlisten wantdesc='≠0A'; fi
+cleanup_probe() { rm -rf "$stub"; }
+trap cleanup_probe EXIT
 mkdir -p "$stub"
 printf '#!/bin/sh\necho %s\n' "$GM_PORT" >"$stub/git-daemon-config.sh"
 chmod 755 "$stub/git-daemon-config.sh"
@@ -294,6 +301,15 @@ else
     sleep 30 | busybox nc -p "$GM_PORT" 127.0.0.1 "$peer" >/dev/null 2>&1 &
 fi
 sleep 1
+tables=""
+for f in /proc/net/tcp /proc/net/tcp6; do [ -r "$f" ] && tables="$tables $f"; done
+observed=$(busybox awk -v p="$port_hex" -v want="$want" 'NR>1 { split($2,a,":"); st=toupper($4); if (a[2]==p && (want=="0A" ? st=="0A" : st!="0A")) { print st; exit } }' $tables)
+if [ -z "$observed" ]; then
+    printf '夹具失效：内核表无本地端口 %s（%s）且状态%s 的条目\n' "$GM_PORT" "$port_hex" "$wantdesc"
+    busybox awk 'NR>1 { print "  " $1 " " $2 " " toupper($4) }' $tables
+    exit 90
+fi
+printf '夹具自证：内核表存在 local_address 端口=%s（%s）状态=%s（mode=%s）\n' "$GM_PORT" "$port_hex" "$observed" "$GM_MODE"
 INSTALL_ROOT="$stub" bash -c 'source /usr/local/bin/git-mirror-entrypoint; confirm_daemon_listening'
 rc=$?
 printf 'confirm_daemon_listening 返回码=%s（mode=%s port=%s）\n' "$rc" "$GM_MODE" "$GM_PORT"
@@ -303,12 +319,14 @@ PROBE
     out=$(docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
         --security-opt no-new-privileges -v "$VOLUME:/var/lib/git-daemon" \
         -e "GM_PORT=$port" -e "GM_MODE=$mode" --entrypoint /bin/bash "$IMAGE" -c "$script" 2>&1) || rc=$?
-    # 探针必须真正执行到 confirm_daemon_listening：入口被 source 时若仍进入 main，容器会提前退出，
-    # 那种情况下返回码没有意义，必须与断言区分开，避免把「入口被误执行」当作负例通过。
-    if [[ $out != *'confirm_daemon_listening 返回码='* ]]; then
-        printf '就绪判据探针未执行到目标函数（mode=%s port=%s，返回码 %s）：\n%s\n' \
+    fixture_line=$(printf '%s\n' "$out" | grep -m1 '^夹具自证：' || true)
+    [[ -n $fixture_line ]] && printf '    %s\n' "$fixture_line" >&2
+    # 夹具失效：容器以 90 显式报告，或探针根本未执行到目标函数（入口被 source 时若仍进入 main，
+    # 容器会提前退出，此时返回码没有意义）。两种情况都属夹具问题，必须与产品断言结果区分开。
+    if [[ $rc == 90 || $out == *'夹具失效：'* || $out != *'confirm_daemon_listening 返回码='* ]]; then
+        printf '就绪判据探针夹具失效（mode=%s port=%s，退出码 %s）：\n%s\n' \
             "$mode" "$port" "$rc" "$out" >&2
-        return 1
+        return 2
     fi
     if [[ $expect == 0 ]]; then
         [[ $rc == 0 ]] && ok=1
@@ -319,6 +337,27 @@ PROBE
     printf '就绪判据探针不符预期（mode=%s port=%s，期望 %s 实际 %s）：\n%s\n' \
         "$mode" "$port" "$expect" "$rc" "$out" >&2
     return 1
+}
+
+# 就绪判据断言：探针夹具失效（返回码 2）计入独立的夹具失败计数，不冒充产品断言结果；
+# 其余情况按产品断言计入断言失败计数。
+readiness_assert() {
+    local label=$1 status=0
+    shift
+    "$@" || status=$?
+    CHECKS=$((CHECKS + 1))
+    if [[ $status == 2 ]]; then
+        FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+        printf '[FIXTURE-FAIL] 夹具未就绪，未执行断言：%s\n' "$label"
+        return 0
+    fi
+    if [[ $status == 0 ]]; then
+        printf '[PASS] %s\n' "$label"
+        return 0
+    fi
+    printf '[FAIL] %s\n' "$label"
+    FAILURES=$((FAILURES + 1))
+    return 0
 }
 
 # 正对照：内核监听表中真实 LISTEN 必须判定为就绪。
@@ -1882,8 +1921,8 @@ check '镜像不含 SSH 组件' no_ssh_components
 check '入口拒绝 UID 0' entry_rejects_root
 
 # 就绪判据：正式入口按内核 LISTEN 状态与本地地址端口判定，同端口非 LISTEN 连接不得算就绪。
-check '就绪判据：真实 LISTEN 判定为就绪（正对照）' readiness_positive_control
-check '就绪判据：同端口非 LISTEN 连接不判为就绪' readiness_rejects_nonlisten
+readiness_assert '就绪判据：真实 LISTEN 判定为就绪（正对照）' readiness_positive_control
+readiness_assert '就绪判据：同端口非 LISTEN 连接不判为就绪' readiness_rejects_nonlisten
 
 # 正常启动路径：正式入口在空命名卷上生成配置、初始目录权限正确、进入前台就绪且 daemon 真实监听。
 check '空命名卷正式启动：配置生成、初始目录权限正确且 daemon 真实监听' empty_volume_formal_startup
@@ -2007,6 +2046,7 @@ fi
 # 场景 S7：隔离 HTTPS 夹具（自定义网络 + github.com DNS 别名 + 测试 CA）下的真实成功同步。
 # 夹具不在生产镜像内；夹具准备/就绪失败记为独立的夹具失败并阻止依赖断言，
 # 依赖断言只在夹具就绪后以真实 Git 客户端与真实网络请求的观察结果判定。
+TLS_FIXTURE_BASE=$FIXTURE_FAILURES
 fixture_step 'TLS 夹具：创建隔离网络与命名卷' fixture_create_network_and_volumes
 fixture_step 'TLS 夹具：生成 Git dumb HTTP 上游与测试 CA' \
     bash "$FIXTURE_SCRIPT" prepare "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO"
@@ -2014,7 +2054,9 @@ fixture_step 'TLS 夹具：启动 github.com:443 TLS 上游' \
     bash "$FIXTURE_SCRIPT" start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_NAME"
 fixture_step 'TLS 夹具：上游 HTTPS 就绪探测' fixture_wait_upstream
 fixture_step 'TLS 夹具：把测试 CA 复制进产品卷' fixture_copy_ca
-if [[ $FIXTURE_FAILURES == 0 ]]; then FIXTURE_READY=1; fi
+# TLS 夹具就绪只看本组夹具步骤是否全部成功：与进入本组前的夹具失败数基线比较，
+# 避免与就绪判据探针等无关夹具的失败耦合而误gate本组断言。
+if [[ $FIXTURE_FAILURES == $TLS_FIXTURE_BASE ]]; then FIXTURE_READY=1; fi
 check_https_sync 'TLS 夹具：正式入口启动并进入前台就绪' fixture_start_product
 check_https_sync 'TLS 夹具：容器内自证 UID 10001 且只读根拒绝写入' fixture_identity_and_readonly_root
 check_https_sync 'TLS 夹具：首次同步引用、HEAD 与 export-ok 正确' fixture_first_sync_succeeded
