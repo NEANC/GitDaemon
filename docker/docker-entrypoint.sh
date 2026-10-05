@@ -15,9 +15,10 @@ set -uo pipefail
 INSTALL_ROOT=${INSTALL_ROOT:-/usr/local/lib/git-mirror}
 RUN_ROOT=${RUN_ROOT:-/var/lib/git-daemon}
 
-# 入口状态：停止标志、当前首次任务子进程、当前休眠子进程。
+# 入口状态：停止标志、当前首次任务子进程与其已确认的进程组 ID、当前休眠子进程。
 GM_ENTRYPOINT_STOP=0
 GM_ENTRYPOINT_TASK=
+GM_ENTRYPOINT_TASK_PGID=
 GM_ENTRYPOINT_SLEEP=
 
 # 输出不带凭据的入口日志。
@@ -72,9 +73,30 @@ scheduler_enabled() {
     [[ ${value:-yes} == yes ]]
 }
 
+# 读取任务子进程的真实进程组 ID：以 /proc/<pid>/stat 的 pgrp 字段为准，并要求其等于子进程自身 PID
+# （setsid 后子进程自成进程组与会话组长）。返回非零表示无法确认独立进程组——此时调用方不得声称
+# 已回收进程组，避免把「组从未存在」当作回收成功。
+task_process_group() {
+    local pid=$1 i stat rest pgid
+    for i in $(seq 1 50); do
+        [[ -r /proc/$pid/stat ]] || return 1
+        stat=$(cat "/proc/$pid/stat" 2>/dev/null) || stat=
+        rest=${stat##*\) }
+        read -r _ _ pgid _ <<< "$rest" || pgid=
+        if [[ $pgid == "$pid" ]]; then
+            printf '%s\n' "$pgid"
+            return 0
+        fi
+        sleep 0.02
+    done
+    return 1
+}
+
 # 等待指定进程组内全部子孙退出；边界内未回收先按组强杀再等一轮。
 # 首次任务可能形成「脚本 → 子 Shell → 传输工具 → 更深子孙」多层进程树，
 # 只终止直接子进程会让子孙滞留到 PID1 退出后被内核清理；此函数确保回收发生在 PID1 存活期间。
+# 契约：仅当调用方已确认该进程组曾真实存在（task_process_group 成功）时才可调用，
+# 因此组消失（kill -0 -pgid 失败）即代表回收完成，而非「组从未存在」的假成功。
 wait_process_group_gone() {
     local pgid=$1 i
     for i in $(seq 1 50); do
@@ -89,11 +111,16 @@ wait_process_group_gone() {
     return 1
 }
 
-# 收到停止信号时置位标志，按进程组定向终止首次任务整棵进程树与休眠子进程。
+# 收到停止信号时置位标志，按已确认的进程组定向终止首次任务整棵进程树与休眠子进程；
+# 尚未确认独立进程组时只终止直接子进程，绝不按未经校验的 PID 推断进程组。
 on_stop_signal() {
     GM_ENTRYPOINT_STOP=1
     if [[ -n ${GM_ENTRYPOINT_TASK-} ]]; then
-        kill -TERM -"$GM_ENTRYPOINT_TASK" 2>/dev/null || kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        if [[ -n ${GM_ENTRYPOINT_TASK_PGID-} ]]; then
+            kill -TERM -"$GM_ENTRYPOINT_TASK_PGID" 2>/dev/null || kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        else
+            kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        fi
     fi
     if [[ -n ${GM_ENTRYPOINT_SLEEP-} ]]; then
         kill -TERM "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
@@ -103,24 +130,35 @@ on_stop_signal() {
 
 # 以前台子进程执行首次刷新或首次同步：任务以独立进程组（setsid）启动，停止信号可按组回收整棵树；
 # 失败仅告警不终止读取服务；收到停止后先确认组内子孙真实退出再返回，不把回收推给 PID1 退出后的内核清理。
+# 启动时即校验真实进程组 ID（不臆断 $! 等于 PGID），未确认到进程组时明确不声称回收。
 run_task_best_effort() {
-    local label=$1 status=0 pgid
+    local label=$1 status=0 pgid=
     shift
     setsid "$@" &
     GM_ENTRYPOINT_TASK=$!
-    pgid=$GM_ENTRYPOINT_TASK
+    if pgid=$(task_process_group "$GM_ENTRYPOINT_TASK"); then
+        GM_ENTRYPOINT_TASK_PGID=$pgid
+    else
+        pgid=
+        GM_ENTRYPOINT_TASK_PGID=
+        log "$label 未能确认任务独立进程组，停止时仅回收直接子进程"
+    fi
     wait "$GM_ENTRYPOINT_TASK" || status=$?
     if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
-        if wait_process_group_gone "$pgid"; then
+        if [[ -n $pgid ]] && wait_process_group_gone "$pgid"; then
             log "$label 已回收进程组全部子孙"
-        else
+        elif [[ -n $pgid ]]; then
             log "$label 子孙回收超时，已按组强制终止"
+        else
+            log "$label 停止时未能确认任务进程组，未声称回收"
         fi
         GM_ENTRYPOINT_TASK=
+        GM_ENTRYPOINT_TASK_PGID=
         log "$label 因停止信号中断"
         return 130
     fi
     GM_ENTRYPOINT_TASK=
+    GM_ENTRYPOINT_TASK_PGID=
     if ((status == 0)); then
         log "$label 完成"
     else

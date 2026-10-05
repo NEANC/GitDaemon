@@ -3,9 +3,10 @@
 # 仅从程序所在位置加载可信共享实现，不执行卷内配置。
 source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/foundation.sh"
 
-# 调度进程状态：终止标志、当前任务子进程与休眠子进程，供信号处理定向回收。
+# 调度进程状态：终止标志、当前任务子进程与其已确认的进程组 ID、当前休眠子进程，供信号处理定向回收。
 GM_SCHEDULER_STOP=0
 GM_SCHEDULER_CHILD=
+GM_SCHEDULER_CHILD_PGID=
 GM_SCHEDULER_SLEEP_CHILD=
 
 # 记录调度消息并同时输出到终端与实例调度日志。
@@ -157,11 +158,14 @@ gm_scheduler_plan() {
     return 0
 }
 
-# 收到终止信号时置位停止标志，并定向终止当前任务进程组与休眠子进程，不遗留子进程。
+# 收到终止信号时置位停止标志，并定向终止当前任务进程组与休眠子进程，不遗留子进程；
+# 尚未确认独立进程组时只终止直接子进程，绝不按未经校验的 PID 推断进程组。
 gm_scheduler_on_stop_signal() {
     GM_SCHEDULER_STOP=1
     if [[ -n ${GM_SCHEDULER_CHILD-} ]]; then
-        kill -TERM -"$GM_SCHEDULER_CHILD" 2>/dev/null || true
+        if [[ -n ${GM_SCHEDULER_CHILD_PGID-} ]]; then
+            kill -TERM -"$GM_SCHEDULER_CHILD_PGID" 2>/dev/null || true
+        fi
         kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
     fi
     if [[ -n ${GM_SCHEDULER_SLEEP_CHILD-} ]]; then
@@ -183,9 +187,30 @@ gm_scheduler_sleep_until() {
     done
 }
 
+# 读取任务子进程的真实进程组 ID：以 /proc/<pid>/stat 的 pgrp 字段为准，并要求其等于子进程自身 PID
+# （setsid 后子进程自成进程组与会话组长）。返回非零表示无法确认独立进程组——此时调用方不得声称
+# 已回收进程组，避免把「组从未存在」当作回收成功。
+gm_scheduler_task_group() {
+    local pid=$1 i stat rest pgid
+    for i in $(seq 1 50); do
+        [[ -r /proc/$pid/stat ]] || return 1
+        stat=$(cat "/proc/$pid/stat" 2>/dev/null) || stat=
+        rest=${stat##*\) }
+        read -r _ _ pgid _ <<< "$rest" || pgid=
+        if [[ $pgid == "$pid" ]]; then
+            printf '%s\n' "$pgid"
+            return 0
+        fi
+        sleep 0.02
+    done
+    return 1
+}
+
 # 等待任务进程组内全部子孙退出；边界内未回收先按组强杀再等一轮。
 # 任务可能形成多层进程树，仅终止组长会让子孙滞留到容器 PID1 退出后被内核清理，
 # 此函数确保子孙回收发生在调度器（及 PID1）存活期间。
+# 契约：仅当调用方已确认该进程组曾真实存在（gm_scheduler_task_group 成功）时才可调用，
+# 因此组消失（kill -0 -pgid 失败）即代表回收完成，而非「组从未存在」的假成功。
 gm_scheduler_wait_group_gone() {
     local pgid=$1 i
     for i in $(seq 1 50); do
@@ -202,24 +227,35 @@ gm_scheduler_wait_group_gone() {
 
 # 以独立进程组运行既有交付入口；记录结果后继续，单次失败不终止调度循环；
 # 收到停止信号后按组回收任务整棵进程树并等待子孙退出再返回。
+# 启动时即校验真实进程组 ID（不臆断 $! 等于 PGID），未确认到进程组时明确不声称回收。
 gm_scheduler_run_task() {
-    local label=$1 script=$2 status=0 pgid
+    local label=$1 script=$2 status=0 pgid=
     gm_scheduler_log "开始$label：$(basename -- "$script")"
     setsid "$script" &
     GM_SCHEDULER_CHILD=$!
-    pgid=$GM_SCHEDULER_CHILD
+    if pgid=$(gm_scheduler_task_group "$GM_SCHEDULER_CHILD"); then
+        GM_SCHEDULER_CHILD_PGID=$pgid
+    else
+        pgid=
+        GM_SCHEDULER_CHILD_PGID=
+        gm_scheduler_log "$label 未能确认任务独立进程组，停止时仅回收直接子进程"
+    fi
     wait "$GM_SCHEDULER_CHILD" || status=$?
     if (( GM_SCHEDULER_STOP != 0 )); then
-        if gm_scheduler_wait_group_gone "$pgid"; then
+        if [[ -n $pgid ]] && gm_scheduler_wait_group_gone "$pgid"; then
             gm_scheduler_log "$label 已回收进程组全部子孙"
-        else
+        elif [[ -n $pgid ]]; then
             gm_scheduler_log "$label 子孙回收超时，已按组强制终止"
+        else
+            gm_scheduler_log "$label 停止时未能确认任务进程组，未声称回收"
         fi
         GM_SCHEDULER_CHILD=
+        GM_SCHEDULER_CHILD_PGID=
         gm_scheduler_log "$label 因停止信号中断"
         return 1
     fi
     GM_SCHEDULER_CHILD=
+    GM_SCHEDULER_CHILD_PGID=
     if (( status == 0 )); then
         gm_scheduler_log "$label 完成"
     else
