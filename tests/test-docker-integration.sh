@@ -9,6 +9,9 @@
 # 另在隔离 HTTPS 夹具（自定义网络 + github.com DNS 别名 + 测试 CA）下用真实 Git 客户端与真实网络请求
 # 验证产品保持 https://github.com/<owner>/<repo>.git 与 TLS 校验时的首次/重复/指定分支同步、远端更新、
 # 失败保留、未发布不可读、receive-pack 拒绝以及 /repo 与 /repo.git 双形式指向预期提交。
+# 同一夹具网络内还以测试私有的 HTTPS CONNECT 代理验证代理传输路径（代理侧 CONNECT 计数）、
+# 传输顺序（proxy → mapping → system）与非代理尝试不经过代理，并用受认证上游与合成 Token 验证
+# 凭据只进入同步路径、常驻 daemon 进程环境不含 Token。
 # docker 完全不可用时整段跳过并返回 77；仅 compose 缺失时 docker-only 覆盖照常执行。
 
 set -euo pipefail
@@ -52,6 +55,24 @@ FIXTURE_CA=$FIXTURE_MOUNT/fixture/tls/ca.crt
 FIXTURE_CHECKS=0
 FIXTURE_FAILURES=0
 FIXTURE_READY=0
+# 隔离网络使用公开格式网段：地址映射快照必须是合法公开地址，流量只在 Docker 网络内到达夹具容器，
+# 不会发往真实公网地址，也不把私网/元数据地址写进被校验的快照。
+FIXTURE_SUBNET=140.82.112.0/24
+# HTTPS CONNECT 代理夹具：网络别名 gm-proxy、监听 8443；死端口地址用于构造代理不可达场景。
+FIXTURE_PROXY_URL=https://gm-proxy:8443
+FIXTURE_DEAD_PROXY=https://gm-proxy:8099
+FIXTURE_PROXY_NAME=gm-it-proxy-$$
+FIXTURE_CONNECT_COUNT=$FIXTURE_MOUNT/fixture/connect.count
+FIXTURE_GITCONFIG=$FIXTURE_MOUNT/fixture/gitconfig
+FIXTURE_SNAPSHOT=$FIXTURE_MOUNT/hosts/github-hosts.snapshot
+PROXY_READY=0
+# 凭据隔离夹具：独立网络与产品卷；合成测试 Token（非真实私人 Token），只在容器环境变量中传递。
+AUTH_TOKEN=ghp_SYNTHETICB2ATOKEN0000000000000000
+AUTH_NET=gm-it-authnet-$$
+AUTH_PROD_VOL=gm-it-authvol-$$
+AUTH_UP=gm-it-authup-$$
+AUTH_PROD=gm-it-authsync-$$
+AUTH_READY=0
 # 场景化 compose 透传环境变量（列表形式）；compose_up 负责导出后编排。
 COMPOSE_ENV=()
 
@@ -104,11 +125,26 @@ cleanup() {
     if [[ -n ${FIXTURE_PROD:-} ]]; then
         docker rm -f "$FIXTURE_PROD" >/dev/null 2>&1 || true
     fi
+    if [[ -n ${FIXTURE_PROXY_NAME:-} ]]; then
+        docker rm -f "$FIXTURE_PROXY_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${AUTH_UP:-} ]]; then
+        docker rm -f "$AUTH_UP" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${AUTH_PROD:-} ]]; then
+        docker rm -f "$AUTH_PROD" >/dev/null 2>&1 || true
+    fi
     if [[ -n ${FIXTURE_NET:-} ]]; then
         docker network rm "$FIXTURE_NET" >/dev/null 2>&1 || true
     fi
+    if [[ -n ${AUTH_NET:-} ]]; then
+        docker network rm "$AUTH_NET" >/dev/null 2>&1 || true
+    fi
     if [[ -n ${FIXTURE_FIX_VOL:-} || -n ${FIXTURE_PROD_VOL:-} ]]; then
         docker volume rm -f "$FIXTURE_FIX_VOL" "$FIXTURE_PROD_VOL" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${AUTH_PROD_VOL:-} ]]; then
+        docker volume rm -f "$AUTH_PROD_VOL" >/dev/null 2>&1 || true
     fi
     if [[ -f ${COMPOSE_OVERRIDE:-} ]]; then
         IMAGE_TAG=$COMPOSE_TAG REPOS=$TEST_REPO \
@@ -865,11 +901,12 @@ fixture_step() {
     return 0
 }
 
-# 依赖夹具的产品断言：夹具未就绪时记为夹具失败并且不执行，既不冒充产品结论也不把连接错误当断言。
-check_https_sync() {
-    local label=$1
-    shift
-    if [[ $FIXTURE_READY == 1 ]]; then
+# 依赖夹具的产品断言：指定就绪标志未置位时记为夹具失败并且不执行，
+# 既不冒充产品结论也不把连接错误当作断言结果。
+check_gated() {
+    local flag=$1 label=$2
+    shift 2
+    if [[ ${!flag} == 1 ]]; then
         check "$label" "$@"
         return 0
     fi
@@ -879,11 +916,16 @@ check_https_sync() {
     return 0
 }
 
+# 三组夹具各自独立就绪标志：任一组夹具不可用只记夹具失败并阻止其依赖断言。
+check_https_sync() { check_gated FIXTURE_READY "$@"; }
+check_proxy_sync() { check_gated PROXY_READY "$@"; }
+check_auth_sync() { check_gated AUTH_READY "$@"; }
+
 # 创建夹具所需的自定义网络与两个命名卷（上游资产卷、产品运行卷），不使用 bind 或宿主机路径。
 fixture_create_network_and_volumes() {
     docker volume create "$FIXTURE_FIX_VOL" >/dev/null 2>&1 || return 1
     docker volume create "$FIXTURE_PROD_VOL" >/dev/null 2>&1 || return 1
-    docker network create "$FIXTURE_NET" >/dev/null 2>&1 || return 1
+    docker network create --subnet "$FIXTURE_SUBNET" "$FIXTURE_NET" >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -1104,6 +1146,249 @@ compose_teardown() {
     return 0
 }
 
+# 读取代理侧 CONNECT 计数（夹具卷内计数文件；缺失时夹具脚本输出 0）。
+fixture_connect_count() {
+    bash "$FIXTURE_SCRIPT" connects "$FIXTURE_FIX_VOL" "$IMAGE" 2>/dev/null | tr -d '[:space:]'
+}
+
+# 把当前 CONNECT 计数写入测试目录文件，供跨子 Shell 的断言比对。
+fixture_record_count() {
+    local file=$1 value
+    value=$(fixture_connect_count) || value=
+    printf '%s\n' "${value:-0}" > "$file"
+    return 0
+}
+
+# 读取此前记录的 CONNECT 计数。
+fixture_read_count() {
+    local value
+    value=$(cat "$1" 2>/dev/null) || value=
+    printf '%s' "${value:-0}"
+}
+
+# 启动 HTTPS CONNECT 代理容器（网络别名 gm-proxy，监听 8443，非 root）。
+fixture_start_proxy() {
+    bash "$FIXTURE_SCRIPT" proxy-start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_PROXY_NAME"
+}
+
+# 代理就绪探测：以真实 TLS 客户端经代理取到静态 info/refs 且返回 200。
+# 探测本身经过代理（计入计数），故代理基线在探测之后单独记录。
+fixture_wait_proxy() {
+    local i code
+    [[ $(docker inspect -f '{{.State.Running}}' "$FIXTURE_PROXY_NAME" 2>/dev/null) == true ]] || {
+        printf '代理容器未运行，判定代理夹具失败\n' >&2
+        return 1
+    }
+    for i in $(seq 1 30); do
+        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" \
+            --entrypoint /bin/sh "$IMAGE" -c \
+            "curl -sS --cacert $FIXTURE_CA --proxy $FIXTURE_PROXY_URL --proxy-cacert $FIXTURE_CA \
+                -o /dev/null -w '%{http_code}' https://github.com/$FIXTURE_REPO.git/info/refs" \
+            2>"$TEST_ROOT/proxy-probe.err") || code=
+        if [[ $code == 200 ]]; then return 0; fi
+        sleep 1
+    done
+    printf '代理就绪探测失败（HTTP %s）：\n' "$code" >&2
+    cat "$TEST_ROOT/proxy-probe.err" >&2 2>/dev/null || true
+    return 1
+}
+
+# 记录代理基线计数：仅在就绪探测之后调用，避免把探测自身计入断言基线。
+fixture_record_proxy_baseline() {
+    fixture_record_count "$TEST_ROOT/proxy-baseline"
+}
+
+# 在产品卷内预置映射路径与代理路径的输入：
+# 一是合法公开地址快照（值为夹具容器在该隔离网络上的地址，请求只在 Docker 网络内到达夹具）；
+# 二是仅用于信任测试代理 CA 的全局 Git 配置（http.proxySSLCAInfo），不关闭任何 TLS 校验。
+fixture_prepare_proxy_inputs() {
+    local ip
+    ip=$(bash "$FIXTURE_SCRIPT" upstream-ip "$FIXTURE_NAME") || return 1
+    [[ -n $ip ]] || return 1
+    printf '%s\n' '# FORMAT=1' '# SOURCE=https://fixture.invalid/hosts' \
+        '# FETCHED=2026-01-01T00:00:00+0000' '# DIGEST=sha256:fixture' '# COUNT=1' "$ip github.com" | \
+        docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "umask 022; mkdir -p $FIXTURE_MOUNT/hosts; cat > $FIXTURE_SNAPSHOT" || return 1
+    printf '[http]\n\tproxySSLCAInfo = %s\n' "$FIXTURE_CA" | \
+        docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "umask 022; mkdir -p $FIXTURE_MOUNT/fixture; cat > $FIXTURE_GITCONFIG" || return 1
+    return 0
+}
+
+# 在产品容器内以 UID 10001 执行一次同步：显式给出代理地址与映射开关，
+# 输出（同时写入卷内 sync.log）供断言检查实际传输路径。
+fixture_exec_sync_scenario() {
+    local proxy=$1 hosts_update=$2 repos=$3
+    docker exec -e "REPOS=$repos" -e "HOME=$FIXTURE_HOME" -e GIT_SMART_HTTP=0 \
+        -e "GIT_SSL_CAINFO=$FIXTURE_CA" -e "GIT_CONFIG_GLOBAL=$FIXTURE_GITCONFIG" \
+        -e "PROXY_URL=$proxy" -e "ENABLE_HOSTS_UPDATE=$hosts_update" \
+        "$FIXTURE_PROD" /usr/local/lib/git-mirror/git-mirror-sync.sh 2>&1
+}
+
+# 代理成功路径：配置 PROXY_URL 时真实同步成功，日志记录使用配置代理，且代理侧计数确实增加。
+fixture_proxy_path_succeeds() {
+    local out before after
+    out=$(fixture_exec_sync_scenario "$FIXTURE_PROXY_URL" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    printf '%s\n' "$out" > "$TEST_ROOT/proxy-run-output"
+    fixture_record_count "$TEST_ROOT/proxy-after-run"
+    [[ $out == *'本次同步成功'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    [[ $out == *'同步传输路径：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    before=$(fixture_read_count "$TEST_ROOT/proxy-baseline")
+    after=$(fixture_read_count "$TEST_ROOT/proxy-after-run")
+    (( after > before )) || { printf '代理侧计数未增加（before=%s after=%s）\n' "$before" "$after" >&2; return 1; }
+    return 0
+}
+
+# 代理计数证据：代理侧记录到对 github.com:443 的 CONNECT，且计数确实增加。
+fixture_proxy_connect_evidence() {
+    local before after log
+    before=$(fixture_read_count "$TEST_ROOT/proxy-baseline")
+    after=$(fixture_read_count "$TEST_ROOT/proxy-after-run")
+    (( after > before )) || { printf '代理侧计数未增加（before=%s after=%s）\n' "$before" "$after" >&2; return 1; }
+    log=$(bash "$FIXTURE_SCRIPT" connect-log "$FIXTURE_FIX_VOL" "$IMAGE" 2>/dev/null) || log=
+    [[ $log == *'CONNECT github.com:443'* ]] || { printf '代理 CONNECT 日志：\n%s\n' "$log" >&2; return 1; }
+    return 0
+}
+
+# 传输顺序：代理不可达时按序回退到动态地址映射，映射请求真实取到上游。
+fixture_proxy_failure_falls_back_to_mapping() {
+    local out
+    out=$(fixture_exec_sync_scenario "$FIXTURE_DEAD_PROXY" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    printf '%s\n' "$out" > "$TEST_ROOT/proxy-mapping-output"
+    [[ $out == *'传输失败：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    [[ $out == *'同步传输路径：直连加动态地址映射'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    return 0
+}
+
+# 传输顺序：代理不可达且无映射时回退到直连系统 DNS。
+fixture_proxy_failure_falls_back_to_system() {
+    local out
+    out=$(fixture_exec_sync_scenario "$FIXTURE_DEAD_PROXY" no "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    printf '%s\n' "$out" > "$TEST_ROOT/proxy-system-output"
+    fixture_record_count "$TEST_ROOT/proxy-final-count"
+    [[ $out == *'传输失败：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    [[ $out == *'同步传输路径：直连系统 DNS'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    return 0
+}
+
+# 非 proxy 尝试不经过代理：两次直连回退均成功，且代理侧计数与代理成功时完全一致。
+fixture_direct_attempts_leave_proxy_untouched() {
+    local after final mapping system
+    after=$(fixture_read_count "$TEST_ROOT/proxy-after-run")
+    final=$(fixture_read_count "$TEST_ROOT/proxy-final-count")
+    mapping=$(cat "$TEST_ROOT/proxy-mapping-output" 2>/dev/null) || mapping=
+    system=$(cat "$TEST_ROOT/proxy-system-output" 2>/dev/null) || system=
+    [[ $mapping == *'同步传输路径：直连加动态地址映射'* ]] || return 1
+    [[ $system == *'同步传输路径：直连系统 DNS'* ]] || return 1
+    [[ $after == "$final" ]] || { printf '非代理尝试后代理计数变化（after=%s final=%s）\n' "$after" "$final" >&2; return 1; }
+    return 0
+}
+
+# 凭据夹具：在独立网络上以 github.com 别名启动需要 Basic 凭据的认证上游；
+# 就绪判据是未带凭据的真实请求得到 401，证明该夹具确实要求鉴权。
+fixture_start_auth_upstream() {
+    local expect i code
+    expect="Basic $(printf 'x-access-token:%s' "$AUTH_TOKEN" | base64 | tr -d '\n')"
+    docker network create "$AUTH_NET" >/dev/null 2>&1 || return 1
+    bash "$FIXTURE_SCRIPT" auth-start "$FIXTURE_FIX_VOL" "$IMAGE" "$AUTH_NET" "$AUTH_UP" "$expect" || return 1
+    [[ $(docker inspect -f '{{.State.Running}}' "$AUTH_UP" 2>/dev/null) == true ]] || {
+        printf '认证上游容器未运行，判定凭据夹具失败\n' >&2
+        return 1
+    }
+    for i in $(seq 1 30); do
+        code=$(docker run --rm --network "$AUTH_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+            "curl -sS --cacert $FIXTURE_CA -o /dev/null -w '%{http_code}' https://github.com/$FIXTURE_REPO.git/info/refs" \
+            2>/dev/null) || code=
+        if [[ $code == 401 ]]; then return 0; fi
+        sleep 1
+    done
+    printf '认证上游就绪探测未得到 401（HTTP %s）\n' "$code" >&2
+    return 1
+}
+
+# 凭据夹具：创建产品卷并把测试 CA 复制进去（命名卷之间经标准输入传递，无宿主机路径映射）。
+fixture_prepare_auth_product_volume() {
+    docker volume create "$AUTH_PROD_VOL" >/dev/null 2>&1 || return 1
+    bash "$FIXTURE_SCRIPT" ca "$FIXTURE_FIX_VOL" "$IMAGE" > "$TEST_ROOT/auth-ca.pem" || return 1
+    docker run --rm -i --user 10001:10001 -v "$AUTH_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "umask 022; mkdir -p ${FIXTURE_CA%/*}; cat > $FIXTURE_CA" < "$TEST_ROOT/auth-ca.pem"
+}
+
+# 带合成 Token 的产品容器：正式入口完成首次同步；Token 仅以容器环境变量形式提供。
+fixture_start_auth_product() {
+    local i
+    docker rm -f "$AUTH_PROD" >/dev/null 2>&1 || true
+    docker run -d --name "$AUTH_PROD" --network "$AUTH_NET" --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --user 10001:10001 -v "$AUTH_PROD_VOL:$FIXTURE_MOUNT" \
+        -e "REPOS=$FIXTURE_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no -e GIT_SMART_HTTP=0 \
+        -e "GITHUB_TOKEN=$AUTH_TOKEN" -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$IMAGE" \
+        >"$TEST_ROOT/auth-product.log" 2>&1 || return 1
+    for i in $(seq 1 150); do
+        if docker logs "$AUTH_PROD" 2>&1 | grep -q '容器前台就绪'; then return 0; fi
+        if [[ $(docker inspect -f '{{.State.Running}}' "$AUTH_PROD" 2>/dev/null) == false ]]; then
+            printf '认证同步容器提前退出，日志尾部：\n' >&2
+            docker logs "$AUTH_PROD" 2>&1 | tail -n 20 >&2 2>&1 || true
+            return 1
+        fi
+        sleep 1
+    done
+    printf '认证同步容器未进入前台就绪，日志尾部：\n' >&2
+    docker logs "$AUTH_PROD" 2>&1 | tail -n 20 >&2 2>&1 || true
+    return 1
+}
+
+# 合成 Token 访问受认证夹具成功：镜像引用与上游一致，已发布且同步日志记录成功。
+fixture_auth_sync_with_token_succeeds() {
+    local expected
+    docker logs "$AUTH_PROD" 2>&1 | grep -q '本次同步成功' || return 1
+    expected=$(bash "$FIXTURE_SCRIPT" rev-parse "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" refs/heads/main) || return 1
+    docker run --rm --user 10001:10001 -v "$AUTH_PROD_VOL:$FIXTURE_MOUNT" \
+        -e "GM_EXPECT_MAIN=$expected" --entrypoint /bin/sh "$IMAGE" -c '
+        set -e
+        d='"$FIXTURE_MOUNT"'/repos/'"$FIXTURE_REPO"'.git
+        [ "$(git --git-dir="$d" rev-parse refs/heads/main)" = "$GM_EXPECT_MAIN" ]
+        git --git-dir="$d" rev-parse --verify refs/heads/dev >/dev/null
+        [ -f "$d/git-daemon-export-ok" ]
+    '
+}
+
+# 凭据隔离：容器内读取常驻 git-daemon 进程的 /proc/<pid>/environ，该环境既不含 GITHUB_TOKEN，
+# 也不含合成 Token 值；同时要求读取结果包含 PATH，避免因读取失败而空转通过。
+fixture_daemon_env_excludes_token() {
+    local out
+    out=$(docker exec "$AUTH_PROD" sh -c '
+        pid=$(cat /var/lib/git-daemon/runtime/git-daemon.pid 2>/dev/null)
+        case "$pid" in ""|*[!0-9]*) printf "NO_PIDFILE\n"; exit 1 ;; esac
+        cmd=$(tr "\0" " " < "/proc/$pid/cmdline" 2>/dev/null)
+        case "$cmd" in *"daemon --reuseaddr --base-path"*) ;; *) printf "NOT_DAEMON %s\n" "$cmd"; exit 1 ;; esac
+        tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null
+    ' 2>&1) || { printf '无法读取常驻 daemon 进程环境：%s\n' "$out" >&2; return 1; }
+    [[ $out == *'PATH='* ]] || { printf 'daemon 进程环境读取结果异常：%s\n' "$out" >&2; return 1; }
+    case "$out" in
+        *"GITHUB_TOKEN="*) printf '常驻 daemon 进程环境包含 GITHUB_TOKEN\n' >&2; return 1 ;;
+    esac
+    case "$out" in
+        *"$AUTH_TOKEN"*) printf '常驻 daemon 进程环境包含合成 Token 值\n' >&2; return 1 ;;
+    esac
+    return 0
+}
+
+# 对照：真实 Git 客户端不带凭据访问同一受认证夹具必须失败，证明鉴权断言非空转。
+fixture_auth_requires_token() {
+    local out status=0
+    out=$(docker run --rm --network "$AUTH_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+        "cd /tmp && rm -rf anon.git && git init -q --bare anon.git && \
+         git --git-dir=/tmp/anon.git remote add origin https://github.com/$FIXTURE_REPO.git && \
+         GIT_TERMINAL_PROMPT=0 GIT_SMART_HTTP=0 git -c http.sslCAInfo=$FIXTURE_CA \
+         --git-dir=/tmp/anon.git fetch --atomic --prune origin" 2>&1) || status=$?
+    [[ $status != 0 ]] || { printf '无凭据访问意外成功\n' >&2; return 1; }
+    case "$out" in
+        *401*|*'Authentication failed'*|*authentication*|*'could not read Username'*|*认证*) return 0 ;;
+    esac
+    printf '无凭据访问诊断：%s\n' "$out" >&2
+    return 1
+}
+
 # docker 完全不可用（CLI 缺失或守护进程不可达）才整体跳过并返回 77。
 if ! docker_available; then
     printf 'SKIP：docker 不可用，未执行\n'
@@ -1264,6 +1549,32 @@ check_https_sync 'TLS 夹具：重复同步幂等（引用不变且日志递增�
 check_https_sync 'TLS 夹具：远端更新后引用与 HEAD 变化' fixture_remote_update_reflected
 check_https_sync 'TLS 夹具：上游不可达时保留旧引用' fixture_failure_retains_refs
 check_https_sync 'TLS 夹具：指定分支同步仅保留所选分支' fixture_branch_scoped_sync
+
+# 场景 S8：HTTPS CONNECT 代理路径与传输顺序（proxy → mapping → system）。
+# 代理夹具不在生产镜像内；代理启动/就绪失败记独立夹具失败并阻止依赖断言，
+# 断言只用真实网络请求的观察结果与代理侧 CONNECT 计数，不以 git config 输出代替。
+S8_BASE=$FIXTURE_FAILURES
+fixture_step 'HTTPS 代理：启动 TLS 终结的 CONNECT 代理' fixture_start_proxy
+fixture_step 'HTTPS 代理：经代理取到静态 info/refs（就绪）' fixture_wait_proxy
+fixture_step 'HTTPS 代理：预置公开地址快照与代理 CA 信任配置' fixture_prepare_proxy_inputs
+fixture_step 'HTTPS 代理：记录代理基线计数' fixture_record_proxy_baseline
+if [[ $FIXTURE_FAILURES == $S8_BASE ]]; then PROXY_READY=1; fi
+check_proxy_sync 'HTTPS 代理：配置 PROXY_URL 时真实同步成功（代理路径）' fixture_proxy_path_succeeds
+check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT 且计数增加' fixture_proxy_connect_evidence
+check_proxy_sync '传输顺序：代理不可达后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
+check_proxy_sync '传输顺序：代理不可达且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
+check_proxy_sync '传输顺序：非 proxy 尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
+
+# 场景 S9：合成 Token 访问受认证夹具与常驻 daemon 进程的凭据隔离。
+# 使用独立网络与产品卷（github.com 别名冲突），Token 为合成测试值，仅以容器环境变量提供。
+S9_BASE=$FIXTURE_FAILURES
+fixture_step '凭据夹具：在独立网络启动受认证上游（未带凭据为 401）' fixture_start_auth_upstream
+fixture_step '凭据夹具：准备产品卷并信任测试 CA' fixture_prepare_auth_product_volume
+if [[ $FIXTURE_FAILURES == $S9_BASE ]]; then AUTH_READY=1; fi
+check_auth_sync '凭据夹具：带合成 Token 的正式入口启动并进入前台就绪' fixture_start_auth_product
+check_auth_sync '凭据隔离：合成 Token 访问受认证夹具成功' fixture_auth_sync_with_token_succeeds
+check_auth_sync '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
+check_auth_sync '凭据夹具：真实 Git 客户端无凭据访问被拒绝（鉴权非空转）' fixture_auth_requires_token
 
 printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES"
 [[ $FAILURES == 0 && $FIXTURE_FAILURES == 0 ]]
