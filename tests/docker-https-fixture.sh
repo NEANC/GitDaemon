@@ -32,6 +32,15 @@ FIXTURE_PROXY_PORT=8443
 # 同一代理容器另开的拒绝端口：收到目标 CONNECT 仍计数，但返回非 200（可达却拒绝），
 # 供回退场景构造「代理确实被尝试过」的可区分证据。
 FIXTURE_PROXY_REJECT_PORT=8444
+# 地址来源（hosts）HTTPS 端点：可信端点用测试 CA 签发 SAN=来源主机名，错误证书端点用自签证书，
+# 供容器内校验「可信来源刷新成功」与「错误证书必须失败」。文件由 hosts-put 发布到夹具卷内 web 根。
+FIXTURE_HOSTS_WEB=$FIXTURE_ROOT/hostsweb
+FIXTURE_HOSTS_CERT=$FIXTURE_TLS/hosts.crt
+FIXTURE_HOSTS_KEY=$FIXTURE_TLS/hosts.key
+FIXTURE_HOSTS_BAD_CERT=$FIXTURE_TLS/hosts-bad.crt
+FIXTURE_HOSTS_BAD_KEY=$FIXTURE_TLS/hosts-bad.key
+FIXTURE_HOSTS_ALIAS=hosts-source.test
+FIXTURE_HOSTS_BAD_ALIAS=hosts-badcert.test
 FIXTURE_FAILURE=80
 
 # 输出夹具诊断到 stderr。
@@ -51,6 +60,9 @@ usage() {
   docker-https-fixture.sh ca          <volume> <image>
   docker-https-fixture.sh proxy-start <volume> <image> <network> <name> [proxy-host]
   docker-https-fixture.sh auth-start  <volume> <image> <network> <name> <expected-authorization>
+  docker-https-fixture.sh hosts-put   <volume> <image> <name>
+  docker-https-fixture.sh hosts-serve <volume> <image> <network> <name> [alias]
+  docker-https-fixture.sh hosts-serve-bad <volume> <image> <network> <name> [alias]
   docker-https-fixture.sh upstream-ip <name>
   docker-https-fixture.sh connects    <volume> <image>
   docker-https-fixture.sh connect-log <volume> <image>
@@ -136,6 +148,13 @@ openssl x509 -req -in srv.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -
 openssl req -newkey rsa:2048 -nodes -subj /CN=gm-proxy -keyout proxy.key -out proxy.csr >/dev/null 2>&1
 printf 'subjectAltName=DNS:gm-proxy\n' > proxy.san
 openssl x509 -req -in proxy.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -extfile proxy.san -out proxy.crt >/dev/null 2>&1
+mkdir -p "\$R/hostsweb"
+openssl req -newkey rsa:2048 -nodes -subj /CN=$FIXTURE_HOSTS_ALIAS -keyout hosts.key -out hosts.csr >/dev/null 2>&1
+printf 'subjectAltName=DNS:%s\n' "$FIXTURE_HOSTS_ALIAS" > hosts.san
+openssl x509 -req -in hosts.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -extfile hosts.san -out hosts.crt >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -subj /CN=$FIXTURE_HOSTS_BAD_ALIAS -keyout hosts-bad.key -out hosts-bad.csr >/dev/null 2>&1
+printf 'subjectAltName=DNS:%s\n' "$FIXTURE_HOSTS_BAD_ALIAS" > hosts-bad.san
+openssl x509 -req -in hosts-bad.csr -signkey hosts-bad.key -days 2 -extfile hosts-bad.san -out hosts-bad.crt >/dev/null 2>&1
 EOF
 )
     volume_run "$volume" "$image" "$script" || return "$FIXTURE_FAILURE"
@@ -251,6 +270,45 @@ cmd_start() {
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
         -c "cd $FIXTURE_WEB && exec openssl s_server -accept $FIXTURE_PORT -cert $FIXTURE_CERT -key $FIXTURE_KEY -WWW -quiet" \
         >/dev/null 2>&1 || { fail '无法启动 TLS 上游容器'; return "$FIXTURE_FAILURE"; }
+    fixture_wait_running "$name" || return "$FIXTURE_FAILURE"
+    return 0
+}
+
+# 把标准输入内容发布为夹具 hosts web 根内的静态文件，供 hosts-serve 端点提供。
+# 二进制安全（cat 直写），支持空文件与超大文件；文件名限制为安全分量。
+cmd_hosts_put() {
+    local volume=$1 image=$2 name=$3 status=0
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { fail "非法的 hosts 文件名：$name"; return 2; }
+    docker run --rm -i --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+        -c "umask 022; mkdir -p '$FIXTURE_HOSTS_WEB'; cat > '$FIXTURE_HOSTS_WEB/$name'" || status=$?
+    [[ $status == 0 ]] || { fail "发布 hosts 文件失败：$name"; return "$FIXTURE_FAILURE"; }
+    return 0
+}
+
+# 在自定义网络上以来源主机名别名启动可信 hosts HTTPS 端点（测试 CA 签发，SAN 匹配别名）。
+# 文件即为 hosts 数据；端口 443 经非特权绑定，不新增 capability。
+cmd_hosts_serve() {
+    local volume=$1 image=$2 network=$3 name=$4 alias=${5:-$FIXTURE_HOSTS_ALIAS}
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --network "$network" --network-alias "$alias" \
+        --sysctl "net.ipv4.ip_unprivileged_port_start=$FIXTURE_PORT" \
+        --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+        -c "cd $FIXTURE_HOSTS_WEB && exec openssl s_server -accept $FIXTURE_PORT -cert $FIXTURE_HOSTS_CERT -key $FIXTURE_HOSTS_KEY -WWW -quiet" \
+        >/dev/null 2>&1 || { fail '无法启动 hosts HTTPS 端点'; return "$FIXTURE_FAILURE"; }
+    fixture_wait_running "$name" || return "$FIXTURE_FAILURE"
+    return 0
+}
+
+# 启动错误证书 hosts 端点：自签证书（不受测试 CA 信任），SAN 匹配另一主机名。
+# 用于「错误证书必须失败」——端点确实在提供文件，失败只能归因于 TLS 校验。
+cmd_hosts_serve_bad() {
+    local volume=$1 image=$2 network=$3 name=$4 alias=${5:-$FIXTURE_HOSTS_BAD_ALIAS}
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --network "$network" --network-alias "$alias" \
+        --sysctl "net.ipv4.ip_unprivileged_port_start=$FIXTURE_PORT" \
+        --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+        -c "cd $FIXTURE_HOSTS_WEB && exec openssl s_server -accept $FIXTURE_PORT -cert $FIXTURE_HOSTS_BAD_CERT -key $FIXTURE_HOSTS_BAD_KEY -WWW -quiet" \
+        >/dev/null 2>&1 || { fail '无法启动错误证书 hosts 端点'; return "$FIXTURE_FAILURE"; }
     fixture_wait_running "$name" || return "$FIXTURE_FAILURE"
     return 0
 }
@@ -379,6 +437,9 @@ main() {
         ca) [[ $# == 2 ]] || usage; cmd_ca "$@" ;;
         proxy-start) [[ $# == 4 || $# == 5 ]] || usage; cmd_proxy_start "$@" ;;
         auth-start) [[ $# == 5 ]] || usage; cmd_auth_start "$@" ;;
+        hosts-put) [[ $# == 3 ]] || usage; cmd_hosts_put "$@" ;;
+        hosts-serve) [[ $# == 4 || $# == 5 ]] || usage; cmd_hosts_serve "$@" ;;
+        hosts-serve-bad) [[ $# == 4 || $# == 5 ]] || usage; cmd_hosts_serve_bad "$@" ;;
         upstream-ip) [[ $# == 1 ]] || usage; cmd_upstream_ip "$@" ;;
         connects) [[ $# == 2 ]] || usage; cmd_connects "$@" ;;
         connect-log) [[ $# == 2 ]] || usage; cmd_connect_log "$@" ;;

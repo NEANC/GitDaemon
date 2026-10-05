@@ -65,6 +65,18 @@ FIXTURE_PROXY_NAME=gm-it-proxy-$$
 FIXTURE_CONNECT_COUNT=$FIXTURE_MOUNT/fixture/connect.count
 FIXTURE_GITCONFIG=$FIXTURE_MOUNT/fixture/gitconfig
 FIXTURE_SNAPSHOT=$FIXTURE_MOUNT/hosts/github-hosts.snapshot
+# 地址内容夹具：可信来源端点（测试 CA 签发，SAN=hosts-source.test）与错误证书端点
+# （自签证书，SAN=hosts-badcert.test）。文件由夹具 hosts-put 发布，覆盖多地址/空/超限/备用内容。
+FIXTURE_HOSTS_ALIAS=hosts-source.test
+FIXTURE_HOSTS_BAD_ALIAS=hosts-badcert.test
+FIXTURE_HOSTS_URL=https://hosts-source.test/hosts
+FIXTURE_HOSTS_URL2=https://hosts-source.test/hosts2
+FIXTURE_HOSTS_EMPTY_URL=https://hosts-source.test/empty
+FIXTURE_HOSTS_BIG_URL=https://hosts-source.test/big
+FIXTURE_HOSTS_BAD_URL=https://hosts-badcert.test/hosts
+FIXTURE_HOSTS_NAME=gm-it-hosts-src-$$
+FIXTURE_HOSTS_BAD_NAME=gm-it-hosts-bad-$$
+HOSTS_READY=0
 PROXY_READY=0
 # 凭据隔离夹具：独立网络与产品卷；合成测试 Token（非真实私人 Token），只在容器环境变量中传递。
 AUTH_TOKEN=ghp_SYNTHETICB2ATOKEN0000000000000000
@@ -129,6 +141,12 @@ cleanup() {
     fi
     if [[ -n ${FIXTURE_PROXY_NAME:-} ]]; then
         docker rm -f "$FIXTURE_PROXY_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${FIXTURE_HOSTS_NAME:-} ]]; then
+        docker rm -f "$FIXTURE_HOSTS_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${FIXTURE_HOSTS_BAD_NAME:-} ]]; then
+        docker rm -f "$FIXTURE_HOSTS_BAD_NAME" >/dev/null 2>&1 || true
     fi
     if [[ -n ${AUTH_UP:-} ]]; then
         docker rm -f "$AUTH_UP" >/dev/null 2>&1 || true
@@ -923,6 +941,7 @@ check_https_sync() { check_gated FIXTURE_READY "$@"; }
 check_proxy_sync() { check_gated PROXY_READY "$@"; }
 check_auth_sync() { check_gated AUTH_READY "$@"; }
 check_auth_prod() { check_gated AUTH_PROD_READY "$@"; }
+check_hosts_content() { check_gated HOSTS_READY "$@"; }
 
 # 创建夹具所需的自定义网络与两个命名卷（上游资产卷、产品运行卷），不使用 bind 或宿主机路径。
 fixture_create_network_and_volumes() {
@@ -1414,6 +1433,271 @@ fixture_auth_requires_token() {
     return 1
 }
 
+# 在正式产品容器内以 UID 10001 执行地址刷新入口：ENABLE_HOSTS_UPDATE/HOSTS_URL/回退由显式环境给出，
+# CURL_CA_BUNDLE 仅指向测试 CA（建立对该测试 CA 的信任，不关闭 TLS 校验）；REPOS 等继承容器环境。
+# 显式 umask 022 以对齐生产入口（docker run/入口进程 umask 022）；docker exec 自身 umask 为 0000，
+# 会把卷内快照写成组/其他可写并被产品自身的文件校验拒绝，那是测试路径差异而非生产行为。
+fixture_exec_hosts_refresh() {
+    local hosts_url=$1 fallback=$2
+    docker exec -e "HOME=$FIXTURE_HOME" -e ENABLE_HOSTS_UPDATE=yes \
+        -e "HOSTS_URL=$hosts_url" -e "HOSTS_URL_FALLBACK=$fallback" \
+        -e "CURL_CA_BUNDLE=$FIXTURE_CA" \
+        "$FIXTURE_PROD" /bin/sh -c 'umask 022; exec /usr/local/lib/git-mirror/update-github-hosts.sh'
+}
+
+# 读取产品卷内地址快照的真实字节（断言读真实卷内快照，而非只看退出码）。
+fixture_snapshot_bytes() {
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint cat "$IMAGE" "$FIXTURE_SNAPSHOT" 2>/dev/null
+}
+
+# 记录当前快照 sha256 到测试目录，供拒绝类断言的逐字节保留比对。
+fixture_record_snapshot_sha() {
+    fixture_snapshot_bytes | sha256sum | cut -d' ' -f1 > "$TEST_ROOT/hosts-snapshot.sha"
+    [[ -s $TEST_ROOT/hosts-snapshot.sha ]]
+}
+
+# 读取此前记录的快照 sha256。
+fixture_recorded_snapshot_sha() {
+    cat "$TEST_ROOT/hosts-snapshot.sha" 2>/dev/null
+}
+
+# 陈旧标记是否存在。
+fixture_stale_present() {
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "[ -e $FIXTURE_MOUNT/hosts/github-hosts.stale ]"
+}
+
+# 清除陈旧标记，用于构造「刷新成功应清除陈旧」的前置条件。
+fixture_clear_stale() {
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "rm -f $FIXTURE_MOUNT/hosts/github-hosts.stale"
+}
+
+# 校验当前卷内快照等于多地址 hosts 文件的期望结果：格式/来源/记录数/摘要头自洽，
+# 数据行为去重排序后的合法公网地址，被拒地址与通配符均不出现。
+fixture_hosts_snapshot_matches_hosts() {
+    local bytes want pay digest bad
+    bytes=$(fixture_snapshot_bytes) || return 1
+    [[ -n $bytes ]] || { printf '快照为空\n' >&2; return 1; }
+    [[ $bytes == *'# FORMAT=1'* ]] || { printf '缺少格式头：\n%s\n' "$bytes" >&2; return 1; }
+    [[ $bytes == *"# SOURCE=$FIXTURE_HOSTS_URL"* ]] || { printf '快照来源不符：\n%s\n' "$bytes" >&2; return 1; }
+    [[ $bytes == *'# COUNT=2'* ]] || { printf '记录数头不符：\n%s\n' "$bytes" >&2; return 1; }
+    want=$'140.82.112.3 github.com\n140.82.112.5 github.com'
+    pay=$(printf '%s\n' "$want")
+    digest=$(printf '%s\n' "$pay" | sha256sum); digest=${digest%% *}
+    [[ $bytes == *"# DIGEST=sha256:$digest"* ]] || { printf '摘要头不符（期望 %s）：\n%s\n' "$digest" "$bytes" >&2; return 1; }
+    [[ $(printf '%s\n' "$bytes" | grep -v '^#') == "$want" ]] || { printf '数据行不符：\n%s\n' "$bytes" >&2; return 1; }
+    for bad in '10.0.0.1' '127.0.0.1' '169.254.169.254' '192.168.1.1' 'example.com' '*.github.com' '*'; do
+        [[ $bytes != *"$bad"* ]] || { printf '被拒内容进入快照：%s\n%s\n' "$bad" "$bytes" >&2; return 1; }
+    done
+    return 0
+}
+
+# 夹具：发布地址内容文件（多地址混合、备用第二份、空、超上限），供可信端点提供。
+fixture_publish_hosts_files() {
+    printf '%s\n' \
+        '# fixture hosts for github.com' \
+        '140.82.112.3 github.com' \
+        '140.82.112.5 github.com' \
+        '140.82.112.3 github.com' \
+        '10.0.0.1 github.com' \
+        '127.0.0.1 github.com' \
+        '169.254.169.254 github.com' \
+        '192.168.1.1 github.com' \
+        '140.82.112.3 example.com' \
+        '* github.com' \
+        '140.82.112.4 *.github.com' | \
+        bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" hosts || return 1
+    printf '%s\n' '140.82.113.10 github.com' '140.82.113.11 github.com' '140.82.113.12 github.com' | \
+        bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" hosts2 || return 1
+    : | bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" empty || return 1
+    dd if=/dev/zero bs=1024 count=2048 2>/dev/null | \
+        bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" big || return 1
+    return 0
+}
+
+# 夹具：启动可信 hosts HTTPS 端点（SAN=来源主机名，测试 CA 签发）。
+fixture_start_hosts_endpoint() {
+    bash "$FIXTURE_SCRIPT" hosts-serve "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_HOSTS_NAME"
+}
+
+# 夹具：启动错误证书 hosts HTTPS 端点（自签证书，不受测试 CA 信任）。
+fixture_start_hosts_bad_endpoint() {
+    bash "$FIXTURE_SCRIPT" hosts-serve-bad "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_HOSTS_BAD_NAME"
+}
+
+# 夹具就绪探测：可信端点经测试 CA 取到 200 且不带信任锚时失败（证明需真实证书链）；
+# 错误证书端点以 -k 可达并返回 200（证明端点确实在提供文件，失败只能归因于证书不受信）。
+fixture_wait_hosts_endpoints() {
+    local i rc code
+    for i in $(seq 1 30); do
+        rc=0
+        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+            "curl -sS --cacert $FIXTURE_CA --max-time 5 -o /dev/null -w '%{http_code}' https://$FIXTURE_HOSTS_ALIAS/hosts" \
+            2>"$TEST_ROOT/hosts-probe.err") || rc=$?
+        if [[ $rc == 0 && $code == 200 ]]; then break; fi
+        if (( i == 30 )); then
+            printf '可信 hosts 端点未就绪（curl 退出码 %s，HTTP %s）：\n' "$rc" "$code" >&2
+            cat "$TEST_ROOT/hosts-probe.err" >&2 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    rc=0
+    docker run --rm --network "$FIXTURE_NET" --entrypoint /bin/sh "$IMAGE" -c \
+        "curl -sS --max-time 5 -o /dev/null https://$FIXTURE_HOSTS_ALIAS/hosts" >/dev/null 2>&1 || rc=$?
+    [[ $rc != 0 ]] || { printf '可信端点未校验证书却成功，夹具前提不成立\n' >&2; return 1; }
+    rc=0
+    code=$(docker run --rm --network "$FIXTURE_NET" --entrypoint /bin/sh "$IMAGE" -c \
+        "curl -sS -k --max-time 5 -o /dev/null -w '%{http_code}' https://$FIXTURE_HOSTS_BAD_ALIAS/hosts" \
+        2>"$TEST_ROOT/hosts-bad-probe.err") || rc=$?
+    [[ $rc == 0 && $code == 200 ]] || {
+        printf '错误证书端点不可达（-k 探测失败，curl %s，HTTP %s）：\n' "$rc" "$code" >&2
+        cat "$TEST_ROOT/hosts-bad-probe.err" >&2 2>/dev/null || true
+        return 1
+    }
+    return 0
+}
+
+# 夹具：把并发读者脚本写入产品卷。读者对快照做单次读取并记录「整文件摘要」，
+# 由宿主断言每次读取恰为旧或新的完整快照之一——半文件/撕裂读取会得到第三种摘要。
+# 只用镜像内确实存在的 cat/sha256sum（镜像无 sed/awk），不依赖缺失工具。
+fixture_write_hosts_reader() {
+    docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "umask 022; mkdir -p $FIXTURE_MOUNT/tmp && cat > $FIXTURE_MOUNT/tmp/hosts-reader.sh" <<'READER'
+#!/bin/sh
+set -u
+SNAP=${1:?}; SEEN=${2:?}; STOP=${3:?}
+while [ ! -e "$STOP" ]; do
+    if [ -f "$SNAP" ]; then
+        h=$(sha256sum "$SNAP" 2>/dev/null) || continue
+        printf '%s\n' "${h%% *}" >> "$SEEN"
+    fi
+done
+READER
+}
+
+# 多地址处理：合法多地址保留去重排序；非法/私网/元数据/非白名单/通配符被拒绝且不入快照；
+# 头信息（格式/来源/记录数/摘要）与真实卷内快照字节一致。
+fixture_hosts_multi_address() {
+    local out
+    fixture_clear_stale || return 1
+    out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_URL" '' 2>&1) || { printf '刷新失败：\n%s\n' "$out" >&2; return 1; }
+    fixture_hosts_snapshot_matches_hosts
+}
+
+# 空响应：必须以非零退出（不发布），且旧有效快照逐字节保留并标记陈旧。
+fixture_hosts_empty_fails_retains() {
+    local out before now status=0
+    before=$(fixture_recorded_snapshot_sha); [[ -n $before ]] || return 1
+    out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_EMPTY_URL" '' 2>&1) || status=$?
+    [[ $status != 0 ]] || { printf '空响应刷新未失败：\n%s\n' "$out" >&2; return 1; }
+    now=$(fixture_snapshot_bytes | sha256sum | cut -d' ' -f1) || return 1
+    [[ $now == "$before" ]] || { printf '空响应后旧快照被改写：%s -> %s\n' "$before" "$now" >&2; return 1; }
+    fixture_stale_present
+}
+
+# 超上限响应：以真实超大响应触发体积拒绝，必须以非零退出且旧有效快照逐字节保留。
+fixture_hosts_oversize_fails_retains() {
+    local out before now status=0
+    before=$(fixture_recorded_snapshot_sha); [[ -n $before ]] || return 1
+    out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_BIG_URL" '' 2>&1) || status=$?
+    [[ $status != 0 ]] || { printf '超上限响应刷新未失败：\n%s\n' "$out" >&2; return 1; }
+    now=$(fixture_snapshot_bytes | sha256sum | cut -d' ' -f1) || return 1
+    [[ $now == "$before" ]] || { printf '超上限响应后旧快照被改写：%s -> %s\n' "$before" "$now" >&2; return 1; }
+    fixture_stale_present
+}
+
+# 主备来源：主源失败（空响应）时改用备用源成功发布，来源头指向备用源，且清除陈旧标记。
+fixture_hosts_fallback_success() {
+    local out bytes want pay digest
+    out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_EMPTY_URL" "$FIXTURE_HOSTS_URL2" 2>&1) || { printf '回退刷新失败：\n%s\n' "$out" >&2; return 1; }
+    bytes=$(fixture_snapshot_bytes) || return 1
+    [[ $bytes == *"# SOURCE=$FIXTURE_HOSTS_URL2"* ]] || { printf '未使用备用来源：\n%s\n' "$bytes" >&2; return 1; }
+    want=$'140.82.113.10 github.com\n140.82.113.11 github.com\n140.82.113.12 github.com'
+    pay=$(printf '%s\n' "$want")
+    digest=$(printf '%s\n' "$pay" | sha256sum); digest=${digest%% *}
+    [[ $bytes == *"# DIGEST=sha256:$digest"* ]] || { printf '备用来源摘要不符：\n%s\n' "$bytes" >&2; return 1; }
+    [[ $(printf '%s\n' "$bytes" | grep -v '^#') == "$want" ]] || { printf '备用来源数据行不符：\n%s\n' "$bytes" >&2; return 1; }
+    ! fixture_stale_present
+}
+
+# 原子替换与并发读者：刷新期间持续读取快照整文件摘要，每次读取恰为旧或新完整快照之一，
+# 无半文件/撕裂读取；同时观察到替换前后两种完整快照摘要，证明替换确实发生在读取窗口内；
+# 替换后快照内容与摘要正确。
+fixture_hosts_atomic_replace_readers() {
+    local out seen oldh newh total distinct
+    fixture_snapshot_bytes > "$TEST_ROOT/atomic-old" || return 1
+    oldh=$(sha256sum < "$TEST_ROOT/atomic-old"); oldh=${oldh%% *}
+    out=$(docker exec "$FIXTURE_PROD" sh -c '
+        R=/var/lib/git-daemon
+        w=$R/tmp/hosts-atomic
+        mkdir -p "$w"
+        : > "$w/seen"; rm -f "$w/stop"
+        sh "$R/tmp/hosts-reader.sh" "$R/hosts/github-hosts.snapshot" "$w/seen" "$w/stop" &
+        reader=$!
+        umask 022
+        ENABLE_HOSTS_UPDATE=yes HOSTS_URL='"$FIXTURE_HOSTS_URL"' HOSTS_URL_FALLBACK= \
+            HOME='"$FIXTURE_HOME"' CURL_CA_BUNDLE='"$FIXTURE_CA"' \
+            /usr/local/lib/git-mirror/update-github-hosts.sh
+        status=$?
+        sleep 1
+        : > "$w/stop"
+        wait "$reader"
+        exit "$status"
+    ' 2>&1) || { printf '并发读者场景刷新失败：\n%s\n' "$out" >&2; return 1; }
+    fixture_snapshot_bytes > "$TEST_ROOT/atomic-new" || return 1
+    newh=$(sha256sum < "$TEST_ROOT/atomic-new"); newh=${newh%% *}
+    [[ $oldh != "$newh" ]] || { printf '替换前后快照字节相同，无法区分原子替换\n' >&2; return 1; }
+    seen=$(docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint cat "$IMAGE" \
+        "$FIXTURE_MOUNT/tmp/hosts-atomic/seen" 2>/dev/null) || return 1
+    total=$(printf '%s\n' "$seen" | grep -c . || true)
+    distinct=$(printf '%s\n' "$seen" | sort -u | grep -c . || true)
+    if printf '%s\n' "$seen" | grep -v -e "^$oldh$" -e "^$newh$" | grep -q .; then
+        printf '并发读者见到非完整快照摘要（旧 %s / 新 %s）：\n%s\n' "$oldh" "$newh" "$seen" >&2
+        return 1
+    fi
+    (( total >= 5 )) || { printf '完整读取样本不足（total=%s）：\n%s\n' "$total" "$seen" >&2; return 1; }
+    (( distinct >= 2 )) || { printf '未观察到替换前后两种完整快照（distinct=%s）\n' "$distinct" >&2; return 1; }
+    fixture_hosts_snapshot_matches_hosts
+}
+
+# 错误证书：必须以非零退出并给出证书类诊断，且旧有效快照逐字节保留、标记陈旧。
+fixture_hosts_wrong_certificate_fails_retains() {
+    local out before now status=0
+    before=$(fixture_recorded_snapshot_sha); [[ -n $before ]] || return 1
+    out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_BAD_URL" '' 2>&1) || status=$?
+    [[ $status != 0 ]] || { printf '错误证书刷新未失败：\n%s\n' "$out" >&2; return 1; }
+    case "$out" in
+        *certificate*|*Certificate*|*SSL*|*ssl*|*证书*) ;;
+        *) printf '错误证书诊断未指明证书问题：\n%s\n' "$out" >&2; return 1 ;;
+    esac
+    now=$(fixture_snapshot_bytes | sha256sum | cut -d' ' -f1) || return 1
+    [[ $now == "$before" ]] || { printf '错误证书后旧快照被污染：%s -> %s\n' "$before" "$now" >&2; return 1; }
+    fixture_stale_present
+}
+
+# 夹具：记录产品容器内 /etc/hosts 与 /etc/resolv.conf 基线（运行前后比对用）。
+fixture_record_system_files() {
+    docker exec "$FIXTURE_PROD" sha256sum /etc/hosts /etc/resolv.conf > "$TEST_ROOT/system-files.before" 2>/dev/null
+    [[ -s $TEST_ROOT/system-files.before ]]
+}
+
+# 项目运行不修改系统 /etc/hosts 与 /etc/resolv.conf：以一次真实刷新为运行样本，前后字节摘要一致。
+fixture_hosts_system_files_unchanged() {
+    local before after out status=0
+    before=$(cat "$TEST_ROOT/system-files.before" 2>/dev/null) || before=
+    [[ -n $before ]] || { printf '缺少系统文件基线\n' >&2; return 1; }
+    out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_URL" '' 2>&1) || status=$?
+    [[ $status == 0 ]] || { printf '刷新失败，无法作为运行样本：\n%s\n' "$out" >&2; return 1; }
+    after=$(docker exec "$FIXTURE_PROD" sha256sum /etc/hosts /etc/resolv.conf 2>/dev/null) || return 1
+    [[ "$before" == "$after" ]] || {
+        printf '项目运行改写了系统 hosts/resolv.conf：\n before=%s\n after=%s\n' "$before" "$after" >&2
+        return 1
+    }
+    [[ $(docker inspect -f '{{.State.Running}}' "$FIXTURE_PROD" 2>/dev/null) == true ]]
+}
+
 # docker 完全不可用（CLI 缺失或守护进程不可达）才整体跳过并返回 77。
 if ! docker_available; then
     printf 'SKIP：docker 不可用，未执行\n'
@@ -1589,6 +1873,26 @@ check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT �
 check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
 check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
 check_proxy_sync '传输顺序：非 proxy 直连尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
+
+# 场景 S10：正式镜像内地址快照内容级校验与证书失败（多地址/拒绝/空/超限/主备/原子替换/错误证书/系统文件）。
+# 端点与内容文件属测试私有夹具；夹具未就绪记独立夹具失败并阻止依赖断言；断言读真实卷内快照字节。
+S10_BASE=$FIXTURE_FAILURES
+fixture_step '地址内容：发布来源文件（多地址/备用/空/超限）' fixture_publish_hosts_files
+fixture_step '地址内容：启动可信来源 HTTPS 端点' fixture_start_hosts_endpoint
+fixture_step '地址内容：启动错误证书 HTTPS 端点' fixture_start_hosts_bad_endpoint
+fixture_step '地址内容：端点就绪探测（可信需证书链、错误证书端点 -k 可达）' fixture_wait_hosts_endpoints
+fixture_step '地址内容：写入产品卷内并发读者脚本' fixture_write_hosts_reader
+if [[ $FIXTURE_FAILURES == $S10_BASE && $FIXTURE_READY == 1 ]]; then HOSTS_READY=1; fi
+fixture_step '地址内容：记录产品容器 /etc/hosts 与 /etc/resolv.conf 运行前基线' fixture_record_system_files
+check_hosts_content '地址内容：多地址保留且非法/私网/元数据/通配符被拒不入快照' fixture_hosts_multi_address
+fixture_record_snapshot_sha
+check_hosts_content '地址内容：空响应刷新失败且旧快照逐字节保留并标记陈旧' fixture_hosts_empty_fails_retains
+check_hosts_content '地址内容：超上限响应刷新失败且旧快照逐字节保留' fixture_hosts_oversize_fails_retains
+check_hosts_content '地址内容：主源失败改用备用源成功并清除陈旧标记' fixture_hosts_fallback_success
+check_hosts_content '地址内容：原子替换下并发读者不见半文件且替换后内容/摘要正确' fixture_hosts_atomic_replace_readers
+fixture_record_snapshot_sha
+check_hosts_content '地址内容：错误证书刷新失败且不污染快照' fixture_hosts_wrong_certificate_fails_retains
+check_hosts_content '地址内容：项目运行不修改系统 hosts/resolv.conf' fixture_hosts_system_files_unchanged
 
 # 场景 S9：合成 Token 访问受认证夹具与常驻 daemon 进程的凭据隔离。
 # 使用独立网络与产品卷（github.com 别名冲突），Token 为合成测试值，仅以容器环境变量提供。
