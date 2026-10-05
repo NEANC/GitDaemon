@@ -38,6 +38,12 @@ COMPOSE_ENV_CONFIG_ADDR=0.0.0.0
 COMPOSE_ENV_CONFIG_PORT=19428
 # 上游占位仓库名刻意不存在于 GitHub：同步预期失败且快速返回，测试不依赖真实上游内容与体积。
 TEST_REPO=octocat/Nonexistent-$COMPOSE_TAG
+# 就绪判据探针端口：在一次性容器内构造真实 LISTEN 与「本地端口恰为该端口」的非 LISTEN 已建立连接；
+# 容器使用独立网络命名空间，该端口只需在容器内空闲。
+READINESS_PORT=19424
+# 空命名卷正式启动校验使用的独立容器与卷名：检查内自清理，并由全局清理兜底。
+EMPTY_CONTAINER=gm-it-empty-$$
+EMPTY_VOLUME=gm-it-empty-$$-vol
 # 地址刷新夹具：与目标容器共享网络命名空间的自签名 HTTPS 服务名与端口。
 TLS_FIXTURE_NAME=gm-it-tls-$$
 TLS_FIXTURE_PORT=$((COMPOSE_PORT + 10000))
@@ -132,6 +138,12 @@ compose_available() {
 cleanup() {
     if [[ -n ${TLS_FIXTURE_NAME:-} ]]; then
         docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${EMPTY_CONTAINER:-} ]]; then
+        docker rm -f "$EMPTY_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${EMPTY_VOLUME:-} ]]; then
+        docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
     fi
     if [[ -n ${FIXTURE_NAME:-} ]]; then
         docker rm -f "$FIXTURE_NAME" >/dev/null 2>&1 || true
@@ -258,6 +270,112 @@ entry_rejects_root() {
     output=$(docker run --rm --user 0:0 "$IMAGE" 2>&1) || status=$?
     [[ $status != 0 ]] || return 1
     [[ $output == *'禁止以 root'* ]]
+}
+
+# 就绪判据探针：在正式镜像内以桩程序层（仅含 git-daemon-config.sh 输出指定端口）驱动正式入口的
+# confirm_daemon_listening。mode=listen 时在容器内建立真实 LISTEN；mode=connect 时建立一条本地端口恰为
+# 该端口的已建立（非 LISTEN）连接。随后 source 正式入口（源引保护使其不进入 main）并比对返回码。
+readiness_probe() {
+    local port=$1 mode=$2 expect=$3
+    local script out rc=0 ok=0
+    script=$(cat <<'PROBE'
+set -u
+umask 022
+stub=/var/lib/git-daemon/readiness-stub
+peer=$((GM_PORT + 1))
+mkdir -p "$stub"
+printf '#!/bin/sh\necho %s\n' "$GM_PORT" >"$stub/git-daemon-config.sh"
+chmod 755 "$stub/git-daemon-config.sh"
+if [ "$GM_MODE" = listen ]; then
+    sleep 30 | busybox nc -l -p "$GM_PORT" >/dev/null 2>&1 &
+else
+    sleep 30 | busybox nc -l -p "$peer" >/dev/null 2>&1 &
+    sleep 0.5
+    sleep 30 | busybox nc -p "$GM_PORT" 127.0.0.1 "$peer" >/dev/null 2>&1 &
+fi
+sleep 1
+INSTALL_ROOT="$stub" bash -c 'source /usr/local/bin/git-mirror-entrypoint; confirm_daemon_listening'
+rc=$?
+printf 'confirm_daemon_listening 返回码=%s（mode=%s port=%s）\n' "$rc" "$GM_MODE" "$GM_PORT"
+exit "$rc"
+PROBE
+)
+    out=$(docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
+        --security-opt no-new-privileges -v "$VOLUME:/var/lib/git-daemon" \
+        -e "GM_PORT=$port" -e "GM_MODE=$mode" --entrypoint /bin/bash "$IMAGE" -c "$script" 2>&1) || rc=$?
+    # 探针必须真正执行到 confirm_daemon_listening：入口被 source 时若仍进入 main，容器会提前退出，
+    # 那种情况下返回码没有意义，必须与断言区分开，避免把「入口被误执行」当作负例通过。
+    if [[ $out != *'confirm_daemon_listening 返回码='* ]]; then
+        printf '就绪判据探针未执行到目标函数（mode=%s port=%s，返回码 %s）：\n%s\n' \
+            "$mode" "$port" "$rc" "$out" >&2
+        return 1
+    fi
+    if [[ $expect == 0 ]]; then
+        [[ $rc == 0 ]] && ok=1
+    else
+        [[ $rc != 0 ]] && ok=1
+    fi
+    [[ $ok == 1 ]] && return 0
+    printf '就绪判据探针不符预期（mode=%s port=%s，期望 %s 实际 %s）：\n%s\n' \
+        "$mode" "$port" "$expect" "$rc" "$out" >&2
+    return 1
+}
+
+# 正对照：内核监听表中真实 LISTEN 必须判定为就绪。
+readiness_positive_control() { readiness_probe "$READINESS_PORT" listen 0; }
+
+# 负例：同端口的非 LISTEN 连接（本地端口恰为该端口）不得判定为就绪。
+readiness_rejects_nonlisten() { readiness_probe "$READINESS_PORT" connect 1; }
+
+# 空命名卷正式启动：以正式入口在全新命名卷上完成实例初始化与配置生成并进入前台就绪；
+# 断言生成的配置文件非空、实例目录与配置文件属主为 10001 且不含组/其他用户写位，
+# 并以入口自身已修复的 confirm_daemon_listening 复核 daemon 确以内核真实 LISTEN 提供服务。
+empty_volume_formal_startup() {
+    local id=$EMPTY_CONTAINER i ready=0 ok=1
+    docker rm -f "$EMPTY_CONTAINER" >/dev/null 2>&1 || true
+    docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
+    docker volume create "$EMPTY_VOLUME" >/dev/null 2>&1 || return 1
+    if ! docker run -d --name "$EMPTY_CONTAINER" --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --user 10001:10001 \
+        -v "$EMPTY_VOLUME:/var/lib/git-daemon" \
+        -e "REPOS=$TEST_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no \
+        "$IMAGE" >/dev/null 2>&1; then
+        docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
+        return 1
+    fi
+    for i in $(seq 1 120); do
+        if docker logs "$id" 2>&1 | grep -q '容器前台就绪'; then ready=1; break; fi
+        if [[ $(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null) == false ]]; then break; fi
+        sleep 1
+    done
+    if [[ $ready == 1 ]]; then
+        docker exec "$id" sh -c '
+            umask 022
+            [ -s /var/lib/git-daemon/config/mirror.env ] || exit 1
+            for p in /var/lib/git-daemon/config/mirror.env \
+                     /var/lib/git-daemon/config /var/lib/git-daemon/repos \
+                     /var/lib/git-daemon/logs /var/lib/git-daemon/runtime \
+                     /var/lib/git-daemon/cache /var/lib/git-daemon/tmp; do
+                [ -e "$p" ] || exit 1
+                [ "$(stat -c %u "$p")" = 10001 ] || exit 1
+                [ $(( 0$(stat -c %a "$p") & 0022 )) -eq 0 ] || exit 1
+            done
+        ' >/dev/null 2>&1 || ok=0
+        if [[ $ok == 1 ]]; then
+            docker exec -e HOME=/var/lib/git-daemon/home "$id" \
+                bash -c 'source /usr/local/bin/git-mirror-entrypoint; confirm_daemon_listening' \
+                >/dev/null 2>&1 || ok=0
+        fi
+    else
+        ok=0
+    fi
+    if [[ $ok != 1 ]]; then
+        printf '空命名卷正式启动校验失败，日志尾部：\n' >&2
+        docker logs "$id" 2>&1 | tail -n 20 >&2 2>&1 || true
+    fi
+    docker rm -f "$id" >/dev/null 2>&1 || true
+    docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
+    [[ $ok == 1 ]]
 }
 
 # 为本地构建镜像附加 registry 前缀标签，供 compose 引用且无需拉取远端镜像。
@@ -1762,6 +1880,13 @@ check '空命名卷首次挂载后以 10001 可写入' named_volume_writable
 check '运行时依赖命令与 CA/时区文件齐备' runtime_dependencies_present
 check '镜像不含 SSH 组件' no_ssh_components
 check '入口拒绝 UID 0' entry_rejects_root
+
+# 就绪判据：正式入口按内核 LISTEN 状态与本地地址端口判定，同端口非 LISTEN 连接不得算就绪。
+check '就绪判据：真实 LISTEN 判定为就绪（正对照）' readiness_positive_control
+check '就绪判据：同端口非 LISTEN 连接不判为就绪' readiness_rejects_nonlisten
+
+# 正常启动路径：正式入口在空命名卷上生成配置、初始目录权限正确、进入前台就绪且 daemon 真实监听。
+check '空命名卷正式启动：配置生成、初始目录权限正确且 daemon 真实监听' empty_volume_formal_startup
 
 if [[ $COMPOSE_ENABLED == 1 ]]; then
     # 后续所有 compose 子命令（ps/logs/down）都需成功渲染镜像引用，故在此统一导出 IMAGE_TAG。
