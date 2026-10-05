@@ -29,6 +29,9 @@ FIXTURE_AUTH_SCRIPT=$FIXTURE_ROOT/auth.sh
 FIXTURE_CONNECT_COUNT=$FIXTURE_ROOT/connect.count
 FIXTURE_PORT=443
 FIXTURE_PROXY_PORT=8443
+# 同一代理容器另开的拒绝端口：收到目标 CONNECT 仍计数，但返回非 200（可达却拒绝），
+# 供回退场景构造「代理确实被尝试过」的可区分证据。
+FIXTURE_PROXY_REJECT_PORT=8444
 FIXTURE_FAILURE=80
 
 # 输出夹具诊断到 stderr。
@@ -141,9 +144,10 @@ EOF
 #!/bin/bash
 # 测试私有 HTTPS CONNECT 代理：openssl s_server 做 TLS 终结，bash 读取 CONNECT 请求、计数并回写 200，
 # 再在客户端与夹具上游之间双向中继。仅用于隔离测试，不进入生产镜像。
-# 参数：<监听端口> <证书> <私钥> <计数文件> <允许的上游主机>
+# 参数：<监听端口> <证书> <私钥> <计数文件> <允许的上游主机> [accept|reject]
+# accept：计数后回 200 并双向中继；reject：计数后回 403（可达但拒绝目标 CONNECT）。
 set -u
-PORT=${1:?}; CERT=${2:?}; KEY=${3:?}; COUNT=${4:?}; UPSTREAM=${5:?}
+PORT=${1:?}; CERT=${2:?}; KEY=${3:?}; COUNT=${4:?}; UPSTREAM=${5:?}; MODE=${6:-accept}
 IN=$(mktemp -u /tmp/gmpx.in.XXXXXX)
 OUT=$(mktemp -u /tmp/gmpx.out.XXXXXX)
 mkfifo "$IN" "$OUT"
@@ -169,6 +173,10 @@ while IFS= read -r line; do
     n=$((n + 1))
     printf '%s\n' "$n" >"$COUNT"
     printf 'CONNECT %s\n' "$target" >>"${COUNT}.log"
+    if [ "$MODE" = reject ]; then
+        printf 'HTTP/1.1 403 Forbidden\r\n\r\n' >&3
+        continue
+    fi
     if [ "$host" != "$UPSTREAM" ] || [ "$port" != 443 ]; then
         printf 'HTTP/1.1 502 Bad Gateway\r\n\r\n' >&3
         continue
@@ -260,14 +268,18 @@ cmd_auth_start() {
     return 0
 }
 
-# 启动 HTTPS CONNECT 代理（非 root）；默认网络别名 gm-proxy，端口 8443。
+# 启动 HTTPS CONNECT 代理（非 root）；默认网络别名 gm-proxy。
+# 同一容器内并行监听两个端口：8443 接受（计数 + 200 + 中继），8444 拒绝（计数 + 403）。
 cmd_proxy_start() {
     local volume=$1 image=$2 network=$3 name=$4 host=${5:-gm-proxy}
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" --network "$network" --network-alias "$host" \
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/bash "$image" \
-        "$FIXTURE_PROXY_SCRIPT" "$FIXTURE_PROXY_PORT" "$FIXTURE_PROXY_CERT" "$FIXTURE_PROXY_KEY" \
-        "$FIXTURE_CONNECT_COUNT" github.com >/dev/null 2>&1 || { fail '无法启动 HTTPS CONNECT 代理容器'; return "$FIXTURE_FAILURE"; }
+        -c "$FIXTURE_PROXY_SCRIPT $FIXTURE_PROXY_PORT $FIXTURE_PROXY_CERT $FIXTURE_PROXY_KEY \
+            $FIXTURE_CONNECT_COUNT github.com accept & \
+            $FIXTURE_PROXY_SCRIPT $FIXTURE_PROXY_REJECT_PORT $FIXTURE_PROXY_CERT $FIXTURE_PROXY_KEY \
+            $FIXTURE_CONNECT_COUNT github.com reject & wait" \
+        >/dev/null 2>&1 || { fail '无法启动 HTTPS CONNECT 代理容器'; return "$FIXTURE_FAILURE"; }
     fixture_wait_running "$name" || return "$FIXTURE_FAILURE"
     return 0
 }
@@ -282,18 +294,20 @@ cmd_upstream_ip() {
 }
 
 # 输出代理侧观测到的 CONNECT 次数；计数文件缺失时输出 0（表示未观测到任何 CONNECT）。
+# 以 UID 10001 读取，与夹具其余步骤的最小权限保持一致。
 cmd_connects() {
     local volume=$1 image=$2 status=0 count
-    count=$(docker run --rm -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "$FIXTURE_CONNECT_COUNT" 2>/dev/null) || status=$?
+    count=$(docker run --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "$FIXTURE_CONNECT_COUNT" 2>/dev/null) || status=$?
     if [[ $status != 0 ]]; then printf '0\n'; return 0; fi
     printf '%s\n' "$count"
     return 0
 }
 
 # 输出代理侧 CONNECT 明细日志（形如 "CONNECT github.com:443"），计数文件不存在时视为空。
+# 以 UID 10001 读取，与夹具其余步骤的最小权限保持一致。
 cmd_connect_log() {
     local volume=$1 image=$2 status=0
-    docker run --rm -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "${FIXTURE_CONNECT_COUNT}.log" || status=$?
+    docker run --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "${FIXTURE_CONNECT_COUNT}.log" || status=$?
     [[ $status == 0 || $status == 1 ]] || return "$FIXTURE_FAILURE"
     return 0
 }

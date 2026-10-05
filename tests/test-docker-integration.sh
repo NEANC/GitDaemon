@@ -58,9 +58,9 @@ FIXTURE_READY=0
 # 隔离网络使用公开格式网段：地址映射快照必须是合法公开地址，流量只在 Docker 网络内到达夹具容器，
 # 不会发往真实公网地址，也不把私网/元数据地址写进被校验的快照。
 FIXTURE_SUBNET=140.82.112.0/24
-# HTTPS CONNECT 代理夹具：网络别名 gm-proxy、监听 8443；死端口地址用于构造代理不可达场景。
+# HTTPS CONNECT 代理夹具：网络别名 gm-proxy；8443 接受，8444 可达但拒绝目标 CONNECT（计数后回 403）。
 FIXTURE_PROXY_URL=https://gm-proxy:8443
-FIXTURE_DEAD_PROXY=https://gm-proxy:8099
+FIXTURE_REJECT_PROXY=https://gm-proxy:8444
 FIXTURE_PROXY_NAME=gm-it-proxy-$$
 FIXTURE_CONNECT_COUNT=$FIXTURE_MOUNT/fixture/connect.count
 FIXTURE_GITCONFIG=$FIXTURE_MOUNT/fixture/gitconfig
@@ -73,6 +73,8 @@ AUTH_PROD_VOL=gm-it-authvol-$$
 AUTH_UP=gm-it-authup-$$
 AUTH_PROD=gm-it-authsync-$$
 AUTH_READY=0
+# 产品容器就绪标志：入口前台就绪属夹具步骤，失败只在夹具计数并在本标志上 gate 依赖断言，避免级联。
+AUTH_PROD_READY=0
 # 场景化 compose 透传环境变量（列表形式）；compose_up 负责导出后编排。
 COMPOSE_ENV=()
 
@@ -920,6 +922,7 @@ check_gated() {
 check_https_sync() { check_gated FIXTURE_READY "$@"; }
 check_proxy_sync() { check_gated PROXY_READY "$@"; }
 check_auth_sync() { check_gated AUTH_READY "$@"; }
+check_auth_prod() { check_gated AUTH_PROD_READY "$@"; }
 
 # 创建夹具所需的自定义网络与两个命名卷（上游资产卷、产品运行卷），不使用 bind 或宿主机路径。
 fixture_create_network_and_volumes() {
@@ -1250,37 +1253,59 @@ fixture_proxy_connect_evidence() {
     return 0
 }
 
-# 传输顺序：代理不可达时按序回退到动态地址映射，映射请求真实取到上游。
+# 传输顺序：可达但拒绝 CONNECT 的代理失败后回退到动态地址映射。
+# 代理端点可达且会计数，故本场景计数增长证明代理尝试确实发生（不是「不可达故无从计数」）；
+# 随后的映射请求成功且不经代理（若经代理会被同一端点以 403 拒绝而失败）。
 fixture_proxy_failure_falls_back_to_mapping() {
-    local out
-    out=$(fixture_exec_sync_scenario "$FIXTURE_DEAD_PROXY" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    local out before after
+    before=$(fixture_connect_count)
+    out=$(fixture_exec_sync_scenario "$FIXTURE_REJECT_PROXY" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    after=$(fixture_connect_count)
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-mapping-output"
+    printf '%s\n' "$before" > "$TEST_ROOT/proxy-mapping-before"
+    printf '%s\n' "$after" > "$TEST_ROOT/proxy-mapping-after"
     [[ $out == *'传输失败：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
     [[ $out == *'同步传输路径：直连加动态地址映射'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    (( after > before )) || { printf '可达拒绝代理未被计数（before=%s after=%s）\n' "$before" "$after" >&2; return 1; }
     return 0
 }
 
-# 传输顺序：代理不可达且无映射时回退到直连系统 DNS。
+# 传输顺序：可达但拒绝 CONNECT 的代理失败且无映射时回退到直连系统 DNS。
 fixture_proxy_failure_falls_back_to_system() {
-    local out
-    out=$(fixture_exec_sync_scenario "$FIXTURE_DEAD_PROXY" no "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    local out before after
+    before=$(fixture_connect_count)
+    out=$(fixture_exec_sync_scenario "$FIXTURE_REJECT_PROXY" no "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    after=$(fixture_connect_count)
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-system-output"
-    fixture_record_count "$TEST_ROOT/proxy-final-count"
+    printf '%s\n' "$before" > "$TEST_ROOT/proxy-system-before"
+    printf '%s\n' "$after" > "$TEST_ROOT/proxy-system-after"
     [[ $out == *'传输失败：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
     [[ $out == *'同步传输路径：直连系统 DNS'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    (( after > before )) || { printf '可达拒绝代理未被计数（before=%s after=%s）\n' "$before" "$after" >&2; return 1; }
     return 0
 }
 
-# 非 proxy 尝试不经过代理：两次直连回退均成功，且代理侧计数与代理成功时完全一致。
+# 非 proxy 尝试不经过代理：先确证计数机制在有代理尝试时确实增长（两次拒绝代理回退场景各增一次），
+# 再以无 PROXY_URL 的纯直连映射场景证明同步成功而计数零增长。因同一映射传输在拒绝代理场景中
+# 也未令计数增长，故「计数可能增长却未增长」可区分地证明直连旁路了代理，而非代理不可达。
 fixture_direct_attempts_leave_proxy_untouched() {
-    local after final mapping system
-    after=$(fixture_read_count "$TEST_ROOT/proxy-after-run")
-    final=$(fixture_read_count "$TEST_ROOT/proxy-final-count")
+    local out before after mapping system m_before m_after s_after
     mapping=$(cat "$TEST_ROOT/proxy-mapping-output" 2>/dev/null) || mapping=
     system=$(cat "$TEST_ROOT/proxy-system-output" 2>/dev/null) || system=
     [[ $mapping == *'同步传输路径：直连加动态地址映射'* ]] || return 1
     [[ $system == *'同步传输路径：直连系统 DNS'* ]] || return 1
-    [[ $after == "$final" ]] || { printf '非代理尝试后代理计数变化（after=%s final=%s）\n' "$after" "$final" >&2; return 1; }
+    m_before=$(fixture_read_count "$TEST_ROOT/proxy-mapping-before")
+    m_after=$(fixture_read_count "$TEST_ROOT/proxy-mapping-after")
+    s_after=$(fixture_read_count "$TEST_ROOT/proxy-system-after")
+    (( m_after > m_before )) || { printf '拒绝代理回退未计数（%s→%s）\n' "$m_before" "$m_after" >&2; return 1; }
+    (( s_after > m_after )) || { printf '拒绝代理回退未计数（%s→%s）\n' "$m_after" "$s_after" >&2; return 1; }
+    before=$(fixture_connect_count)
+    out=$(fixture_exec_sync_scenario '' yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    after=$(fixture_connect_count)
+    printf '%s\n' "$out" > "$TEST_ROOT/proxy-direct-output"
+    [[ $out == *'本次同步成功'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    [[ $out == *'同步传输路径：直连加动态地址映射'* ]] || { printf '%s\n' "$out" >&2; return 1; }
+    [[ $before == "$after" ]] || { printf '直连尝试后代理计数变化（%s→%s）\n' "$before" "$after" >&2; return 1; }
     return 0
 }
 
@@ -1561,9 +1586,9 @@ fixture_step 'HTTPS 代理：记录代理基线计数' fixture_record_proxy_base
 if [[ $FIXTURE_FAILURES == $S8_BASE ]]; then PROXY_READY=1; fi
 check_proxy_sync 'HTTPS 代理：配置 PROXY_URL 时真实同步成功（代理路径）' fixture_proxy_path_succeeds
 check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT 且计数增加' fixture_proxy_connect_evidence
-check_proxy_sync '传输顺序：代理不可达后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
-check_proxy_sync '传输顺序：代理不可达且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
-check_proxy_sync '传输顺序：非 proxy 尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
+check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
+check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
+check_proxy_sync '传输顺序：非 proxy 直连尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
 
 # 场景 S9：合成 Token 访问受认证夹具与常驻 daemon 进程的凭据隔离。
 # 使用独立网络与产品卷（github.com 别名冲突），Token 为合成测试值，仅以容器环境变量提供。
@@ -1571,9 +1596,12 @@ S9_BASE=$FIXTURE_FAILURES
 fixture_step '凭据夹具：在独立网络启动受认证上游（未带凭据为 401）' fixture_start_auth_upstream
 fixture_step '凭据夹具：准备产品卷并信任测试 CA' fixture_prepare_auth_product_volume
 if [[ $FIXTURE_FAILURES == $S9_BASE ]]; then AUTH_READY=1; fi
-check_auth_sync '凭据夹具：带合成 Token 的正式入口启动并进入前台就绪' fixture_start_auth_product
-check_auth_sync '凭据隔离：合成 Token 访问受认证夹具成功' fixture_auth_sync_with_token_succeeds
-check_auth_sync '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
+# 入口前台就绪属夹具步骤：因夹具/网络原因起不来只记夹具失败，不冒充产品断言，也不级联牵连后续断言。
+S9_PROD_BASE=$FIXTURE_FAILURES
+fixture_step '凭据夹具：带合成 Token 的正式入口启动并进入前台就绪' fixture_start_auth_product
+if [[ $FIXTURE_FAILURES == $S9_PROD_BASE ]]; then AUTH_PROD_READY=1; fi
+check_auth_prod '凭据隔离：合成 Token 访问受认证夹具成功' fixture_auth_sync_with_token_succeeds
+check_auth_prod '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
 check_auth_sync '凭据夹具：真实 Git 客户端无凭据访问被拒绝（鉴权非空转）' fixture_auth_requires_token
 
 printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES"
