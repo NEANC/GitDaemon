@@ -1451,8 +1451,10 @@ fixture_snapshot_bytes() {
 }
 
 # 记录当前快照 sha256 到测试目录，供拒绝类断言的逐字节保留比对。
+# 明确以 `|| return 1` 容错：在 set -e 下若快照缺失，返回失败由调用方记为可读的夹具失败，
+# 而不是让失败的管道直接中止整套测试。
 fixture_record_snapshot_sha() {
-    fixture_snapshot_bytes | sha256sum | cut -d' ' -f1 > "$TEST_ROOT/hosts-snapshot.sha"
+    fixture_snapshot_bytes | sha256sum | cut -d' ' -f1 > "$TEST_ROOT/hosts-snapshot.sha" || return 1
     [[ -s $TEST_ROOT/hosts-snapshot.sha ]]
 }
 
@@ -1495,6 +1497,7 @@ fixture_hosts_snapshot_matches_hosts() {
 
 # 夹具：发布地址内容文件（多地址混合、备用第二份、空、超上限），供可信端点提供。
 fixture_publish_hosts_files() {
+    local i
     printf '%s\n' \
         '# fixture hosts for github.com' \
         '140.82.112.3 github.com' \
@@ -1511,8 +1514,12 @@ fixture_publish_hosts_files() {
     printf '%s\n' '140.82.113.10 github.com' '140.82.113.11 github.com' '140.82.113.12 github.com' | \
         bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" hosts2 || return 1
     : | bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" empty || return 1
-    dd if=/dev/zero bs=1024 count=2048 2>/dev/null | \
-        bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" big || return 1
+    # 超限夹具必须是「体积超限但内容合法」的记录：若产品缺少体积上限，过滤与渲染仍会成功并改写快照，
+    # 从而使「体积上限拒绝」与「无有效记录拒绝」可区分（全零字节内容在这两种情形下都会失败）。
+    # 逐行合法公网 140.82.0.0/16 内的 github.com 记录，整体远大于 GM_HOSTS_MAX_BYTES=1048576。
+    for ((i = 1; i <= 65535; i++)); do
+        printf '140.82.%d.%d github.com\n' "$((i / 256))" "$((i % 256))"
+    done | bash "$FIXTURE_SCRIPT" hosts-put "$FIXTURE_FIX_VOL" "$IMAGE" big || return 1
     return 0
 }
 
@@ -1527,9 +1534,10 @@ fixture_start_hosts_bad_endpoint() {
 }
 
 # 夹具就绪探测：可信端点经测试 CA 取到 200 且不带信任锚时失败（证明需真实证书链）；
+# /empty 经测试 CA 取到 200 且响应体长度为 0（证明空响应用例确为「200 空体」，而非 404/错误页）；
 # 错误证书端点以 -k 可达并返回 200（证明端点确实在提供文件，失败只能归因于证书不受信）。
 fixture_wait_hosts_endpoints() {
-    local i rc code
+    local i rc code probe
     for i in $(seq 1 30); do
         rc=0
         code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
@@ -1543,6 +1551,15 @@ fixture_wait_hosts_endpoints() {
         fi
         sleep 1
     done
+    rc=0
+    probe=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+        "curl -sS --cacert $FIXTURE_CA --max-time 5 -o /dev/null -w '%{http_code} %{size_download}' https://$FIXTURE_HOSTS_ALIAS/empty" \
+        2>"$TEST_ROOT/hosts-empty-probe.err") || rc=$?
+    [[ $rc == 0 && $probe == '200 0' ]] || {
+        printf '可信端点空响应文件未就绪（期望 HTTP 200 且响应体长度 0，实得 curl %s [%s]）：\n' "$rc" "$probe" >&2
+        cat "$TEST_ROOT/hosts-empty-probe.err" >&2 2>/dev/null || true
+        return 1
+    }
     rc=0
     docker run --rm --network "$FIXTURE_NET" --entrypoint /bin/sh "$IMAGE" -c \
         "curl -sS --max-time 5 -o /dev/null https://$FIXTURE_HOSTS_ALIAS/hosts" >/dev/null 2>&1 || rc=$?
@@ -1597,15 +1614,40 @@ fixture_hosts_empty_fails_retains() {
     fixture_stale_present
 }
 
-# 超上限响应：以真实超大响应触发体积拒绝，必须以非零退出且旧有效快照逐字节保留。
+# 超上限响应：以真实超大响应触发体积拒绝，必须以非零退出、诊断指明体积上限，且旧有效快照逐字节保留。
 fixture_hosts_oversize_fails_retains() {
     local out before now status=0
     before=$(fixture_recorded_snapshot_sha); [[ -n $before ]] || return 1
     out=$(fixture_exec_hosts_refresh "$FIXTURE_HOSTS_BIG_URL" '' 2>&1) || status=$?
     [[ $status != 0 ]] || { printf '超上限响应刷新未失败：\n%s\n' "$out" >&2; return 1; }
+    case "$out" in
+        *'file size'*|*'max-filesize'*|*'1048576'*) ;;
+        *) printf '超上限诊断未指明体积上限：\n%s\n' "$out" >&2; return 1 ;;
+    esac
     now=$(fixture_snapshot_bytes | sha256sum | cut -d' ' -f1) || return 1
     [[ $now == "$before" ]] || { printf '超上限响应后旧快照被改写：%s -> %s\n' "$before" "$now" >&2; return 1; }
     fixture_stale_present
+}
+
+# 可区分性对照：同一超限内容在撤除体积上限后仍能通过产品自身的过滤与渲染（记录数 > 0），
+# 证明刷新失败只能归因于体积上限，而非「无有效记录」——这是与全零字节内容的判别依据。
+fixture_hosts_oversize_content_valid_without_cap() {
+    local out rc=0 count
+    out=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/bash "$IMAGE" -c "
+        source /usr/local/lib/git-mirror/lib/foundation.sh
+        curl -sS --cacert $FIXTURE_CA --max-time 30 -- 'https://$FIXTURE_HOSTS_ALIAS/big' \
+            | gm_hosts_filter_records \
+            | gm_hosts_render_snapshot 'https://$FIXTURE_HOSTS_ALIAS/big' 2026-01-01T00:00:00+0000 \
+            | grep -m1 '^# COUNT='
+        " 2>"$TEST_ROOT/hosts-big-control.err") || rc=$?
+    [[ $rc == 0 && $out == '# COUNT='* ]] || {
+        printf '超限内容对照：撤除体积上限后产品过滤/渲染未成功（curl/bash %s，输出 [%s]）：\n' "$rc" "$out" >&2
+        cat "$TEST_ROOT/hosts-big-control.err" >&2 2>/dev/null || true
+        return 1
+    }
+    count=${out#*# COUNT=}; count=${count%%[!0-9]*}
+    [[ $count =~ ^[0-9]+$ ]] && (( count > 0 )) || { printf '超限内容对照记录数非正：%s\n' "$count" >&2; return 1; }
+    return 0
 }
 
 # 主备来源：主源失败（空响应）时改用备用源成功发布，来源头指向备用源，且清除陈旧标记。
@@ -1882,15 +1924,19 @@ fixture_step '地址内容：启动可信来源 HTTPS 端点' fixture_start_host
 fixture_step '地址内容：启动错误证书 HTTPS 端点' fixture_start_hosts_bad_endpoint
 fixture_step '地址内容：端点就绪探测（可信需证书链、错误证书端点 -k 可达）' fixture_wait_hosts_endpoints
 fixture_step '地址内容：写入产品卷内并发读者脚本' fixture_write_hosts_reader
-if [[ $FIXTURE_FAILURES == $S10_BASE && $FIXTURE_READY == 1 ]]; then HOSTS_READY=1; fi
+# 系统文件基线属夹具步骤：置于就绪门控之前，其失败只记夹具失败并使 HOSTS_READY 保持未置位，
+# 而不是让依赖它的断言以「缺少基线」被计为断言失败。
 fixture_step '地址内容：记录产品容器 /etc/hosts 与 /etc/resolv.conf 运行前基线' fixture_record_system_files
+if [[ $FIXTURE_FAILURES == $S10_BASE && $FIXTURE_READY == 1 ]]; then HOSTS_READY=1; fi
 check_hosts_content '地址内容：多地址保留且非法/私网/元数据/通配符被拒不入快照' fixture_hosts_multi_address
-fixture_record_snapshot_sha
+# 摘要基线记录属夹具步骤：纳入夹具计数，避免在 set -e 下以整体中止代替可读的失败归因。
+fixture_step '地址内容：记录快照摘要基线（空响应/超上限用例）' fixture_record_snapshot_sha
 check_hosts_content '地址内容：空响应刷新失败且旧快照逐字节保留并标记陈旧' fixture_hosts_empty_fails_retains
 check_hosts_content '地址内容：超上限响应刷新失败且旧快照逐字节保留' fixture_hosts_oversize_fails_retains
+check_hosts_content '地址内容：超限内容对照（撤除体积上限后产品仍可过滤渲染，故失败归因于体积上限）' fixture_hosts_oversize_content_valid_without_cap
 check_hosts_content '地址内容：主源失败改用备用源成功并清除陈旧标记' fixture_hosts_fallback_success
 check_hosts_content '地址内容：原子替换下并发读者不见半文件且替换后内容/摘要正确' fixture_hosts_atomic_replace_readers
-fixture_record_snapshot_sha
+fixture_step '地址内容：记录快照摘要基线（错误证书用例）' fixture_record_snapshot_sha
 check_hosts_content '地址内容：错误证书刷新失败且不污染快照' fixture_hosts_wrong_certificate_fails_retains
 check_hosts_content '地址内容：项目运行不修改系统 hosts/resolv.conf' fixture_hosts_system_files_unchanged
 
