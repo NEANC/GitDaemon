@@ -112,6 +112,8 @@ C2_SAMP=gm-it-c2samp-$$
 C2_VOL=gm-it-c2vol-$$
 C2_LOG_VOL=gm-it-c2log-$$
 C2_MOUNT=/var/lib/git-daemon
+# 采样侧车挂载产品运行卷的路径：仅用于在 PID1 存活窗口内尝试取操作锁，绝不写入产品卷。
+C2_PROD_MOUNT=/prod
 C2_SAMPLE=$C2_MOUNT/c2-sample.txt
 C2_READY=0
 C2_STOP_FILE=$TEST_ROOT/c2-stop-result
@@ -1998,82 +2000,137 @@ c2_scene_start_product() {
         "${args[@]}" "$IMAGE" >/dev/null 2>&1
 }
 
-# 等待目标模式的多层任务树出现：同步模式等 git fetch 的远端助手，刷新模式等 curl；
-# 且必须出现「父进程既不是 0 也不是 PID1」的子孙，作为多层子孙的真实证据。
+# 判定本地时间线是否已出现目标模式的「多层任务树」：同步模式等传输助手（git-remote-*/fetch --progress），
+# 刷新模式等 curl；且该进程的 ppid 既不是 0 也不是容器内 PID1（即确为任务的深层子孙）。
+# 数据全部来自采样侧车（与产品共享 PID 命名空间），以容器内 PID1 语义判定，
+# 不用宿主命名空间的 PID/ppid（宿主 PID1 与容器入口 PID1 不是同一进程，语义不同）。
+# 按模式限定到真正挂起的传输助手，避免把「首次地址刷新」等短暂子进程误判为待观察的多层任务树。
+c2_timeline_has_deep_tree() {
+    C2_MARKERS="$C2_MARKERS" C2_MODE="$1" awk '
+        BEGIN {
+            mode = ENVIRON["C2_MODE"]
+            if (mode == "timedhosts") {
+                helper = "(^| )curl "
+                taskpat = "update-github-hosts\\.sh"
+            } else if (mode == "timedsync") {
+                helper = "(git-remote-(https|curl)|fetch --progress)"
+                taskpat = "git-mirror-sync\\.sh"
+            } else {
+                helper = "(git-remote-(https|curl)|fetch --progress)"
+                taskpat = ""
+            }
+            sched = 0; found = 0
+        }
+        /^S[ ]/ { inframe=1; f_help=0; f_task=0; next }
+        /^E$/ {
+            if (inframe && f_help && (taskpat == "" || f_task)) found = 1
+            inframe=0; next
+        }
+        {
+            if (!inframe) next
+            if ($0 !~ /^[[:space:]]*pid=[0-9]+[[:space:]]/) next
+            line=$0; sub(/^[[:space:]]*/, "", line)
+            split(line, a, " ")
+            pid=a[1]; sub(/^pid=/,"",pid)
+            ppid=a[2]; sub(/^ppid=/,"",ppid)
+            cmd=$0
+            sub(/^[[:space:]]*pid=[0-9]+[[:space:]]+ppid=[0-9]+[[:space:]]+pgid=[0-9]+[[:space:]]+ruid=[0-9]+[[:space:]]+euid=[0-9]+[[:space:]]*/, "", cmd)
+            # 记录常驻调度器主进程的 PID（排除启动前 --check 调用），供识别其派发的任务。
+            # 调度器进程名不在任务标记集合内，故必须在标记过滤之前识别，否则会被提前跳过。
+            if (cmd ~ /git-mirror-scheduler\.sh/ && cmd !~ /--check/ && ppid == 1) sched = pid
+            if (cmd !~ ENVIRON["C2_MARKERS"]) next
+            if (cmd ~ helper && ppid != 0 && ppid != 1) f_help = 1
+            # 定时模式要求同一帧内既存在「父进程为调度器 PID 的任务脚本」，
+            # 也存在其深层传输助手，以排除启动阶段的首次任务或其后代被误当成待观察的定时任务。
+            if (taskpat != "" && sched != 0 && cmd ~ taskpat && ppid == sched) f_task = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$C2_TIMELINE"
+}
+
+# 等待目标模式的多层任务树出现（夹具步骤）：数据取自采样侧车的容器命名空间时间线。
+# 定时模式需等 Cron 到点（最多约一分钟），故等待上限设为约 120 秒。
 c2_scene_wait_tree() {
-    local mode=$1 i pid ppid cmd deep
-    for i in $(seq 1 200); do
-        deep=no
-        for pid in $(docker top "$C2_PROD" -o pid 2>/dev/null | tail -n +2); do
-            [[ $pid =~ ^[0-9]+$ ]] || continue
-            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || cmd=
-            case "$mode" in
-                timedhosts) case "$cmd" in *'curl '*) ;; *) continue ;; esac ;;
-                *) case "$cmd" in *git-remote-*|*'fetch --progress'*) ;; *) continue ;; esac ;;
-            esac
-            ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || ppid=
-            if [[ $ppid =~ ^[0-9]+$ && $ppid != 0 && $ppid != 1 ]]; then deep=yes; fi
-        done
-        if [[ $deep == yes ]]; then return 0; fi
-        sleep 0.5
+    local mode=${1-} i
+    for i in $(seq 1 480); do
+        c2_scene_read_timeline
+        if c2_timeline_has_deep_tree "$mode"; then return 0; fi
+        sleep 0.25
     done
     return 1
 }
 
-# 启动产品容器并等待多层任务树出现（夹具步骤）。
-c2_scene_start_and_wait() {
-    c2_scene_start_product "$1" || return 1
-    c2_scene_wait_tree "$1"
-}
-
-# 采样侧车：共享产品容器 PID 命名空间，20Hz 把 (pid ppid pgid uid cmd) 按帧写入采样日志卷；
-# 每次写完整帧后关闭文件，避免被内核回收时丢失缓冲。
+# 采样侧车：共享产品容器 PID 命名空间，把 (pid ppid pgid ruid euid cmd) 按帧写入采样日志卷；
+# 同时只读式挂载产品运行卷，仅在信号标记出现后尝试非阻塞取操作锁并把结果记入同一时间线，
+# 使「锁在 PID1 存活期间被释放」有独立于 PID1 退出后内核清理的证据。
+# 侧车与产品共享 PID 命名空间：产品 PID1 一退出，命名空间即销毁、侧车被终止，
+# 因此侧车记下的每一帧都必然落在 PID1 存活窗口内。
 c2_scene_start_sampler() {
-    local script
+    local mode=$1 lock script
+    lock=$(c2_lock_file_name "$mode")
     docker rm -f "$C2_SAMP" >/dev/null 2>&1 || true
     docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
         -c "rm -f $C2_SAMPLE" >/dev/null 2>&1 || true
     script=$(cat <<'EOS'
+marked=0
 while [ -d /proc/1 ]; do
+    # 信号边界由采样侧车自身写入，保证采样文件只有一个写入者，
+    # 避免边界行插入某帧中间而破坏帧分段（否则会把信号前的帧误判为信号后）。
+    if [ "$marked" = 0 ] && [ -e __SIGNALFILE__ ]; then
+        printf "SIGNAL %s\n" "$(date +%s.%N)" >> __SAMPLE__
+        marked=1
+    fi
     {
         printf "S %s\n" "$(date +%s.%N)"
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
             [ "$p" = "$$" ] && continue
             cmd=$(tr "\0" " " < "$d/cmdline" 2>/dev/null || true)
-            ppid=$(busybox awk "{print \$4}" "$d/stat" 2>/dev/null || true)
-            pgid=$(busybox awk "{print \$5}" "$d/stat" 2>/dev/null || true)
-            uid=$(busybox awk "/^Uid:/{print \$2}" "$d/status" 2>/dev/null || true)
+            stat=$(cat "$d/stat" 2>/dev/null || true)
+            rest=${stat##*\) }
+            set -- $rest
+            ppid=${2-}
+            pgid=${3-}
+            uids=$(busybox awk "/^Uid:/{print \$2, \$3}" "$d/status" 2>/dev/null || true)
             # 进程可能在本帧读取过程中退出；读取失败时跳过该行，避免以空值伪造出 root 进程。
             [ -n "$ppid" ] || continue
             [ -n "$pgid" ] || continue
-            [ -n "$uid" ] || continue
-            printf "  pid=%s ppid=%s pgid=%s uid=%s %s\n" "$p" "$ppid" "$pgid" "$uid" "$cmd"
+            [ -n "$uids" ] || continue
+            set -- $uids
+            # 同时记录实际 UID 与有效 UID，任一非 10001 都视为出现非 root 身份偏差。
+            printf "  pid=%s ppid=%s pgid=%s ruid=%s euid=%s %s\n" "$p" "$ppid" "$pgid" "$1" "$2" "$cmd"
         done
+        # 仅在信号标记出现后观测锁：取锁成功即证明持锁进程已退出，且此刻 PID1 仍存活。
+        if [ -e __SIGNALFILE__ ]; then
+            if flock -n -x __LOCK__ true 2>/dev/null; then
+                printf "  lock=free\n"
+            else
+                printf "  lock=busy\n"
+            fi
+        fi
         printf "E\n"
     } >> __SAMPLE__
-    # 停止信号出现后不再休眠，以最高频率采样，尽量捕捉 PID1 存活期间的回收窗口。
-    [ -e __SIGNALFILE__ ] && continue
-    sleep 0.05
+    # 停止信号出现后缩短休眠，以更高频率采样，尽量捕捉 PID1 存活期间的回收窗口。
+    if [ -e __SIGNALFILE__ ]; then sleep 0.01; else sleep 0.05; fi
 done
 printf "SAMPLER-EXIT %s\n" "$(date +%s.%N)" >> __SAMPLE__
 EOS
 )
-    script=${script/__SAMPLE__/$C2_SAMPLE}
-    script=${script/__SIGNALFILE__/$C2_SIGNAL_FILE}
+    script=${script//__SAMPLE__/$C2_SAMPLE}
+    script=${script//__SIGNALFILE__/$C2_SIGNAL_FILE}
+    script=${script//__LOCK__/$C2_PROD_MOUNT/runtime/$lock}
     docker run -d --name "$C2_SAMP" --pid "container:$C2_PROD" -v "$C2_LOG_VOL:$C2_MOUNT" \
-        --user 10001:10001 --entrypoint /bin/sh "$IMAGE" -c "$script" >/dev/null 2>&1
+        -v "$C2_VOL:$C2_PROD_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
+        -c "$script" >/dev/null 2>&1
 }
 
 # 等待采样侧车确实写入至少一个含 PID1 的进程行：避免在侧车尚未开始记录时就发出停止信号，
 # 使「子孙在 PID1 存活期间被回收」的判定建立在真实时间线之上。
 c2_scene_wait_sampler() {
-    local i n
+    local i
     for i in $(seq 1 100); do
-        n=$(docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
-            -c "grep -cE '(^| )pid=1 ' $C2_SAMPLE 2>/dev/null || true" 2>/dev/null) || n=
-        n=$(tr -d '[:space:]' <<<"$n")
-        if [[ $n =~ ^[1-9][0-9]*$ ]]; then return 0; fi
+        c2_scene_read_timeline
+        if grep -qE '(^| )pid=1 ' "$C2_TIMELINE"; then return 0; fi
         sleep 0.2
     done
     return 1
@@ -2087,7 +2144,8 @@ c2_lock_file_name() {
     esac
 }
 
-# 记录信号前状态（动作，非断言）：同一命名卷新实例能否获取操作锁、调度日志「开始」条数基线。
+# 记录信号前状态（动作，非断言）：在同一命名卷上以新实例尝试非阻塞取操作锁，
+# 判定停止前锁是否确实被持有（该观测发生在 PID1 存活期间，作为锁释放判据的前置条件）。
 c2_scene_record_prestate() {
     local mode=$1 lock
     lock=$(c2_lock_file_name "$mode")
@@ -2097,22 +2155,36 @@ c2_scene_record_prestate() {
     else
         printf 'yes\n' > "$TEST_ROOT/c2-lock-busy"
     fi
-    docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
-        -c "if [ -f $C2_MOUNT/logs/scheduler.log ]; then grep -c '开始' $C2_MOUNT/logs/scheduler.log; else echo 0; fi" \
-        > "$TEST_ROOT/c2-dispatch-before" 2>/dev/null || printf '0\n' > "$TEST_ROOT/c2-dispatch-before"
     return 0
 }
 
-# 在采样时间线中写入信号标记（容器内时钟，与采样同一时钟域），并创建卷内信号标记文件。
+# 创建卷内信号标记文件；信号边界行由采样侧车在看到该文件后自行写入采样时间线
+# （保持采样文件单一写入者）。失败不使整个套件中止：由后续基于时间线的断言给出可读的失败归因。
 c2_scene_mark_signal() {
     docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
-        -c "printf 'SIGNAL %s $1\n' \"\$(date +%s.%N)\" >> $C2_SAMPLE; : > $C2_SIGNAL_FILE" >/dev/null 2>&1
+        -c ": > $C2_SIGNAL_FILE" >/dev/null 2>&1 || true
+    return 0
 }
 
-# 断言：停止时按进程组回收任务整棵进程树，并已确认回收完成（发生在 PID1/调度器存活期间）。
-# 依据产品自身在确认进程组为空（按组 kill -0 失败）之后输出的日志：
-#   首次任务由入口输出，定时任务由调度器输出到实例调度日志。
-c2_assert_reclaimed() {
+# 行为判据（回收主判据）：停止信号后含 PID1 的末帧内已无「深层子孙」任务标记（last_post_deep=0），
+# 且至少存在一帧信号后含 PID1 的采样（post_frames>=1）以排除空判据。
+# 采样侧车与产品共享 PID 命名空间，PID1 退出即侧车终止，故信号后的帧必然发生在 PID1 存活期间；
+# 末帧无深层子孙即直接测量到「多层子孙已在 PID1 存活期间被回收」，不依赖产品日志。
+# 只计深层子孙（父进程非 0/1），避免任务组长在拆除瞬间尚未退出造成与回收无关的误判。
+c2_assert_reclaimed_behavior() {
+    local f n m
+    f=$(cat "$C2_FACT_FILE" 2>/dev/null)
+    n=${f#*post_frames=}; n=${n%% *}
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    (( n >= 1 )) || return 1
+    m=${f#*last_post_deep=}; m=${m%% *}
+    [[ $m =~ ^-?[0-9]+$ ]] || return 1
+    (( m == 0 ))
+}
+
+# 代理判据（辅助）：产品自证「已回收进程组全部子孙」日志（首次任务由入口输出，定时任务由调度器写入实例调度日志）。
+# 该判据衡量的是产品声明而非直接测量：缺少该日志时对旧产品失败，但存在该日志不证明子孙确实已回收。
+c2_assert_reclaimed_log() {
     local mode=$1 label
     case "$mode" in
         firstsync) label='首次仓库同步' ;;
@@ -2150,53 +2222,72 @@ c2_scene_signal() {
     return 0
 }
 
-# 把采样日志卷内的时间线读回测试临时目录。
+# 把采样侧车容器内的采样时间线复制到测试临时目录；不额外启动容器，避免污染被测 PID 命名空间。
+# 侧车容器即便已随 PID1 退出而停止，docker cp 仍可读取其文件系统快照。
 c2_scene_read_timeline() {
-    docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
-        -c "cat $C2_SAMPLE 2>/dev/null || true" > "$C2_TIMELINE" 2>/dev/null || true
+    docker cp "$C2_SAMP:$C2_SAMPLE" "$C2_TIMELINE" >/dev/null 2>&1 || : > "$C2_TIMELINE"
     return 0
 }
 
 # 解析时间线，输出信号前最后一帧与信号后帧的判定事实：
 #   pre_haspid1 信号前末帧含 PID1；pre_mark 该帧任务标记进程数；pre_deep 其中存在父非 0/1 的多层证据；
-#   post_frames 信号后含 PID1 的帧数；last_post_mark 最后一个含 PID1 帧内的任务标记进程数；
-#   new_after_signal 信号后出现了信号前不存在的任务标记 PID；uid_bad 全时间线存在非 10001 UID。
+#   post_frames 信号后含 PID1 的帧数；last_post_mark/post_min_mark 末帧/最小帧的任务标记进程数；
+#   last_post_deep/post_min_deep 同上但只计「深层子孙」（父进程非 0/1）——行为回收主判据用它，
+#     以免任务组长（PID1 直接子进程）在末帧尚未退出的拆除瞬间造成误判；
+#   new_after_signal 信号后出现了信号前不存在的任务标记 PID；
+#   lock_free_pid1 信号后含 PID1 的帧内观测到操作锁可被获取（锁已释放）；
+#   uid_bad 全时间线存在实际或有效 UID 非 10001 的进程。
+# 时间线全部来自共享 PID 命名空间的采样侧车，故 post 帧必然落在 PID1 存活窗口内。
 c2_scene_analyze() {
     local facts
     facts=$(C2_MARKERS="$C2_MARKERS" awk '
-        BEGIN { phase="pre"; pre_haspid1=0; pre_mark=0; pre_deep=0; pre_pids=""; post_frames=0; last_post_mark=-1; new_after=0; uid_bad=0 }
+        BEGIN { phase="pre"; pre_haspid1=0; pre_mark=0; pre_deep=0; pre_pids=""; post_frames=0; last_post_mark=-1; post_min_mark=-1; last_post_deep=-1; post_min_deep=-1; new_after=0; lock_free=0; uid_bad=0 }
         /^SIGNAL/ { phase="post"; next }
-        /^S[ ]/ { ts=$2; haspid1=0; nmark=0; deep=0; pids=""; inframe=1; next }
+        /^S[ ]/ { ts=$2; haspid1=0; nmark=0; ndeep=0; pids=""; lock="none"; inframe=1; next }
         /^E$/ {
             if (inframe) {
                 if (phase=="pre") {
-                    if (haspid1) { pre_haspid1=1; pre_mark=nmark; pre_deep=(deep>0)?1:0; pre_pids=(pre_pids pids) }
-                } else if (haspid1) { post_frames++; last_post_mark=nmark }
+                    if (haspid1) { pre_haspid1=1; pre_mark=nmark; pre_deep=(ndeep>0)?1:0; pre_pids=(pre_pids pids) }
+                } else if (haspid1) {
+                    post_frames++
+                    last_post_mark=nmark
+                    if (post_min_mark < 0 || nmark < post_min_mark) post_min_mark=nmark
+                    last_post_deep=ndeep
+                    if (post_min_deep < 0 || ndeep < post_min_deep) post_min_deep=ndeep
+                    if (lock == "free") lock_free=1
+                }
             }
             inframe=0; next
         }
         {
             if (!inframe) next
+            if ($0 ~ /^[[:space:]]*lock=/) {
+                lock=$0
+                sub(/^[[:space:]]*lock=/, "", lock)
+                sub(/[[:space:]].*$/, "", lock)
+                next
+            }
             if ($0 !~ /^[[:space:]]*pid=[0-9]+[[:space:]]/) next
             line=$0; sub(/^[[:space:]]*/, "", line)
             split(line, a, " ")
             pid=a[1]; sub(/^pid=/, "", pid)
             ppid=a[2]; sub(/^ppid=/, "", ppid)
-            uf=a[4]; sub(/^uid=/, "", uf)
-            if (uf != "10001") uid_bad=1
+            ruid=a[4]; sub(/^ruid=/, "", ruid)
+            euid=a[5]; sub(/^euid=/, "", euid)
+            if (ruid != "10001" || euid != "10001") uid_bad=1
             cmd=$0
-            sub(/^[[:space:]]*pid=[0-9]+[[:space:]]+ppid=[0-9]+[[:space:]]+pgid=[0-9]+[[:space:]]+uid=[0-9]+[[:space:]]*/, "", cmd)
+            sub(/^[[:space:]]*pid=[0-9]+[[:space:]]+ppid=[0-9]+[[:space:]]+pgid=[0-9]+[[:space:]]+ruid=[0-9]+[[:space:]]+euid=[0-9]+[[:space:]]*/, "", cmd)
             if (pid == 1) haspid1=1
             if (cmd ~ ENVIRON["C2_MARKERS"]) {
                 nmark++
                 pids = pids pid ","
-                if (ppid != 0 && ppid != 1) deep++
+                if (ppid != 0 && ppid != 1) ndeep++
                 if (phase=="post" && index("," pre_pids, "," pid ",") == 0) new_after=1
             }
         }
         END {
-            printf "pre_haspid1=%d pre_mark=%d pre_deep=%d post_frames=%d last_post_mark=%d new_after_signal=%d uid_bad=%d\n",
-                pre_haspid1, pre_mark, pre_deep, post_frames, last_post_mark, new_after, uid_bad
+            printf "pre_haspid1=%d pre_mark=%d pre_deep=%d post_frames=%d last_post_mark=%d post_min_mark=%d last_post_deep=%d post_min_deep=%d new_after_signal=%d lock_free_pid1=%d uid_bad=%d\n",
+                pre_haspid1, pre_mark, pre_deep, post_frames, last_post_mark, post_min_mark, last_post_deep, post_min_deep, new_after, lock_free, uid_bad
         }
     ' "$C2_TIMELINE")
     printf '%s\n' "$facts" > "$C2_FACT_FILE"
@@ -2234,44 +2325,61 @@ c2_assert_bounded() {
     (( elapsed < 30 ))
 }
 
-# 断言：停止后不再派发新任务——采样中不再出现信号前不存在的任务进程，
-# 且调度日志「开始」条数不增加（无调度日志的场景只核对采样时间线）。
+# 行为判据：停止后不再派发新任务——信号后的采样中不再出现信号前不存在的任务标记 PID。
+# 采样侧车仅在 PID1 存活期间记录，故该判据覆盖的是停止信号后的宽限窗口本身，
+# 不是「容器退出后日志不再增长」这类恒真观察。
 c2_assert_no_dispatch() {
-    local f before after
+    local f n
     f=$(cat "$C2_FACT_FILE" 2>/dev/null)
-    [[ $f == *'new_after_signal=0'* ]] || return 1
-    before=$(tr -d '[:space:]' < "$TEST_ROOT/c2-dispatch-before" 2>/dev/null)
-    [[ $before =~ ^[0-9]+$ ]] || return 1
-    after=$(docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
-        -c "if [ -f $C2_MOUNT/logs/scheduler.log ]; then grep -c '开始' $C2_MOUNT/logs/scheduler.log; else echo absent; fi" 2>/dev/null) || after=
-    after=$(tr -d '[:space:]' <<<"$after")
-    [[ $after != absent ]] || return 0
-    [[ $after =~ ^[0-9]+$ ]] || return 1
-    (( after <= before ))
+    n=${f#*post_frames=}; n=${n%% *}
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    (( n >= 1 )) || return 1
+    [[ $f == *'new_after_signal=0'* ]]
 }
 
-# 断言：停止前记录到操作锁被持有（同卷新实例不可获取）。
+# 断言：停止前记录到操作锁被持有（同卷新实例不可获取）；该观测发生在 PID1 存活期间。
 c2_assert_lock_busy() {
     [[ $(tr -d '[:space:]' < "$TEST_ROOT/c2-lock-busy" 2>/dev/null) == yes ]]
 }
 
-# 断言：停止后同一命名卷上的新实例可立即获取操作锁（锁随进程退出被释放，非 PID1 退出后清理）。
+# 行为判据：信号后含 PID1 的帧内观测到操作锁可被获取（lock_free_pid1=1）。
+# 采样侧车在信号后持续非阻塞取锁，取到即证明持锁进程已退出且此刻 PID1 仍存活，
+# 与 PID1 退出后的内核清理无关，也避免以「容器退出后 flock 必然释放」充当证据。
 c2_assert_lock_free() {
-    local lock
-    lock=$(c2_lock_file_name "$1")
-    docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
-        -c "flock -n -x $C2_MOUNT/runtime/$lock true" >/dev/null 2>&1
+    local f
+    f=$(cat "$C2_FACT_FILE" 2>/dev/null)
+    [[ $f == *'lock_free_pid1=1'* ]]
 }
 
-# 执行一场 C-2 场景：夹具 → 产品启动与多层子孙 → 采样 → 停止信号 → 断言。
+# C-2 定向用例：复位陈旧服务状态必须移除陈旧 pidfile。
+# 仅 zap OpenRC 状态不够：start-stop-daemon 只按 pidfile 中 PID 是否存活判断「已在运行」，
+# 强杀重建后陈旧 PID 被新容器进程复用时会被误判，服务无法拉起。
+# 在隔离子 Shell 中桩掉 rc-service 后直接调用入口函数，以「pidfile 是否仍存在」的行为结果判定，
+# 不依赖 S6（compose 强杀重建）是否被执行。
+c2_reset_removes_stale_pidfile() {
+    local dir=$TEST_ROOT/c2-stale-pidfile out status=0
+    mkdir -p "$dir/runtime" || return 1
+    printf '4242\n' > "$dir/runtime/git-daemon.pid" || return 1
+    out=$(RUN_ROOT="$dir" bash -c '
+        rc-service() { return 0; }
+        source "$1"
+        reset_stale_service_state git-daemon
+        if [ -e "$RUN_ROOT/runtime/git-daemon.pid" ]; then printf "PRESENT\n"; else printf "ABSENT\n"; fi
+    ' _ "$ROOT/docker/docker-entrypoint.sh" 2>&1) || status=$?
+    printf 'C-2 陈旧 pidfile 复位观测：status=%s out=%s\n' "$status" "$(tr -d '\n' <<<"$out")"
+    [[ $out == *ABSENT* ]]
+}
+
+# 执行一场 C-2 场景：夹具 → 产品启动 → 采样侧车 → 采样命名空间就绪 → 停止信号 → 断言。
 c2_run_scenario() {
     local mode=$1 hang=$2 sig=$3 base
     base=$FIXTURE_FAILURES
     C2_READY=0
     fixture_step "C-2[$mode/$sig] 夹具：隔离网络与快速失败+挂起端点" c2_scene_fixture "$hang"
-    fixture_step "C-2[$mode/$sig] 夹具：产品容器启动并形成多层任务树" c2_scene_start_and_wait "$mode"
-    fixture_step "C-2[$mode/$sig] 夹具：共享 PID 命名空间采样侧车" c2_scene_start_sampler
+    fixture_step "C-2[$mode/$sig] 夹具：产品容器启动" c2_scene_start_product "$mode"
+    fixture_step "C-2[$mode/$sig] 夹具：共享 PID 命名空间采样侧车" c2_scene_start_sampler "$mode"
     fixture_step "C-2[$mode/$sig] 夹具：采样侧车已记录到 PID1" c2_scene_wait_sampler
+    fixture_step "C-2[$mode/$sig] 夹具：容器命名空间已形成多层任务树" c2_scene_wait_tree "$mode"
     if [[ $FIXTURE_FAILURES == $base ]]; then C2_READY=1; fi
     c2_scene_record_prestate "$mode"
     c2_scene_mark_signal "$sig"
@@ -2279,12 +2387,13 @@ c2_run_scenario() {
     c2_scene_read_timeline
     printf 'C-2[%s/%s] 采样事实：%s\n' "$mode" "$sig" "$(c2_scene_analyze)"
     check_c2 "C-2[$mode/$sig] 停止在 30 秒宽限期内完成且未被 SIGKILL" c2_assert_bounded
-    check_c2 "C-2[$mode/$sig] 多层子孙在 PID1 存活期间被回收" c2_assert_reclaimed "$mode"
-    check_c2 "C-2[$mode/$sig] 停止后不再派发新任务" c2_assert_no_dispatch
+    check_c2 "C-2[$mode/$sig] 多层子孙在 PID1 存活期间被回收（行为采样）" c2_assert_reclaimed_behavior
+    check_c2 "C-2[$mode/$sig] 产品自证已回收进程组日志（代理判据）" c2_assert_reclaimed_log "$mode"
+    check_c2 "C-2[$mode/$sig] 停止后不再派发新任务（行为采样）" c2_assert_no_dispatch
     check_c2 "C-2[$mode/$sig] 停止前捕获到多层任务树" c2_assert_tree
     check_c2 "C-2[$mode/$sig] 全树实际/有效 UID 均为 10001（无 root 业务进程）" c2_assert_uid_nonroot
     check_c2 "C-2[$mode/$sig] 停止前操作锁被持有" c2_assert_lock_busy
-    check_c2 "C-2[$mode/$sig] 停止后同卷新实例可立即获取操作锁" c2_assert_lock_free "$mode"
+    check_c2 "C-2[$mode/$sig] 锁在 PID1 存活期间被释放（行为采样）" c2_assert_lock_free
     c2_scene_teardown
 }
 
@@ -2514,6 +2623,10 @@ check_auth_prod '凭据隔离：合成 Token 访问受认证夹具成功' fixtur
 check_auth_prod '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
 check_auth_sync '凭据夹具：真实 Git 客户端无凭据访问被拒绝（鉴权非空转）' fixture_auth_requires_token
 fi
+
+# 场景 S11 前置：强杀重建相关产品改动的定向行为用例（无需 Compose），
+# 使「复位陈旧服务状态移除陈旧 pidfile」具备独立于 S6 的红绿覆盖。
+check 'C-2 复位陈旧服务状态移除陈旧 pidfile（PID 复用不误判）' c2_reset_removes_stale_pidfile
 
 # 场景 S11：有界停止（C-2）。首次同步、定时同步、定时 hosts 刷新分别构造可控长进程与多层子孙，
 # 发送 TERM 与 INT；在 PID1 存活期间观察子孙回收、锁释放与不再派发，并核对全树非 root UID。
