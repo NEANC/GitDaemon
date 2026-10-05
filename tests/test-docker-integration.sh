@@ -6,6 +6,9 @@
 # 实例数据落卷、数据重建保留、停止与信号回收、关键服务停止退出、非法配置启动失败、
 # 调度真实派发、发布边界（export-ok/receive-pack）、自签名 HTTPS 地址刷新被拒绝、
 # 显式环境变量对卷内配置的优先级以及强杀（SIGKILL）后同卷重建的真实可达性。
+# 另在隔离 HTTPS 夹具（自定义网络 + github.com DNS 别名 + 测试 CA）下用真实 Git 客户端与真实网络请求
+# 验证产品保持 https://github.com/<owner>/<repo>.git 与 TLS 校验时的首次/重复/指定分支同步、远端更新、
+# 失败保留、未发布不可读、receive-pack 拒绝以及 /repo 与 /repo.git 双形式指向预期提交。
 # docker 完全不可用时整段跳过并返回 77；仅 compose 缺失时 docker-only 覆盖照常执行。
 
 set -euo pipefail
@@ -35,6 +38,20 @@ TEST_REPO=octocat/Nonexistent-$COMPOSE_TAG
 # 地址刷新夹具：与目标容器共享网络命名空间的自签名 HTTPS 服务名与端口。
 TLS_FIXTURE_NAME=gm-it-tls-$$
 TLS_FIXTURE_PORT=$((COMPOSE_PORT + 10000))
+# 隔离 HTTPS 同步夹具：独立命名卷、自定义网络、github.com DNS 别名与测试 CA；夹具失败独立计数。
+FIXTURE_SCRIPT=$ROOT/tests/docker-https-fixture.sh
+FIXTURE_NET=gm-it-net-$$
+FIXTURE_FIX_VOL=gm-it-fixvol-$$
+FIXTURE_PROD_VOL=gm-it-prodvol-$$
+FIXTURE_NAME=gm-it-upstream-$$
+FIXTURE_PROD=gm-it-sync-$$
+FIXTURE_REPO=acme/demo
+FIXTURE_MOUNT=/var/lib/git-daemon
+FIXTURE_HOME=$FIXTURE_MOUNT/home
+FIXTURE_CA=$FIXTURE_MOUNT/fixture/tls/ca.crt
+FIXTURE_CHECKS=0
+FIXTURE_FAILURES=0
+FIXTURE_READY=0
 # 场景化 compose 透传环境变量（列表形式）；compose_up 负责导出后编排。
 COMPOSE_ENV=()
 
@@ -80,6 +97,18 @@ compose_available() {
 cleanup() {
     if [[ -n ${TLS_FIXTURE_NAME:-} ]]; then
         docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${FIXTURE_NAME:-} ]]; then
+        docker rm -f "$FIXTURE_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${FIXTURE_PROD:-} ]]; then
+        docker rm -f "$FIXTURE_PROD" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${FIXTURE_NET:-} ]]; then
+        docker network rm "$FIXTURE_NET" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${FIXTURE_FIX_VOL:-} || -n ${FIXTURE_PROD_VOL:-} ]]; then
+        docker volume rm -f "$FIXTURE_FIX_VOL" "$FIXTURE_PROD_VOL" >/dev/null 2>&1 || true
     fi
     if [[ -f ${COMPOSE_OVERRIDE:-} ]]; then
         IMAGE_TAG=$COMPOSE_TAG REPOS=$TEST_REPO \
@@ -820,6 +849,233 @@ compose_hosts_unreachable_retained() {
     [[ $(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null) == true ]]
 }
 
+# 夹具步骤：失败计入独立的夹具失败计数，避免把夹具不可用当作产品断言结果。
+fixture_step() {
+    local label=$1 status=0
+    shift
+    FIXTURE_CHECKS=$((FIXTURE_CHECKS + 1))
+    "$@" >"$TEST_ROOT/fixture-step.log" 2>&1 || status=$?
+    if (( status == 0 )); then
+        printf '[PASS] %s\n' "$label"
+        return 0
+    fi
+    printf '[FIXTURE-FAIL] %s（退出码 %s）\n' "$label" "$status"
+    sed 's/^/    /' "$TEST_ROOT/fixture-step.log" >&2 2>/dev/null || true
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+    return 0
+}
+
+# 依赖夹具的产品断言：夹具未就绪时记为夹具失败并且不执行，既不冒充产品结论也不把连接错误当断言。
+check_https_sync() {
+    local label=$1
+    shift
+    if [[ $FIXTURE_READY == 1 ]]; then
+        check "$label" "$@"
+        return 0
+    fi
+    CHECKS=$((CHECKS + 1))
+    FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1))
+    printf '[FIXTURE-FAIL] 夹具未就绪，未执行断言：%s\n' "$label"
+    return 0
+}
+
+# 创建夹具所需的自定义网络与两个命名卷（上游资产卷、产品运行卷），不使用 bind 或宿主机路径。
+fixture_create_network_and_volumes() {
+    docker volume create "$FIXTURE_FIX_VOL" >/dev/null 2>&1 || return 1
+    docker volume create "$FIXTURE_PROD_VOL" >/dev/null 2>&1 || return 1
+    docker network create "$FIXTURE_NET" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# 夹具就绪探测：用真实 TLS 客户端经 github.com DNS 别名取到静态 info/refs；连接失败即夹具失败。
+fixture_wait_upstream() {
+    local i rc=0 code
+    for i in $(seq 1 30); do
+        rc=0
+        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" \
+            --entrypoint /bin/sh "$IMAGE" -c \
+            "curl -sS --cacert $FIXTURE_CA --max-time 5 -o /dev/null -w '%{http_code}' https://github.com/$FIXTURE_REPO.git/info/refs" \
+            2>"$TEST_ROOT/upstream-probe.err") || rc=$?
+        if [[ $rc == 0 && $code == 200 ]]; then return 0; fi
+        sleep 1
+    done
+    printf '上游就绪探测失败（curl 退出码 %s，HTTP %s）：\n' "$rc" "$code" >&2
+    cat "$TEST_ROOT/upstream-probe.err" >&2 2>/dev/null || true
+    return 1
+}
+
+# 把测试 CA 从上游卷复制到产品卷：两个命名卷之间经标准输入传递，不落地宿主机路径映射。
+fixture_copy_ca() {
+    bash "$FIXTURE_SCRIPT" ca "$FIXTURE_FIX_VOL" "$IMAGE" >"$TEST_ROOT/fixture-ca.pem" || return 1
+    docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "umask 022; mkdir -p ${FIXTURE_CA%/*} && cat > $FIXTURE_CA" <"$TEST_ROOT/fixture-ca.pem"
+}
+
+# 以正式入口在产品卷上启动隔离同步场景：只读根、UID10001、cap_drop ALL、no-new-privileges、仅命名卷；
+# ENABLE_HOSTS_UPDATE=no 走 system DNS 且不设 PROXY_URL，GIT_SSL_CAINFO 信任测试 CA（TLS 校验保持开启）。
+fixture_start_product() {
+    local i
+    docker rm -f "$FIXTURE_PROD" >/dev/null 2>&1 || true
+    docker run -d --name "$FIXTURE_PROD" --network "$FIXTURE_NET" --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" \
+        -e "REPOS=$FIXTURE_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no \
+        -e GIT_SMART_HTTP=0 -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$IMAGE" \
+        >"$TEST_ROOT/fixture-up.log" 2>&1 || return 1
+    for i in $(seq 1 150); do
+        if docker logs "$FIXTURE_PROD" 2>&1 | grep -q '容器前台就绪'; then return 0; fi
+        if [[ $(docker inspect -f '{{.State.Running}}' "$FIXTURE_PROD" 2>/dev/null) == false ]]; then
+            printf '产品容器提前退出，日志尾部：\n' >&2
+            docker logs "$FIXTURE_PROD" 2>&1 | tail -n 20 >&2 2>&1 || true
+            return 1
+        fi
+        sleep 1
+    done
+    printf '产品容器未进入前台就绪，日志尾部：\n' >&2
+    docker logs "$FIXTURE_PROD" 2>&1 | tail -n 20 >&2 2>&1 || true
+    return 1
+}
+
+# 在产品容器内以 UID 10001 运行产品同步入口；docker exec 不继承入口导出的环境，故显式传入实例 HOME。
+fixture_exec_sync() {
+    local repos=$1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 120 docker exec -e "REPOS=$repos" -e "HOME=$FIXTURE_HOME" -e GIT_SMART_HTTP=0 \
+            -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$FIXTURE_PROD" \
+            /usr/local/lib/git-mirror/git-mirror-sync.sh
+    else
+        docker exec -e "REPOS=$repos" -e "HOME=$FIXTURE_HOME" -e GIT_SMART_HTTP=0 \
+            -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$FIXTURE_PROD" \
+            /usr/local/lib/git-mirror/git-mirror-sync.sh
+    fi
+}
+
+# 读取产品卷内已同步镜像仓库的完整引用清单（引用名与提交号）。
+fixture_local_refs() {
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "git --git-dir=$FIXTURE_MOUNT/repos/$FIXTURE_REPO.git for-each-ref --format='%(refname) %(objectname)'" 2>/dev/null
+}
+
+# 统计产品同步日志内的本轮仓库同步条目数，用于验证重复同步确实重新执行。
+fixture_sync_log_count() {
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "grep -c '同步 $FIXTURE_REPO' $FIXTURE_MOUNT/logs/sync.log 2>/dev/null || true" 2>/dev/null
+}
+
+# 首次真实成功同步：引用齐全、main 提交与上游一致、已写入发布标记、传输路径为直连系统 DNS。
+fixture_first_sync_succeeded() {
+    local expected
+    expected=$(bash "$FIXTURE_SCRIPT" rev-parse "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" refs/heads/main) || return 1
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" \
+        -e "GM_EXPECT_MAIN=$expected" --entrypoint /bin/sh "$IMAGE" -c '
+        set -e
+        d='"$FIXTURE_MOUNT"'/repos/'"$FIXTURE_REPO"'.git
+        [ "$(git --git-dir="$d" rev-parse refs/heads/main)" = "$GM_EXPECT_MAIN" ]
+        git --git-dir="$d" rev-parse --verify refs/heads/dev >/dev/null
+        git --git-dir="$d" rev-parse --verify refs/tags/v1 >/dev/null
+        [ -f "$d/git-daemon-export-ok" ]
+        grep -q "同步传输路径：直连系统 DNS" '"$FIXTURE_MOUNT"'/logs/sync.log
+    '
+}
+
+# 用真实 Git 客户端经产品 git-daemon 验证 /repo 与 /repo.git 双形式都指向预期提交。
+fixture_publish_both_forms() {
+    local expected out path
+    expected=$(bash "$FIXTURE_SCRIPT" rev-parse "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" refs/heads/main) || return 1
+    for path in "$FIXTURE_REPO.git" "$FIXTURE_REPO"; do
+        out=$(docker run --rm --network "container:$FIXTURE_PROD" --entrypoint git "$IMAGE" \
+            ls-remote "git://127.0.0.1:9418/$path" 2>&1) || return 1
+        [[ $out == *"$expected"$'\t'"HEAD"* ]] || return 1
+        [[ $out == *"$expected"$'\t'"refs/heads/main"* ]] || return 1
+    done
+    return 0
+}
+
+# 未带 git-daemon-export-ok 的仓库必须不可读；先证明发布端口可达，避免把连接失败误判为拒绝。
+fixture_unexported_rejected() {
+    local out status=0
+    fixture_publish_both_forms || return 1
+    docker exec -e "HOME=$FIXTURE_HOME" "$FIXTURE_PROD" sh -c \
+        'umask 022; R=/var/lib/git-daemon; rm -rf "$R/repos/acme/secret.git"; git clone -q --bare "$R/repos/acme/demo.git" "$R/repos/acme/secret.git"' || return 1
+    out=$(docker run --rm --network "container:$FIXTURE_PROD" --entrypoint git "$IMAGE" \
+        ls-remote "git://127.0.0.1:9418/acme/secret.git" 2>&1) || status=$?
+    [[ $status != 0 ]] || return 1
+    [[ $out == *'not exported'* ]]
+}
+
+# 即使夹具在仓库上设置 daemon.receivepack=true，产品 daemon 仍必须拒绝 push（--forbid-override）。
+fixture_push_rejected() {
+    fixture_publish_both_forms || return 1
+    docker exec -e "HOME=$FIXTURE_HOME" "$FIXTURE_PROD" sh -c \
+        "git --git-dir=$FIXTURE_MOUNT/repos/$FIXTURE_REPO.git config daemon.receivepack true" || return 1
+    docker run --rm --network "container:$FIXTURE_PROD" --user 10001:10001 -e "HOME=$FIXTURE_HOME" \
+        --entrypoint /bin/sh "$IMAGE" -c '
+        set -e
+        cd /tmp; rm -rf pushsrc; git init -q pushsrc; cd pushsrc
+        git config user.email fixture@example.invalid
+        git config user.name fixture
+        printf x > f; git add f; git commit -qm c
+        if git push git://127.0.0.1:9418/'"$FIXTURE_REPO"'.git HEAD:refs/heads/gm-push >/dev/null 2>&1; then exit 1; fi
+        exit 0
+    '
+}
+
+# 重复同步：再次以产品入口同步，要求引用不变且同步日志确有一次新的执行记录。
+fixture_repeat_sync_idempotent() {
+    local before after before_count after_count
+    before=$(fixture_local_refs) || return 1
+    before_count=$(fixture_sync_log_count) || return 1
+    fixture_exec_sync "$FIXTURE_REPO" >"$TEST_ROOT/fixture-resync.log" 2>&1 || return 1
+    after=$(fixture_local_refs) || return 1
+    after_count=$(fixture_sync_log_count) || return 1
+    [[ $before == "$after" ]] || return 1
+    (( after_count > before_count ))
+}
+
+# 远端更新后重新同步：镜像引用与 HEAD 必须反映上游新提交，且新提交号确实变化。
+fixture_remote_update_reflected() {
+    local old new
+    old=$(bash "$FIXTURE_SCRIPT" rev-parse "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" refs/heads/main) || return 1
+    new=$(bash "$FIXTURE_SCRIPT" update "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" main fixture-update) || return 1
+    [[ -n $new && $new != "$old" ]] || return 1
+    fixture_exec_sync "$FIXTURE_REPO" >"$TEST_ROOT/fixture-resync-update.log" 2>&1 || return 1
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" \
+        -e "GM_NEW=$new" --entrypoint /bin/sh "$IMAGE" -c '
+        set -e
+        d='"$FIXTURE_MOUNT"'/repos/'"$FIXTURE_REPO"'.git
+        [ "$(git --git-dir="$d" rev-parse refs/heads/main)" = "$GM_NEW" ]
+        [ "$(git --git-dir="$d" symbolic-ref HEAD)" = "refs/heads/main" ]
+    '
+}
+
+# 上游不可达时同步必须失败，且已有引用逐字节保留（失败不破坏缓存）。
+fixture_failure_retains_refs() {
+    local before after status=0
+    before=$(fixture_local_refs) || return 1
+    bash "$FIXTURE_SCRIPT" stop "$FIXTURE_NAME" || return 1
+    fixture_exec_sync "$FIXTURE_REPO" >"$TEST_ROOT/fixture-fail.log" 2>&1 || status=$?
+    [[ $status != 0 ]] || return 1
+    after=$(fixture_local_refs) || return 1
+    [[ $before == "$after" ]] || return 1
+    grep -q '同步失败' "$TEST_ROOT/fixture-fail.log"
+}
+
+# 指定分支同步：只保留所选分支的引用，其余分支与标签被裁剪，HEAD 指向所选分支。
+fixture_branch_scoped_sync() {
+    local expected
+    bash "$FIXTURE_SCRIPT" start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_NAME" || return 1
+    fixture_wait_upstream || return 1
+    fixture_exec_sync "$FIXTURE_REPO main" >"$TEST_ROOT/fixture-branch.log" 2>&1 || return 1
+    expected=$(bash "$FIXTURE_SCRIPT" rev-parse "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" refs/heads/main) || return 1
+    docker run --rm --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" \
+        -e "GM_NEW=$expected" --entrypoint /bin/sh "$IMAGE" -c '
+        set -e
+        d='"$FIXTURE_MOUNT"'/repos/'"$FIXTURE_REPO"'.git
+        [ "$(git --git-dir="$d" for-each-ref --format="%(refname)" | sort | tr "\n" " ")" = "refs/heads/main " ]
+        [ "$(git --git-dir="$d" rev-parse refs/heads/main)" = "$GM_NEW" ]
+        [ "$(git --git-dir="$d" symbolic-ref HEAD)" = "refs/heads/main" ]
+    '
+}
+
 # 停止并删除测试 compose 项目、网络与测试作用域卷，并移除本脚本附加的镜像标签；无残留。
 compose_teardown() {
     docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
@@ -969,5 +1225,26 @@ else
     printf '注意：docker compose 不可用，Compose 编排实机检查未执行\n'
 fi
 
-printf '容器实机集成检查：%s；失败：%s\n' "$CHECKS" "$FAILURES"
-[[ $FAILURES == 0 ]]
+# 场景 S7：隔离 HTTPS 夹具（自定义网络 + github.com DNS 别名 + 测试 CA）下的真实成功同步。
+# 夹具不在生产镜像内；夹具准备/就绪失败记为独立的夹具失败并阻止依赖断言，
+# 依赖断言只在夹具就绪后以真实 Git 客户端与真实网络请求的观察结果判定。
+fixture_step 'TLS 夹具：创建隔离网络与命名卷' fixture_create_network_and_volumes
+fixture_step 'TLS 夹具：生成 Git dumb HTTP 上游与测试 CA' \
+    bash "$FIXTURE_SCRIPT" prepare "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO"
+fixture_step 'TLS 夹具：启动 github.com:443 TLS 上游' \
+    bash "$FIXTURE_SCRIPT" start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_NAME"
+fixture_step 'TLS 夹具：上游 HTTPS 就绪探测' fixture_wait_upstream
+fixture_step 'TLS 夹具：把测试 CA 复制进产品卷' fixture_copy_ca
+if [[ $FIXTURE_FAILURES == 0 ]]; then FIXTURE_READY=1; fi
+check_https_sync 'TLS 夹具：正式入口完成首次真实成功同步' fixture_start_product
+check_https_sync 'TLS 夹具：首次同步引用、HEAD 与 export-ok 正确' fixture_first_sync_succeeded
+check_https_sync 'TLS 夹具：/repo 与 /repo.git 双形式指向预期提交' fixture_publish_both_forms
+check_https_sync 'TLS 夹具：未带 export-ok 的仓库不可读' fixture_unexported_rejected
+check_https_sync 'TLS 夹具：即使 receivepack=true 也拒绝 push' fixture_push_rejected
+check_https_sync 'TLS 夹具：重复同步幂等（引用不变且日志递增）' fixture_repeat_sync_idempotent
+check_https_sync 'TLS 夹具：远端更新后引用与 HEAD 变化' fixture_remote_update_reflected
+check_https_sync 'TLS 夹具：上游不可达时保留旧引用' fixture_failure_retains_refs
+check_https_sync 'TLS 夹具：指定分支同步仅保留所选分支' fixture_branch_scoped_sync
+
+printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES"
+[[ $FAILURES == 0 && $FIXTURE_FAILURES == 0 ]]
