@@ -13,6 +13,9 @@
 # 传输顺序（proxy → mapping → system）与非代理尝试不经过代理，并用受认证上游与合成 Token 验证
 # 凭据只进入同步路径、常驻 daemon 进程环境不含 Token。
 # docker 完全不可用时整段跳过并返回 77；仅 compose 缺失时 docker-only 覆盖照常执行。
+# 另在 C-2 有界停止场景内用隔离网络与「快速失败/挂起」TCP 端点夹具，对首次同步、定时同步与
+# 定时 hosts 刷新构造多层子孙并发送 TERM/INT，以共享 PID 命名空间的采样侧车证明子孙在 PID1 存活
+# 期间被回收、锁被释放且不再派发；设置 IT_FILTER=c2 可只跑镜像静态检查与该场景。
 
 set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -95,6 +98,29 @@ AUTH_READY=0
 AUTH_PROD_READY=0
 # 场景化 compose 透传环境变量（列表形式）；compose_up 负责导出后编排。
 COMPOSE_ENV=()
+# 可选过滤：设置 IT_FILTER=c2 时只执行镜像静态检查与 C-2 有界停止场景，便于定向红绿取证；
+# 不设置时行为不变（执行完整套件）。
+IT_FILTER=${IT_FILTER-}
+
+# 阶段 C-2 有界停止场景：独立命名网络 + 「快速失败/挂起」TCP 端点夹具 + 共享 PID 命名空间的采样侧车。
+# 夹具在 443 上接受后立即关闭（使首次同步/首次刷新快速失败，容器能进入就绪）；
+# 在 8443 上前 N 次同样立即关闭、之后挂起不响应（使首次任务或定时任务形成可控长进程与多层子孙）。
+C2_NET=gm-it-c2net-$$
+C2_FIX=gm-it-c2fix-$$
+C2_PROD=gm-it-c2prod-$$
+C2_SAMP=gm-it-c2samp-$$
+C2_VOL=gm-it-c2vol-$$
+C2_LOG_VOL=gm-it-c2log-$$
+C2_MOUNT=/var/lib/git-daemon
+C2_SAMPLE=$C2_MOUNT/c2-sample.txt
+C2_READY=0
+C2_STOP_FILE=$TEST_ROOT/c2-stop-result
+C2_TIMELINE=$TEST_ROOT/c2-timeline.txt
+C2_FACT_FILE=$TEST_ROOT/c2-facts.txt
+# 停止信号的卷内标记文件：采样侧车据此在信号后进入紧凑采样。
+C2_SIGNAL_FILE=$C2_MOUNT/c2-signal
+# 任务标记：出现在任务进程树中的可执行/脚本名，用于识别「多层子孙」并检查回收。
+C2_MARKERS='git-mirror-sync\.sh|update-github-hosts\.sh|git-remote-(https|curl)|git .*fetch|tee -a [^ ]*sync\.log|curl '
 
 # 测试通过 override 文件把 compose.yml 的固定全局卷名改写到测试作用域，
 # 从而绝不触碰宿主上真实部署使用的 git-daemon-data 卷（即使它已存在）。
@@ -136,6 +162,21 @@ compose_available() {
 # 仅清理本脚本创建的临时目录、测试作用域卷、compose 项目/网络、夹具容器与本脚本附加的镜像标签；
 # 被检查镜像保留。绝不删除 compose.yml 绑定的全局卷 git-daemon-data。
 cleanup() {
+    if [[ -n ${C2_SAMP:-} ]]; then
+        docker rm -f "$C2_SAMP" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${C2_PROD:-} ]]; then
+        docker rm -f "$C2_PROD" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${C2_FIX:-} ]]; then
+        docker rm -f "$C2_FIX" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${C2_NET:-} ]]; then
+        docker network rm "$C2_NET" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${C2_VOL:-} || -n ${C2_LOG_VOL:-} ]]; then
+        docker volume rm -f "$C2_VOL" "$C2_LOG_VOL" >/dev/null 2>&1 || true
+    fi
     if [[ -n ${TLS_FIXTURE_NAME:-} ]]; then
         docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
     fi
@@ -1897,6 +1938,356 @@ fixture_hosts_system_files_unchanged() {
     [[ $(docker inspect -f '{{.State.Running}}' "$FIXTURE_PROD" 2>/dev/null) == true ]]
 }
 
+# 依赖 C-2 夹具就绪的产品断言：夹具未就绪时只记夹具失败，不冒充产品结论。
+check_c2() { check_gated C2_READY "$@"; }
+
+# 销毁上一场 C-2 场景的网络、卷与容器；全部属测试作用域，绝不触碰全局命名卷。
+c2_scene_teardown() {
+    docker rm -f "$C2_SAMP" "$C2_PROD" "$C2_FIX" >/dev/null 2>&1 || true
+    docker network rm "$C2_NET" >/dev/null 2>&1 || true
+    docker volume rm -f "$C2_VOL" "$C2_LOG_VOL" >/dev/null 2>&1 || true
+    return 0
+}
+
+# 建立 C-2 隔离网络与两个命名卷（产品运行卷、采样日志卷），并启动「快速失败 + 挂起」TCP 端点夹具。
+# hang_after 表示 8443 上前若干次连接接受后立即关闭，之后连接挂起不响应；8091 端口不涉及。
+c2_scene_fixture() {
+    local hang_after=$1 script
+    c2_scene_teardown
+    docker network create "$C2_NET" >/dev/null 2>&1 || return 1
+    docker volume create "$C2_VOL" >/dev/null 2>&1 || return 1
+    docker volume create "$C2_LOG_VOL" >/dev/null 2>&1 || return 1
+    script=$(cat <<'EOS'
+( while true; do busybox nc -l -p 443 < /dev/null > /dev/null 2>&1; done ) &
+n=0
+while true; do
+    if [ "$n" -lt __HANG_AFTER__ ]; then
+        busybox nc -l -p 8443 < /dev/null > /dev/null 2>&1
+    else
+        sleep 3600 | busybox nc -l -p 8443 > /dev/null 2>&1
+    fi
+    n=$((n + 1))
+done
+EOS
+)
+    script=${script/__HANG_AFTER__/$hang_after}
+    docker run -d --name "$C2_FIX" --network "$C2_NET" --network-alias github.com --network-alias gm-hang \
+        --user 10001:10001 --entrypoint /bin/sh "$IMAGE" -c "$script" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# 启动产品容器：firstsync（首次同步经挂起代理）、timedsync（定时同步经挂起代理）、
+# timedhosts（定时 hosts 刷新指向挂起端点）；均为只读根、cap_drop ALL、no-new-privileges、UID10001、仅命名卷。
+c2_scene_start_product() {
+    local mode=$1 e
+    local -a envs=("REPOS=acme/demo") args=()
+    case "$mode" in
+        firstsync)
+            envs+=("ENABLE_HOSTS_UPDATE=no" "ENABLE_CRON=no" "PROXY_URL=https://gm-hang:8443") ;;
+        timedsync)
+            envs+=("ENABLE_HOSTS_UPDATE=no" "ENABLE_CRON=yes" "CRON_SCHEDULE=* * * * *" "PROXY_URL=https://gm-hang:8443") ;;
+        timedhosts)
+            envs+=("ENABLE_HOSTS_UPDATE=yes" "ENABLE_CRON=yes" "CRON_SCHEDULE=0 0 1 1 *" \
+                "HOSTS_CRON=* * * * *" "HOSTS_URL=https://gm-hang:8443/hosts" "HOSTS_URL_FALLBACK=") ;;
+        *) return 1 ;;
+    esac
+    for e in "${envs[@]}"; do args+=(-e "$e"); done
+    docker rm -f "$C2_PROD" >/dev/null 2>&1 || true
+    docker run -d --name "$C2_PROD" --network "$C2_NET" --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" \
+        "${args[@]}" "$IMAGE" >/dev/null 2>&1
+}
+
+# 等待目标模式的多层任务树出现：同步模式等 git fetch 的远端助手，刷新模式等 curl；
+# 且必须出现「父进程既不是 0 也不是 PID1」的子孙，作为多层子孙的真实证据。
+c2_scene_wait_tree() {
+    local mode=$1 i pid ppid cmd deep
+    for i in $(seq 1 200); do
+        deep=no
+        for pid in $(docker top "$C2_PROD" -o pid 2>/dev/null | tail -n +2); do
+            [[ $pid =~ ^[0-9]+$ ]] || continue
+            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || cmd=
+            case "$mode" in
+                timedhosts) case "$cmd" in *'curl '*) ;; *) continue ;; esac ;;
+                *) case "$cmd" in *git-remote-*|*'fetch --progress'*) ;; *) continue ;; esac ;;
+            esac
+            ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null) || ppid=
+            if [[ $ppid =~ ^[0-9]+$ && $ppid != 0 && $ppid != 1 ]]; then deep=yes; fi
+        done
+        if [[ $deep == yes ]]; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# 启动产品容器并等待多层任务树出现（夹具步骤）。
+c2_scene_start_and_wait() {
+    c2_scene_start_product "$1" || return 1
+    c2_scene_wait_tree "$1"
+}
+
+# 采样侧车：共享产品容器 PID 命名空间，20Hz 把 (pid ppid pgid uid cmd) 按帧写入采样日志卷；
+# 每次写完整帧后关闭文件，避免被内核回收时丢失缓冲。
+c2_scene_start_sampler() {
+    local script
+    docker rm -f "$C2_SAMP" >/dev/null 2>&1 || true
+    docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
+        -c "rm -f $C2_SAMPLE" >/dev/null 2>&1 || true
+    script=$(cat <<'EOS'
+while [ -d /proc/1 ]; do
+    {
+        printf "S %s\n" "$(date +%s.%N)"
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            [ "$p" = "$$" ] && continue
+            cmd=$(tr "\0" " " < "$d/cmdline" 2>/dev/null || true)
+            ppid=$(busybox awk "{print \$4}" "$d/stat" 2>/dev/null || true)
+            pgid=$(busybox awk "{print \$5}" "$d/stat" 2>/dev/null || true)
+            uid=$(busybox awk "/^Uid:/{print \$2}" "$d/status" 2>/dev/null || true)
+            # 进程可能在本帧读取过程中退出；读取失败时跳过该行，避免以空值伪造出 root 进程。
+            [ -n "$ppid" ] || continue
+            [ -n "$pgid" ] || continue
+            [ -n "$uid" ] || continue
+            printf "  pid=%s ppid=%s pgid=%s uid=%s %s\n" "$p" "$ppid" "$pgid" "$uid" "$cmd"
+        done
+        printf "E\n"
+    } >> __SAMPLE__
+    # 停止信号出现后不再休眠，以最高频率采样，尽量捕捉 PID1 存活期间的回收窗口。
+    [ -e __SIGNALFILE__ ] && continue
+    sleep 0.05
+done
+printf "SAMPLER-EXIT %s\n" "$(date +%s.%N)" >> __SAMPLE__
+EOS
+)
+    script=${script/__SAMPLE__/$C2_SAMPLE}
+    script=${script/__SIGNALFILE__/$C2_SIGNAL_FILE}
+    docker run -d --name "$C2_SAMP" --pid "container:$C2_PROD" -v "$C2_LOG_VOL:$C2_MOUNT" \
+        --user 10001:10001 --entrypoint /bin/sh "$IMAGE" -c "$script" >/dev/null 2>&1
+}
+
+# 等待采样侧车确实写入至少一个含 PID1 的进程行：避免在侧车尚未开始记录时就发出停止信号，
+# 使「子孙在 PID1 存活期间被回收」的判定建立在真实时间线之上。
+c2_scene_wait_sampler() {
+    local i n
+    for i in $(seq 1 100); do
+        n=$(docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
+            -c "grep -cE '(^| )pid=1 ' $C2_SAMPLE 2>/dev/null || true" 2>/dev/null) || n=
+        n=$(tr -d '[:space:]' <<<"$n")
+        if [[ $n =~ ^[1-9][0-9]*$ ]]; then return 0; fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# 返回目标模式在停止时应被持有的操作锁文件名：hosts 刷新用 hosts.lock，同步用 sync.lock。
+c2_lock_file_name() {
+    case "$1" in
+        timedhosts) printf 'hosts.lock' ;;
+        *) printf 'sync.lock' ;;
+    esac
+}
+
+# 记录信号前状态（动作，非断言）：同一命名卷新实例能否获取操作锁、调度日志「开始」条数基线。
+c2_scene_record_prestate() {
+    local mode=$1 lock
+    lock=$(c2_lock_file_name "$mode")
+    if docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "flock -n -x $C2_MOUNT/runtime/$lock true" >/dev/null 2>&1; then
+        printf 'no\n' > "$TEST_ROOT/c2-lock-busy"
+    else
+        printf 'yes\n' > "$TEST_ROOT/c2-lock-busy"
+    fi
+    docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "if [ -f $C2_MOUNT/logs/scheduler.log ]; then grep -c '开始' $C2_MOUNT/logs/scheduler.log; else echo 0; fi" \
+        > "$TEST_ROOT/c2-dispatch-before" 2>/dev/null || printf '0\n' > "$TEST_ROOT/c2-dispatch-before"
+    return 0
+}
+
+# 在采样时间线中写入信号标记（容器内时钟，与采样同一时钟域），并创建卷内信号标记文件。
+c2_scene_mark_signal() {
+    docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
+        -c "printf 'SIGNAL %s $1\n' \"\$(date +%s.%N)\" >> $C2_SAMPLE; : > $C2_SIGNAL_FILE" >/dev/null 2>&1
+}
+
+# 断言：停止时按进程组回收任务整棵进程树，并已确认回收完成（发生在 PID1/调度器存活期间）。
+# 依据产品自身在确认进程组为空（按组 kill -0 失败）之后输出的日志：
+#   首次任务由入口输出，定时任务由调度器输出到实例调度日志。
+c2_assert_reclaimed() {
+    local mode=$1 label
+    case "$mode" in
+        firstsync) label='首次仓库同步' ;;
+        timedsync) label='仓库同步' ;;
+        timedhosts) label='地址刷新' ;;
+        *) return 1 ;;
+    esac
+    if [[ $mode == firstsync ]]; then
+        docker logs "$C2_PROD" 2>&1 | grep -q "$label 已回收进程组全部子孙"
+        return
+    fi
+    docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "grep -q '$label 已回收进程组全部子孙' $C2_MOUNT/logs/scheduler.log" >/dev/null 2>&1
+}
+
+# 发送停止信号并记录结果（动作，非断言）：TERM 用 docker stop -t 30；INT 用 docker kill -s INT，
+# 两者都最多等待 30 秒（与 Compose stop_grace_period 对齐），记录容器是否退出与退出码。
+c2_scene_signal() {
+    local sig=$1 start i running
+    start=$(date +%s)
+    if [[ $sig == INT ]]; then
+        docker kill -s INT "$C2_PROD" >/dev/null 2>&1 || true
+        for i in $(seq 1 60); do
+            running=$(docker inspect -f '{{.State.Running}}' "$C2_PROD" 2>/dev/null) || running=
+            [[ $running != true ]] && break
+            sleep 0.5
+        done
+    else
+        docker stop -t 30 "$C2_PROD" >/dev/null 2>&1 || true
+    fi
+    running=$(docker inspect -f '{{.State.Running}}' "$C2_PROD" 2>/dev/null) || running=
+    printf '%s %s %s\n' "$(( $(date +%s) - start ))" \
+        "$(docker inspect -f '{{.State.ExitCode}}' "$C2_PROD" 2>/dev/null || echo '?')" "$running" \
+        > "$C2_STOP_FILE"
+    return 0
+}
+
+# 把采样日志卷内的时间线读回测试临时目录。
+c2_scene_read_timeline() {
+    docker run --rm -v "$C2_LOG_VOL:$C2_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
+        -c "cat $C2_SAMPLE 2>/dev/null || true" > "$C2_TIMELINE" 2>/dev/null || true
+    return 0
+}
+
+# 解析时间线，输出信号前最后一帧与信号后帧的判定事实：
+#   pre_haspid1 信号前末帧含 PID1；pre_mark 该帧任务标记进程数；pre_deep 其中存在父非 0/1 的多层证据；
+#   post_frames 信号后含 PID1 的帧数；last_post_mark 最后一个含 PID1 帧内的任务标记进程数；
+#   new_after_signal 信号后出现了信号前不存在的任务标记 PID；uid_bad 全时间线存在非 10001 UID。
+c2_scene_analyze() {
+    local facts
+    facts=$(C2_MARKERS="$C2_MARKERS" awk '
+        BEGIN { phase="pre"; pre_haspid1=0; pre_mark=0; pre_deep=0; pre_pids=""; post_frames=0; last_post_mark=-1; new_after=0; uid_bad=0 }
+        /^SIGNAL/ { phase="post"; next }
+        /^S[ ]/ { ts=$2; haspid1=0; nmark=0; deep=0; pids=""; inframe=1; next }
+        /^E$/ {
+            if (inframe) {
+                if (phase=="pre") {
+                    if (haspid1) { pre_haspid1=1; pre_mark=nmark; pre_deep=(deep>0)?1:0; pre_pids=(pre_pids pids) }
+                } else if (haspid1) { post_frames++; last_post_mark=nmark }
+            }
+            inframe=0; next
+        }
+        {
+            if (!inframe) next
+            if ($0 !~ /^[[:space:]]*pid=[0-9]+[[:space:]]/) next
+            line=$0; sub(/^[[:space:]]*/, "", line)
+            split(line, a, " ")
+            pid=a[1]; sub(/^pid=/, "", pid)
+            ppid=a[2]; sub(/^ppid=/, "", ppid)
+            uf=a[4]; sub(/^uid=/, "", uf)
+            if (uf != "10001") uid_bad=1
+            cmd=$0
+            sub(/^[[:space:]]*pid=[0-9]+[[:space:]]+ppid=[0-9]+[[:space:]]+pgid=[0-9]+[[:space:]]+uid=[0-9]+[[:space:]]*/, "", cmd)
+            if (pid == 1) haspid1=1
+            if (cmd ~ ENVIRON["C2_MARKERS"]) {
+                nmark++
+                pids = pids pid ","
+                if (ppid != 0 && ppid != 1) deep++
+                if (phase=="post" && index("," pre_pids, "," pid ",") == 0) new_after=1
+            }
+        }
+        END {
+            printf "pre_haspid1=%d pre_mark=%d pre_deep=%d post_frames=%d last_post_mark=%d new_after_signal=%d uid_bad=%d\n",
+                pre_haspid1, pre_mark, pre_deep, post_frames, last_post_mark, new_after, uid_bad
+        }
+    ' "$C2_TIMELINE")
+    printf '%s\n' "$facts" > "$C2_FACT_FILE"
+    printf '%s\n' "$facts"
+}
+
+# 断言：信号前最后一帧确实存在由多层子孙构成的整棵任务树。
+c2_assert_tree() {
+    local f n
+    f=$(cat "$C2_FACT_FILE" 2>/dev/null)
+    [[ $f == *'pre_haspid1=1'* && $f == *'pre_deep=1'* ]] || return 1
+    n=${f#*pre_mark=}; n=${n%% *}
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    (( n >= 2 ))
+}
+
+# 断言：全时间线每个进程的实际/有效 UID 均为 10001，无一为 root。
+c2_assert_uid_nonroot() {
+    local f n
+    f=$(cat "$C2_FACT_FILE" 2>/dev/null)
+    [[ $f == *'uid_bad=0'* ]] || return 1
+    n=${f#*pre_mark=}; n=${n%% *}
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    (( n >= 1 ))
+}
+
+# 断言：停止在 30 秒宽限期内完成、容器已退出且退出码不是 137（未被 SIGKILL 强杀）。
+c2_assert_bounded() {
+    local elapsed exit running
+    [[ -s $C2_STOP_FILE ]] || return 1
+    read -r elapsed exit running < "$C2_STOP_FILE"
+    [[ $running == false ]] || return 1
+    [[ $exit != 137 ]] || return 1
+    [[ $elapsed =~ ^[0-9]+$ ]] || return 1
+    (( elapsed < 30 ))
+}
+
+# 断言：停止后不再派发新任务——采样中不再出现信号前不存在的任务进程，
+# 且调度日志「开始」条数不增加（无调度日志的场景只核对采样时间线）。
+c2_assert_no_dispatch() {
+    local f before after
+    f=$(cat "$C2_FACT_FILE" 2>/dev/null)
+    [[ $f == *'new_after_signal=0'* ]] || return 1
+    before=$(tr -d '[:space:]' < "$TEST_ROOT/c2-dispatch-before" 2>/dev/null)
+    [[ $before =~ ^[0-9]+$ ]] || return 1
+    after=$(docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "if [ -f $C2_MOUNT/logs/scheduler.log ]; then grep -c '开始' $C2_MOUNT/logs/scheduler.log; else echo absent; fi" 2>/dev/null) || after=
+    after=$(tr -d '[:space:]' <<<"$after")
+    [[ $after != absent ]] || return 0
+    [[ $after =~ ^[0-9]+$ ]] || return 1
+    (( after <= before ))
+}
+
+# 断言：停止前记录到操作锁被持有（同卷新实例不可获取）。
+c2_assert_lock_busy() {
+    [[ $(tr -d '[:space:]' < "$TEST_ROOT/c2-lock-busy" 2>/dev/null) == yes ]]
+}
+
+# 断言：停止后同一命名卷上的新实例可立即获取操作锁（锁随进程退出被释放，非 PID1 退出后清理）。
+c2_assert_lock_free() {
+    local lock
+    lock=$(c2_lock_file_name "$1")
+    docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "flock -n -x $C2_MOUNT/runtime/$lock true" >/dev/null 2>&1
+}
+
+# 执行一场 C-2 场景：夹具 → 产品启动与多层子孙 → 采样 → 停止信号 → 断言。
+c2_run_scenario() {
+    local mode=$1 hang=$2 sig=$3 base
+    base=$FIXTURE_FAILURES
+    C2_READY=0
+    fixture_step "C-2[$mode/$sig] 夹具：隔离网络与快速失败+挂起端点" c2_scene_fixture "$hang"
+    fixture_step "C-2[$mode/$sig] 夹具：产品容器启动并形成多层任务树" c2_scene_start_and_wait "$mode"
+    fixture_step "C-2[$mode/$sig] 夹具：共享 PID 命名空间采样侧车" c2_scene_start_sampler
+    fixture_step "C-2[$mode/$sig] 夹具：采样侧车已记录到 PID1" c2_scene_wait_sampler
+    if [[ $FIXTURE_FAILURES == $base ]]; then C2_READY=1; fi
+    c2_scene_record_prestate "$mode"
+    c2_scene_mark_signal "$sig"
+    c2_scene_signal "$sig"
+    c2_scene_read_timeline
+    printf 'C-2[%s/%s] 采样事实：%s\n' "$mode" "$sig" "$(c2_scene_analyze)"
+    check_c2 "C-2[$mode/$sig] 停止在 30 秒宽限期内完成且未被 SIGKILL" c2_assert_bounded
+    check_c2 "C-2[$mode/$sig] 多层子孙在 PID1 存活期间被回收" c2_assert_reclaimed "$mode"
+    check_c2 "C-2[$mode/$sig] 停止后不再派发新任务" c2_assert_no_dispatch
+    check_c2 "C-2[$mode/$sig] 停止前捕获到多层任务树" c2_assert_tree
+    check_c2 "C-2[$mode/$sig] 全树实际/有效 UID 均为 10001（无 root 业务进程）" c2_assert_uid_nonroot
+    check_c2 "C-2[$mode/$sig] 停止前操作锁被持有" c2_assert_lock_busy
+    check_c2 "C-2[$mode/$sig] 停止后同卷新实例可立即获取操作锁" c2_assert_lock_free "$mode"
+    c2_scene_teardown
+}
+
 # docker 完全不可用（CLI 缺失或守护进程不可达）才整体跳过并返回 77。
 if ! docker_available; then
     printf 'SKIP：docker 不可用，未执行\n'
@@ -1927,7 +2318,7 @@ readiness_assert '就绪判据：同端口非 LISTEN 连接不判为就绪' read
 # 正常启动路径：正式入口在空命名卷上生成配置、初始目录权限正确、进入前台就绪且 daemon 真实监听。
 check '空命名卷正式启动：配置生成、初始目录权限正确且 daemon 真实监听' empty_volume_formal_startup
 
-if [[ $COMPOSE_ENABLED == 1 ]]; then
+if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
     # 后续所有 compose 子命令（ps/logs/down）都需成功渲染镜像引用，故在此统一导出 IMAGE_TAG。
     export IMAGE_TAG=$COMPOSE_TAG
     check 'Compose 为本地镜像附加 registry 标签' compose_tag_local_image
@@ -2043,6 +2434,8 @@ else
     printf '注意：docker compose 不可用，Compose 编排实机检查未执行\n'
 fi
 
+# 隔离夹具组（S7/S8/S10/S9）：设置 IT_FILTER=c2 时跳过，便于只跑 C-2 有界停止场景。
+if [[ $IT_FILTER != c2 ]]; then
 # 场景 S7：隔离 HTTPS 夹具（自定义网络 + github.com DNS 别名 + 测试 CA）下的真实成功同步。
 # 夹具不在生产镜像内；夹具准备/就绪失败记为独立的夹具失败并阻止依赖断言，
 # 依赖断言只在夹具就绪后以真实 Git 客户端与真实网络请求的观察结果判定。
@@ -2120,6 +2513,17 @@ if [[ $FIXTURE_FAILURES == $S9_PROD_BASE ]]; then AUTH_PROD_READY=1; fi
 check_auth_prod '凭据隔离：合成 Token 访问受认证夹具成功' fixture_auth_sync_with_token_succeeds
 check_auth_prod '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
 check_auth_sync '凭据夹具：真实 Git 客户端无凭据访问被拒绝（鉴权非空转）' fixture_auth_requires_token
+fi
+
+# 场景 S11：有界停止（C-2）。首次同步、定时同步、定时 hosts 刷新分别构造可控长进程与多层子孙，
+# 发送 TERM 与 INT；在 PID1 存活期间观察子孙回收、锁释放与不再派发，并核对全树非 root UID。
+# 不依赖 Compose 与 TLS 夹具，只使用命名卷与 Docker 网络；夹具失败只记夹具失败，不冒充断言结果。
+c2_run_scenario firstsync 0 TERM
+c2_run_scenario firstsync 0 INT
+c2_run_scenario timedsync 1 TERM
+c2_run_scenario timedsync 1 INT
+c2_run_scenario timedhosts 1 TERM
+c2_run_scenario timedhosts 1 INT
 
 printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES"
 [[ $FAILURES == 0 && $FIXTURE_FAILURES == 0 ]]

@@ -247,6 +247,59 @@ scheduler_stop_suppresses_due_task() {
     [[ $content == hosts ]]
 }
 
+# 验证任务以独立进程组运行：停止信号按组回收多层子孙（任务脚本与其派生的长眠孙进程都被终止），
+# 且停止后不再派发新任务。仅终止组长会让孙进程滞留，故该用例是进程组回收的回归守卫。
+scheduler_stop_reclaims_task_group() {
+    require_function gm_scheduler_main || return 1
+    local work marker pid gpid index content alive=no
+    work=$(mktemp -d "$ROOT/.scheduler-group.XXXXXX") || return 1
+    marker=$work/marker
+    mkdir -p "$work/run/logs" "$work/install"
+    : > "$marker"
+    # 桩任务：登记后派生一个长眠孙进程再等待；脚本经 setsid 成为独立进程组的组长。
+    printf '#!/usr/bin/env bash\necho hosts >> %q\nsleep 300 &\necho $! > %q\nwait\n' \
+        "$marker" "$work/grandchild" > "$work/install/update-github-hosts.sh"
+    printf '#!/usr/bin/env bash\necho sync >> %q\n' "$marker" > "$work/install/git-mirror-sync.sh"
+    chmod +x "$work/install/update-github-hosts.sh" "$work/install/git-mirror-sync.sh"
+    export RUN_ROOT=$work/run
+    STUB_INSTALL=$work/install
+    gm_prepare_runtime() {
+        INSTALL_ROOT=$STUB_INSTALL
+        declare -gA GM_CONFIG=([ENABLE_CRON]=yes [ENABLE_HOSTS_UPDATE]=yes [CRON_SCHEDULE]='* * * * *' [HOSTS_CRON]='* * * * *')
+        return 0
+    }
+    gm_cron_next_trigger() { printf '1\n'; }
+    gm_scheduler_main >/dev/null 2>&1 &
+    pid=$!
+    for (( index = 0; index < 200; index++ )); do
+        [[ -s $work/grandchild ]] && break
+        sleep 0.05
+    done
+    gpid=$(cat "$work/grandchild" 2>/dev/null) || gpid=
+    if [[ ! $gpid =~ ^[0-9]+$ ]] || ! kill -0 "$gpid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        rm -rf "$work"
+        printf '未观察到任务派生的孙进程\n'
+        return 1
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    for (( index = 0; index < 100; index++ )); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    # 孙进程必须随进程组一起被回收，且不再有第二个任务被启动。
+    for (( index = 0; index < 60; index++ )); do
+        if kill -0 "$gpid" 2>/dev/null; then alive=yes; else alive=no; break; fi
+        sleep 0.05
+    done
+    content=$(cat "$marker")
+    if [[ $alive == yes ]]; then kill -KILL "$gpid" 2>/dev/null || true; fi
+    rm -rf "$work"
+    [[ $alive == no && $content == hosts ]]
+}
+
 # 验证语法合法但永不触发的表达式在启动前校验中明确失败，而合法表达式仍通过。
 scheduler_check_rejects_never_triggering() {
     require_function gm_scheduler_main || return 1
@@ -279,6 +332,7 @@ check 'cron N/step 下次触发时间' cron_next_trigger_step_start
 check 'cron 非法表达式不参与触发计算' cron_next_trigger_rejects
 check '调度开关决定任务集合（ENABLE_CRON/ENABLE_HOSTS_UPDATE）' scheduler_switches
 check '调度停止后不再启动当轮到期任务' scheduler_stop_suppresses_due_task
+check '调度任务按进程组回收多层子孙且停止后不再派发' scheduler_stop_reclaims_task_group
 check '调度启动前校验拦截永不触发的表达式' scheduler_check_rejects_never_triggering
 check '调度器复用既有同步与刷新入口且不新建锁' scheduler_reuses_entrypoints
 check '调度服务定义指向调度脚本并可解析' scheduler_service_definition
