@@ -2,6 +2,8 @@
 
 # 容器前台入口：以非 root 身份完成命名卷内实例初始化，启动常驻服务并监督生命周期。
 # 同步与地址刷新算法全部复用交付脚本，入口只负责编排、前台存活、信号转发与子进程回收。
+# 首次任务以独立进程组（setsid）运行，停止信号按组终止整棵进程树并等待子孙退出，
+# 使回收发生在 PID1 存活期间，而不依赖 PID1 退出后的内核清理。
 # 计划中的入口逻辑说明：一次性工作服务（git-mirror-sync / git-mirror-hosts）经 rc-service 运行后
 # 状态会显示 crashed（退出 32），属既有语义，因此入口只对常驻服务使用 OpenRC 状态，绝不据一次性
 # 工作服务的状态判断成功；跨容器残留运行状态先以 zap 复位再启动，并以真实监听确认存活，
@@ -70,11 +72,28 @@ scheduler_enabled() {
     [[ ${value:-yes} == yes ]]
 }
 
-# 收到停止信号时置位标志并定向终止首次任务与休眠子进程。
+# 等待指定进程组内全部子孙退出；边界内未回收先按组强杀再等一轮。
+# 首次任务可能形成「脚本 → 子 Shell → 传输工具 → 更深子孙」多层进程树，
+# 只终止直接子进程会让子孙滞留到 PID1 退出后被内核清理；此函数确保回收发生在 PID1 存活期间。
+wait_process_group_gone() {
+    local pgid=$1 i
+    for i in $(seq 1 50); do
+        kill -0 -"$pgid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -KILL -"$pgid" 2>/dev/null || true
+    for i in $(seq 1 20); do
+        kill -0 -"$pgid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# 收到停止信号时置位标志，按进程组定向终止首次任务整棵进程树与休眠子进程。
 on_stop_signal() {
     GM_ENTRYPOINT_STOP=1
     if [[ -n ${GM_ENTRYPOINT_TASK-} ]]; then
-        kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        kill -TERM -"$GM_ENTRYPOINT_TASK" 2>/dev/null || kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
     fi
     if [[ -n ${GM_ENTRYPOINT_SLEEP-} ]]; then
         kill -TERM "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
@@ -82,18 +101,26 @@ on_stop_signal() {
     return 0
 }
 
-# 以前台子进程执行首次刷新或首次同步：失败仅告警不终止读取服务，停止信号可中断并回收。
+# 以前台子进程执行首次刷新或首次同步：任务以独立进程组（setsid）启动，停止信号可按组回收整棵树；
+# 失败仅告警不终止读取服务；收到停止后先确认组内子孙真实退出再返回，不把回收推给 PID1 退出后的内核清理。
 run_task_best_effort() {
-    local label=$1 status=0
+    local label=$1 status=0 pgid
     shift
-    "$@" &
+    setsid "$@" &
     GM_ENTRYPOINT_TASK=$!
+    pgid=$GM_ENTRYPOINT_TASK
     wait "$GM_ENTRYPOINT_TASK" || status=$?
-    GM_ENTRYPOINT_TASK=
     if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
+        if wait_process_group_gone "$pgid"; then
+            log "$label 已回收进程组全部子孙"
+        else
+            log "$label 子孙回收超时，已按组强制终止"
+        fi
+        GM_ENTRYPOINT_TASK=
         log "$label 因停止信号中断"
         return 130
     fi
+    GM_ENTRYPOINT_TASK=
     if ((status == 0)); then
         log "$label 完成"
     else
@@ -111,9 +138,13 @@ shutdown_services() {
 }
 
 # 复位实例 OpenRC 用户态常驻服务的残留状态：卷内持久化的“已启动”记录与陈旧 pidfile 不代表真实存活，
-# 新容器内残留活动使 start 被判为“已启动”而跳过真正启动；先 zap 清除状态，使 start 确实拉起服务。
+# 新容器内残留活动使 start 被判为“已启动”而跳过真正启动；先 zap 清除状态，再移除陈旧 pidfile——
+# start-stop-daemon 仅按 pidfile 中 PID 是否存活判断“已在运行”，不校验其可执行文件，
+# 强杀重建后陈旧 PID 被新容器进程复用时会被误判，导致服务无法拉起。
 reset_stale_service_state() {
-    rc-service --user "$1" zap >/dev/null 2>&1 || true
+    local name=$1 pidfile=$RUN_ROOT/runtime/$1.pid
+    rc-service --user "$name" zap >/dev/null 2>&1 || true
+    rm -f -- "$pidfile" 2>/dev/null || true
     return 0
 }
 

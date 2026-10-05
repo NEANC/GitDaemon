@@ -183,18 +183,43 @@ gm_scheduler_sleep_until() {
     done
 }
 
-# 以独立进程组运行既有交付入口；记录结果后继续，单次失败不终止调度循环。
+# 等待任务进程组内全部子孙退出；边界内未回收先按组强杀再等一轮。
+# 任务可能形成多层进程树，仅终止组长会让子孙滞留到容器 PID1 退出后被内核清理，
+# 此函数确保子孙回收发生在调度器（及 PID1）存活期间。
+gm_scheduler_wait_group_gone() {
+    local pgid=$1 i
+    for i in $(seq 1 50); do
+        kill -0 -"$pgid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -KILL -"$pgid" 2>/dev/null || true
+    for i in $(seq 1 20); do
+        kill -0 -"$pgid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# 以独立进程组运行既有交付入口；记录结果后继续，单次失败不终止调度循环；
+# 收到停止信号后按组回收任务整棵进程树并等待子孙退出再返回。
 gm_scheduler_run_task() {
-    local label=$1 script=$2 status=0
+    local label=$1 script=$2 status=0 pgid
     gm_scheduler_log "开始$label：$(basename -- "$script")"
     setsid "$script" &
     GM_SCHEDULER_CHILD=$!
+    pgid=$GM_SCHEDULER_CHILD
     wait "$GM_SCHEDULER_CHILD" || status=$?
-    GM_SCHEDULER_CHILD=
     if (( GM_SCHEDULER_STOP != 0 )); then
+        if gm_scheduler_wait_group_gone "$pgid"; then
+            gm_scheduler_log "$label 已回收进程组全部子孙"
+        else
+            gm_scheduler_log "$label 子孙回收超时，已按组强制终止"
+        fi
+        GM_SCHEDULER_CHILD=
         gm_scheduler_log "$label 因停止信号中断"
         return 1
     fi
+    GM_SCHEDULER_CHILD=
     if (( status == 0 )); then
         gm_scheduler_log "$label 完成"
     else
