@@ -935,6 +935,20 @@ fixture_start_product() {
     return 1
 }
 
+# 容器内自证：产品进程有效 UID 为 10001，且只读根的系统路径写入均失败
+# （不依赖宿主侧 inspect 结论，直接在容器内以真实命令观察）。
+fixture_identity_and_readonly_root() {
+    local out p
+    out=$(docker exec "$FIXTURE_PROD" id -u 2>/dev/null) || return 1
+    [[ $out == 10001 ]] || return 1
+    for p in / /etc /tmp /run /var/log; do
+        if docker exec "$FIXTURE_PROD" sh -c "touch '$p/gm-s7-probe' 2>/dev/null"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 # 在产品容器内以 UID 10001 运行产品同步入口；docker exec 不继承入口导出的环境，故显式传入实例 HOME。
 fixture_exec_sync() {
     local repos=$1
@@ -1003,20 +1017,24 @@ fixture_unexported_rejected() {
 }
 
 # 即使夹具在仓库上设置 daemon.receivepack=true，产品 daemon 仍必须拒绝 push（--forbid-override）。
+# 只把「非零退出且输出含 receive-pack 拒绝文案」判为拒绝成功；连接中断、超时、DNS 失败等
+# 其它非零退出不得冒充拒绝结果。
 fixture_push_rejected() {
+    local out rc=0
     fixture_publish_both_forms || return 1
     docker exec -e "HOME=$FIXTURE_HOME" "$FIXTURE_PROD" sh -c \
         "git --git-dir=$FIXTURE_MOUNT/repos/$FIXTURE_REPO.git config daemon.receivepack true" || return 1
-    docker run --rm --network "container:$FIXTURE_PROD" --user 10001:10001 -e "HOME=$FIXTURE_HOME" \
+    out=$(docker run --rm --network "container:$FIXTURE_PROD" --user 10001:10001 -e "HOME=$FIXTURE_HOME" \
         --entrypoint /bin/sh "$IMAGE" -c '
         set -e
         cd /tmp; rm -rf pushsrc; git init -q pushsrc; cd pushsrc
         git config user.email fixture@example.invalid
         git config user.name fixture
         printf x > f; git add f; git commit -qm c
-        if git push git://127.0.0.1:9418/'"$FIXTURE_REPO"'.git HEAD:refs/heads/gm-push >/dev/null 2>&1; then exit 1; fi
-        exit 0
-    '
+        git push git://127.0.0.1:9418/'"$FIXTURE_REPO"'.git HEAD:refs/heads/gm-push
+    ' 2>&1) || rc=$?
+    [[ $rc != 0 ]] || return 1
+    grep -q 'service not enabled' <<<"$out"
 }
 
 # 重复同步：再次以产品入口同步，要求引用不变且同步日志确有一次新的执行记录。
@@ -1236,7 +1254,8 @@ fixture_step 'TLS 夹具：启动 github.com:443 TLS 上游' \
 fixture_step 'TLS 夹具：上游 HTTPS 就绪探测' fixture_wait_upstream
 fixture_step 'TLS 夹具：把测试 CA 复制进产品卷' fixture_copy_ca
 if [[ $FIXTURE_FAILURES == 0 ]]; then FIXTURE_READY=1; fi
-check_https_sync 'TLS 夹具：正式入口完成首次真实成功同步' fixture_start_product
+check_https_sync 'TLS 夹具：正式入口启动并进入前台就绪' fixture_start_product
+check_https_sync 'TLS 夹具：容器内自证 UID 10001 且只读根拒绝写入' fixture_identity_and_readonly_root
 check_https_sync 'TLS 夹具：首次同步引用、HEAD 与 export-ok 正确' fixture_first_sync_succeeded
 check_https_sync 'TLS 夹具：/repo 与 /repo.git 双形式指向预期提交' fixture_publish_both_forms
 check_https_sync 'TLS 夹具：未带 export-ok 的仓库不可读' fixture_unexported_rejected
