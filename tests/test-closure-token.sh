@@ -2,6 +2,9 @@
 # 验证同步私密凭据通路保存显式环境，隔离 OpenRC 过滤并保持卷配置字节不变。
 set -uo pipefail
 source "$(dirname "$0")/../scripts/lib/foundation.sh"
+# 同步入口在加载时即声明空配置数组（git-mirror-sync.sh），再由 gm_load_config 填充；
+# 直接调用凭据 helper 的夹具须复现该前置状态，否则 nounset 下数组下标按算术求值。
+declare -A GM_CONFIG=()
 [[ $UID != 0 && $EUID != 0 ]] || exit 1
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
