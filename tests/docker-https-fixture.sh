@@ -3,6 +3,9 @@
 # 隔离 HTTPS 测试夹具（测试私有，不进入生产镜像）：在自定义 Docker 网络上以 github.com 网络别名，
 # 用 openssl s_server -WWW 提供 Git dumb HTTP over TLS 的静态上游，并以测试 CA（SAN=github.com）
 # 供测试进程通过 GIT_SSL_CAINFO 信任，使产品保持 URL https://github.com/<owner>/<repo>.git 与 TLS 校验。
+# 夹具只暴露静态 dumb HTTP 资源，无法响应 smart 端点 .../info/refs?service=git-upload-pack；
+# 调用方在客户端设置 GIT_SMART_HTTP=0，让 Git 跳过 smart 探测、直接使用 dumb HTTP。该变量仍被
+# git-remote-http 读取（实测 git 2.54.0 下不设置时 ls-remote 直接失败：info/refs not valid）。
 # 夹具还提供测试私有的 HTTPS CONNECT 代理（TLS 终结 + CONNECT 计数 + 向夹具中继）与需要 HTTP Basic
 # 凭据的认证上游，用于验证代理传输路径、传输顺序与凭据隔离。
 # 所有数据只落在 Docker 命名卷内，不使用 bind、匿名卷、宿主机路径映射或 Docker socket。

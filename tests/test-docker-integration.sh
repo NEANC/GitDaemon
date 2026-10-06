@@ -518,10 +518,12 @@ tz_record_volume_hash() {
 
 # 以正式入口启动 TZ 场景容器：只读根、cap_drop ALL、no-new-privileges、UID10001、仅命名卷。
 # tz 非空时以显式 TZ 环境变量启动；为空时不注入 TZ，使卷内配置层可达。
+# 显式 ENABLE_HOSTS_UPDATE=no 使入口的「首次地址刷新」在读取镜像默认 HOSTS_URL 前即短路返回，
+# 本用例只验证默认 TZ 值，不向真实第三方 CDN 发起请求（不写入 TZ，保持默认时区层验证）。
 tz_start_container() {
     local tz=$1 i
     local -a args=(-d --name "$TZ_CONTAINER" --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 10001:10001 -v "$TZ_VOLUME:$TZ_MOUNT" -e "REPOS=$TEST_REPO")
+        --user 10001:10001 -v "$TZ_VOLUME:$TZ_MOUNT" -e "REPOS=$TEST_REPO" -e ENABLE_HOSTS_UPDATE=no)
     [[ -z $tz ]] || args+=(-e "TZ=$tz")
     docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
     docker run "${args[@]}" "$IMAGE" >/dev/null 2>&1 || return 1
@@ -584,6 +586,14 @@ tz_assert_volume_unchanged() {
     current=$(docker run --rm --user 10001:10001 -v "$volume:$TZ_MOUNT" --entrypoint /bin/sh "$IMAGE" \
         -c "sha256sum $TZ_MOUNT/config/mirror.env" 2>/dev/null | awk '{print $1}') || return 1
     [[ -n $current && -f $out && $current == "$(<"$out")" ]]
+}
+
+# 断言：TZ 默认值场景容器日志不含地址刷新外网行为标记，
+# 证明该用例未向真实第三方 CDN 发起请求（首次地址刷新已被 ENABLE_HOSTS_UPDATE=no 短路）。
+tz_assert_no_outbound_refresh() {
+    local name=$1 log
+    log=$(docker logs "$name" 2>&1) || return 1
+    [[ $log != *'尝试数据源'* && $log != *'地址快照更新成功'* && $log != *'数据源失败'* ]]
 }
 
 # 为本地构建镜像附加 registry 前缀标签，供 compose 引用且无需拉取远端镜像。
@@ -1309,6 +1319,7 @@ fixture_copy_ca() {
 
 # 以正式入口在产品卷上启动隔离同步场景：只读根、UID10001、cap_drop ALL、no-new-privileges、仅命名卷；
 # ENABLE_HOSTS_UPDATE=no 走 system DNS 且不设 PROXY_URL，GIT_SSL_CAINFO 信任测试 CA（TLS 校验保持开启）。
+# 上游为静态 dumb HTTP；以 GIT_SMART_HTTP=0 让 Git 跳过 smart 探测直接走 dumb HTTP（该变量仍被读取）。
 fixture_start_product() {
     local i
     docker rm -f "$FIXTURE_PROD" >/dev/null 2>&1 || true
@@ -2252,7 +2263,7 @@ EOS
     script=${script//__SIGNALFILE__/$C2_SIGNAL_FILE}
     script=${script//__LOCK__/$C2_PROD_MOUNT/runtime/$lock}
     docker run -d --name "$C2_SAMP" --pid "container:$C2_PROD" -v "$C2_LOG_VOL:$C2_MOUNT" \
-        -v "$C2_VOL:$C2_PROD_MOUNT" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
+        -v "$C2_VOL:$C2_PROD_MOUNT:ro" --user 10001:10001 --entrypoint /bin/sh "$IMAGE" \
         -c "$script" >/dev/null 2>&1
 }
 
@@ -2587,6 +2598,7 @@ fixture_step 'TZ[default] 夹具：全新命名卷且不注入 TZ 启动并进�
 TZ_DEF_READY=0
 if [[ $FIXTURE_FAILURES == $TZ_DEF_BASE ]]; then TZ_DEF_READY=1; fi
 check_tz_def 'TZ[default] 全新卷未传 TZ 时默认 Asia/Shanghai（配置入口有效值）' tz_assert_effective Asia/Shanghai "$TZ_CONTAINER"
+check_tz_def 'TZ[default] 首次地址刷新被禁用，未向真实公网发起请求' tz_assert_no_outbound_refresh "$TZ_CONTAINER"
 docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
 docker volume rm -f "$TZ_VOLUME" >/dev/null 2>&1 || true
 
