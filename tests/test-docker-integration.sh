@@ -333,10 +333,19 @@ no_ssh_components() {
         2>/dev/null
 }
 
-# 入口拒绝 UID 0：以 --user 0:0 运行必须非零退出且输出包含 root 拒绝诊断。
+# 入口拒绝 UID 0：在非 root 容器内以 UID 查询测试替身（桩 id 返回 0）驱动正式入口启动路径，
+# 断言身份守卫拒绝并给出 root 诊断。明确：这不是实际 root 容器验证，避免执行越界（真实 root）负例。
 entry_rejects_root() {
-    local output status=0
-    output=$(docker run --rm --user 0:0 "$IMAGE" 2>&1) || status=$?
+    local output status=0 script
+    script=$(cat <<'STUB'
+set -uo pipefail
+id() { echo 0; }
+source /usr/local/bin/git-mirror-entrypoint
+main
+STUB
+)
+    output=$(docker run --rm --user 10001:10001 --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --entrypoint /bin/bash "$IMAGE" -c "$script" 2>&1) || status=$?
     [[ $status != 0 ]] || return 1
     [[ $output == *'禁止以 root'* ]]
 }
@@ -2541,7 +2550,7 @@ check '运行根属主 10001、权限 755' runtime_root_attributes
 check '空命名卷首次挂载后以 10001 可写入' named_volume_writable
 check '运行时依赖命令与 CA/时区文件齐备' runtime_dependencies_present
 check '镜像不含 SSH 组件' no_ssh_components
-check '入口拒绝 UID 0' entry_rejects_root
+check '入口拒绝 UID 0（UID 查询替身，非实际 root 容器）' entry_rejects_root
 
 # 就绪判据：正式入口按内核 LISTEN 状态与本地地址端口判定，同端口非 LISTEN 连接不得算就绪。
 readiness_assert '就绪判据：真实 LISTEN 判定为就绪（正对照）' readiness_positive_control
