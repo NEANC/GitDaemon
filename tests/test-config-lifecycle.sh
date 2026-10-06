@@ -128,6 +128,45 @@ config_unchanged() {
     cmp -s -- "$file" "$file.before"
 }
 
+# 验证显式 TZ 环境变量覆盖卷内时区，且卷内配置逐字节不变。
+config_timezone_environment_override() {
+    require_function gm_load_config || return 1
+    clear_config_environment
+    local file=$TEST_ROOT/timezone-env.conf
+    printf '%s\n' 'TZ=Asia/Shanghai' 'GIT_PORT=12345' > "$file"
+    cp -- "$file" "$file.before" || return 1
+    export TZ=UTC
+    gm_load_config "$file" || return 1
+    [[ ${GM_CONFIG[TZ]} == UTC ]] || return 1
+    cmp -s -- "$file" "$file.before"
+}
+
+# 验证未设置 TZ 时读取卷内值，并在卷内缺失时回退到默认 Asia/Shanghai。
+config_timezone_volume_and_default() {
+    require_function gm_load_config || return 1
+    clear_config_environment
+    local file=$TEST_ROOT/timezone-file.conf
+    printf 'TZ=Asia/Shanghai\n' > "$file"
+    gm_load_config "$file" || return 1
+    [[ ${GM_CONFIG[TZ]} == Asia/Shanghai ]] || return 1
+    rm -f -- "$file"
+    gm_load_config "$file" || return 1
+    [[ ${GM_CONFIG[TZ]} == Asia/Shanghai ]]
+}
+
+# 验证非法 TZ 即使由环境显式给出也必须拒绝，且不触碰卷内字节。
+config_timezone_invalid_rejected() {
+    require_function gm_load_config || return 1
+    clear_config_environment
+    local file=$TEST_ROOT/timezone-invalid.conf output status=0
+    printf 'TZ=Asia/Shanghai\n' > "$file"
+    cp -- "$file" "$file.before" || return 1
+    export TZ=Missing/ClosureTimezone
+    output=$(gm_load_config "$file" 2>&1) || status=$?
+    [[ $status == 1 && $output == 'git-mirror: 有效配置值非法：TZ' ]] || return 1
+    cmp -s -- "$file" "$file.before"
+}
+
 # 验证显式凭据来源写入私密状态，配置卷保持原始字节且状态权限收紧。
 sync_credentials_state_is_private() {
     require_function gm_save_sync_credentials || return 1
@@ -1362,6 +1401,14 @@ negative_assertion_reason_guard() {
                 return 1
             fi
             ;;
+        tz)
+            # 故障注入让配置加载器固定返回卷内值，验证 TZ 优先级断言不会据此误判通过。
+            gm_load_config() { declare -gA GM_CONFIG=([TZ]=Asia/Shanghai); return 0; }
+            if config_timezone_environment_override; then
+                printf 'TZ 优先级断言错误接受了固定卷内值\n'
+                return 1
+            fi
+            ;;
         *) return 1 ;;
     esac
     return 0
@@ -1370,6 +1417,7 @@ negative_assertion_reason_guard() {
 check '负向断言拒绝错误原因：config（故障注入）' negative_assertion_reason_guard config
 check '负向断言拒绝错误原因：repos（故障注入）' negative_assertion_reason_guard repos
 check '负向断言拒绝错误原因：lock（故障注入）' negative_assertion_reason_guard lock
+check '负向断言拒绝错误原因：TZ 优先级（故障注入）' negative_assertion_reason_guard tz
 check '配置保留等号与 cron 原始字符串' config_values
 check '显式环境、文件、默认值优先级及可选空值' config_precedence
 check '重复键拒绝' config_rejected $'GIT_PORT=12345\nGIT_PORT=23456' '配置键重复：GIT_PORT'
@@ -1385,6 +1433,9 @@ check '非 HTTPS 来源拒绝' config_rejected 'HOSTS_URL=http://example.invalid
 check '显式必填空值拒绝' config_empty_required
 check '命令替换与分号绝不执行' config_no_execution
 check '已有配置字节不变' config_unchanged
+check 'TZ 显式环境变量覆盖卷内配置且字节不变' config_timezone_environment_override
+check 'TZ 未设置时读取卷内值、缺失时默认 Asia/Shanghai' config_timezone_volume_and_default
+check 'TZ 非法值拒绝且不触碰卷内字节' config_timezone_invalid_rejected
 check '凭据互斥且诊断不泄漏 Token' config_credentials
 check '合法多仓库及 git/git git 映射预检' repos_valid
 for input in '' 'owner/' '/repo' 'owner/repo/extra' 'owner/repo.git' '../repo' 'git/git;git/git main' 'git/git;' ';git/git' 'git/git;;owner/repo' 'git/git HEAD' 'git/git --help' 'git/git *' 'git/git main,' 'git/git ,main' 'git/git main,,next' 'git/git main,main' 'git/git main..next' 'git/git main #comment' $'git/git\nowner/repo' $'git/git\r'; do

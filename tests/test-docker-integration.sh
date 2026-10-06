@@ -47,6 +47,26 @@ READINESS_PORT=19424
 # 空命名卷正式启动校验使用的独立容器与卷名：检查内自清理，并由全局清理兜底。
 EMPTY_CONTAINER=gm-it-empty-$$
 EMPTY_VOLUME=gm-it-empty-$$-vol
+# 阶段 D：TZ 覆盖与调度生效夹具。同一命名卷写入 TZ=Asia/Shanghai，run `-e TZ=UTC` 与 Compose 环境
+# TZ=UTC 都必须使最终有效值为 UTC；不传 TZ 时读取卷内值，全新卷回退默认 Asia/Shanghai。
+# 固定时间戳 TZ_FIXED_NOW 下，同步表达式与 hosts 表达式的下一次触发按最终有效时区各自独立推出。
+TZ_CONTAINER=gm-it-tz-$$
+TZ_VOLUME=gm-it-tzvol-$$
+TZ_MOUNT=/var/lib/git-daemon
+TZ_CRON_SYNC='0 20 * * *'
+TZ_CRON_HOSTS='15 20 * * *'
+TZ_FIXED_NOW=1700000000
+# 固定时间戳 1700000000 = 2023-11-14T22:13:20Z（同一瞬间 Asia/Shanghai 为 2023-11-15 06:13:20）。
+# 下一次触发按各自墙钟独立推出，两时区相差 8 小时（28800 秒）。
+TZ_SYNC_UTC=1700078400
+TZ_SYNC_SHANGHAI=1700049600
+TZ_HOSTS_UTC=1700079300
+TZ_HOSTS_SHANGHAI=1700050500
+TZ_RUN_READY=0
+TZ_VOL_READY=0
+TZ_DEF_READY=0
+TZ_COMPOSE_READY=0
+TZ_COMPOSE2_READY=0
 # 地址刷新夹具：与目标容器共享网络命名空间的自签名 HTTPS 服务名与端口。
 TLS_FIXTURE_NAME=gm-it-tls-$$
 TLS_FIXTURE_PORT=$((COMPOSE_PORT + 10000))
@@ -187,6 +207,12 @@ cleanup() {
     fi
     if [[ -n ${EMPTY_VOLUME:-} ]]; then
         docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${TZ_CONTAINER:-} ]]; then
+        docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [[ -n ${TZ_VOLUME:-} ]]; then
+        docker volume rm -f "$TZ_VOLUME" >/dev/null 2>&1 || true
     fi
     if [[ -n ${FIXTURE_NAME:-} ]]; then
         docker rm -f "$FIXTURE_NAME" >/dev/null 2>&1 || true
@@ -460,6 +486,97 @@ empty_volume_formal_startup() {
     [[ $ok == 1 ]]
 }
 
+# 阶段 D：在命名卷内写入卷内 TZ=Asia/Shanghai 与固定 cron 表达式（全部以 UID 10001 完成，不以 root 初始化）。
+tz_prepare_volume() {
+    local volume=$1
+    docker volume rm -f "$volume" >/dev/null 2>&1 || true
+    docker volume create "$volume" >/dev/null 2>&1 || return 1
+    printf '%s\n' 'TZ=Asia/Shanghai' 'LISTEN_ADDRESS=0.0.0.0' 'GIT_PORT=9418' \
+        "CRON_SCHEDULE=$TZ_CRON_SYNC" "HOSTS_CRON=$TZ_CRON_HOSTS" \
+        'ENABLE_CRON=no' 'ENABLE_HOSTS_UPDATE=no' | \
+        docker run --rm -i --user 10001:10001 -v "$volume:$TZ_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "umask 022; mkdir -p $TZ_MOUNT/config && cat > $TZ_MOUNT/config/mirror.env"
+}
+
+# 记录命名卷内 mirror.env 的 SHA256，供「卷内配置逐字节不变」断言使用。
+tz_record_volume_hash() {
+    local volume=$1 out=$2 hash
+    hash=$(docker run --rm --user 10001:10001 -v "$volume:$TZ_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "sha256sum $TZ_MOUNT/config/mirror.env" 2>/dev/null | awk '{print $1}') || return 1
+    [[ $hash =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$hash" > "$out"
+}
+
+# 以正式入口启动 TZ 场景容器：只读根、cap_drop ALL、no-new-privileges、UID10001、仅命名卷。
+# tz 非空时以显式 TZ 环境变量启动；为空时不注入 TZ，使卷内配置层可达。
+tz_start_container() {
+    local tz=$1 i
+    local -a args=(-d --name "$TZ_CONTAINER" --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --user 10001:10001 -v "$TZ_VOLUME:$TZ_MOUNT" -e "REPOS=$TEST_REPO")
+    [[ -z $tz ]] || args+=(-e "TZ=$tz")
+    docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
+    docker run "${args[@]}" "$IMAGE" >/dev/null 2>&1 || return 1
+    for i in $(seq 1 120); do
+        if docker logs "$TZ_CONTAINER" 2>&1 | grep -q '容器前台就绪'; then return 0; fi
+        if [[ $(docker inspect -f '{{.State.Running}}' "$TZ_CONTAINER" 2>/dev/null) == false ]]; then break; fi
+        sleep 1
+    done
+    printf 'TZ 场景容器未就绪，日志尾部：\n' >&2
+    docker logs "$TZ_CONTAINER" 2>&1 | tail -n 20 >&2 2>&1 || true
+    return 1
+}
+
+# 夹具动作：全新空命名卷且不注入 TZ 启动，验证默认值层。
+tz_prepare_fresh_volume_then_start() {
+    docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
+    docker volume rm -f "$TZ_VOLUME" >/dev/null 2>&1 || true
+    docker volume create "$TZ_VOLUME" >/dev/null 2>&1 || return 1
+    tz_start_container ''
+}
+
+# 读取容器内交付配置入口解析出的最终有效时区（输出第三行），不只看环境变量本身。
+tz_effective_timezone() {
+    local name=$1
+    docker exec -e HOME=$TZ_MOUNT/home "$name" \
+        /usr/local/lib/git-mirror/git-daemon-config.sh --token-state=empty 2>/dev/null | sed -n '3p'
+}
+
+# 用容器内真实调度器库计算同步与 hosts 的下一次触发：经交付入口校验实例配置后，
+# gm_prepare_runtime 导出的 TZ 即调度时钟来源，再按固定时间戳取两类调度的下一次触发。
+tz_scheduler_next_triggers() {
+    local name=$1
+    docker exec -e HOME=$TZ_MOUNT/home "$name" bash -c '
+        set -u
+        export RUN_ROOT='"$TZ_MOUNT"' INSTALL_ROOT=/usr/local/lib/git-mirror
+        source "$INSTALL_ROOT/git-mirror-scheduler.sh" || exit 1
+        gm_prepare_runtime "$RUN_ROOT" "$INSTALL_ROOT" || exit 1
+        printf "TZ=%s sync=%s hosts=%s" "$TZ" \
+            "$(gm_cron_next_trigger "${GM_CONFIG[CRON_SCHEDULE]}" '"$TZ_FIXED_NOW"')" \
+            "$(gm_cron_next_trigger "${GM_CONFIG[HOSTS_CRON]}" '"$TZ_FIXED_NOW"')"
+    ' 2>/dev/null
+}
+
+# 断言：容器内交付配置入口解析出的最终有效时区等于期望值。
+tz_assert_effective() {
+    local expected=$1 name=$2
+    [[ $(tz_effective_timezone "$name") == "$expected" ]]
+}
+
+# 断言：容器内调度器按最终有效时区计算同步与 hosts 的下一次触发。
+tz_assert_scheduler() {
+    local expected_zone=$1 expected_sync=$2 expected_hosts=$3 name=$4 actual
+    actual=$(tz_scheduler_next_triggers "$name") || return 1
+    [[ $actual == "TZ=$expected_zone sync=$expected_sync hosts=$expected_hosts" ]]
+}
+
+# 断言：卷内 mirror.env 摘要与记录一致（逐字节不变），而非只看进程内变量。
+tz_assert_volume_unchanged() {
+    local volume=$1 out=$2 current
+    current=$(docker run --rm --user 10001:10001 -v "$volume:$TZ_MOUNT" --entrypoint /bin/sh "$IMAGE" \
+        -c "sha256sum $TZ_MOUNT/config/mirror.env" 2>/dev/null | awk '{print $1}') || return 1
+    [[ -n $current && -f $out && $current == "$(<"$out")" ]]
+}
+
 # 为本地构建镜像附加 registry 前缀标签，供 compose 引用且无需拉取远端镜像。
 compose_tag_local_image() {
     docker tag "$IMAGE" "$COMPOSE_IMAGE" 2>/dev/null
@@ -495,13 +612,13 @@ compose_prepare_publish_volume() {
         -c 'mkdir -p /var/lib/git-daemon/config && printf "%s\n" "LISTEN_ADDRESS=0.0.0.0" "GIT_PORT=9418" > /var/lib/git-daemon/config/mirror.env'
 }
 
-# 以当前 COMPOSE_ENV 编排启动/重建一次；宿主机未在 COMPOSE_ENV 中显式给出 GIT_PORT/LISTEN_ADDRESS 时
-# 清空这两个变量，使容器回退到卷内配置（验证卷内配置层可达）；显式给出时以环境变量优先。
+# 以当前 COMPOSE_ENV 编排启动/重建一次；宿主机未在 COMPOSE_ENV 中显式给出 GIT_PORT/LISTEN_ADDRESS/TZ 时
+# 清空这三个变量，使容器回退到卷内配置（验证卷内配置层可达且断言不依赖宿主时区）；显式给出时以环境变量优先。
 compose_up() {
     local log=$TEST_ROOT/compose-up.log status=0
     (
         export IMAGE_TAG="$COMPOSE_TAG" PUBLISHED_PORT="$COMPOSE_PORT"
-        unset GIT_PORT LISTEN_ADDRESS
+        unset GIT_PORT LISTEN_ADDRESS TZ
         if [[ ${#COMPOSE_ENV[@]} -gt 0 ]]; then export "${COMPOSE_ENV[@]}"; fi
         compose up -d --force-recreate
     ) >"$log" 2>&1 || status=$?
@@ -1142,6 +1259,12 @@ check_proxy_sync() { check_gated PROXY_READY "$@"; }
 check_auth_sync() { check_gated AUTH_READY "$@"; }
 check_auth_prod() { check_gated AUTH_PROD_READY "$@"; }
 check_hosts_content() { check_gated HOSTS_READY "$@"; }
+# 阶段 D 各夹具组的独立就绪标志：任一组夹具不可用只记夹具失败并阻止其依赖断言。
+check_tz_run() { check_gated TZ_RUN_READY "$@"; }
+check_tz_vol() { check_gated TZ_VOL_READY "$@"; }
+check_tz_def() { check_gated TZ_DEF_READY "$@"; }
+check_tz_compose() { check_gated TZ_COMPOSE_READY "$@"; }
+check_tz_compose2() { check_gated TZ_COMPOSE2_READY "$@"; }
 
 # 创建夹具所需的自定义网络与两个命名卷（上游资产卷、产品运行卷），不使用 bind 或宿主机路径。
 fixture_create_network_and_volumes() {
@@ -2427,6 +2550,37 @@ readiness_assert '就绪判据：同端口非 LISTEN 连接不判为就绪' read
 # 正常启动路径：正式入口在空命名卷上生成配置、初始目录权限正确、进入前台就绪且 daemon 真实监听。
 check '空命名卷正式启动：配置生成、初始目录权限正确且 daemon 真实监听' empty_volume_formal_startup
 
+# 阶段 D（run 场景，仅需 Docker）：同一命名卷写入 TZ=Asia/Shanghai，run `-e TZ=UTC` 必须使最终有效值为
+# UTC、两类调度按 UTC 计算且卷内配置不变；不传 TZ 时读取卷内值；全新卷回退默认 Asia/Shanghai。
+# 夹具失败独立计数并 gate 依赖断言，不把连接或启动错误当作时区断言结果。
+TZ_RUN_BASE=$FIXTURE_FAILURES
+fixture_step 'TZ[run] 夹具：卷内写入 TZ=Asia/Shanghai 与固定 cron' tz_prepare_volume "$TZ_VOLUME"
+fixture_step 'TZ[run] 夹具：记录卷内配置摘要' tz_record_volume_hash "$TZ_VOLUME" "$TEST_ROOT/tz-run-hash"
+fixture_step 'TZ[run] 夹具：以 -e TZ=UTC 启动正式入口并进入就绪' tz_start_container UTC
+TZ_RUN_READY=0
+if [[ $FIXTURE_FAILURES == $TZ_RUN_BASE ]]; then TZ_RUN_READY=1; fi
+check_tz_run 'TZ[run] -e TZ=UTC 覆盖卷内 Asia/Shanghai（配置入口有效值）' tz_assert_effective UTC "$TZ_CONTAINER"
+check_tz_run 'TZ[run] 调度器按最终有效时区 UTC 计算同步与 hosts 触发' \
+    tz_assert_scheduler UTC "$TZ_SYNC_UTC" "$TZ_HOSTS_UTC" "$TZ_CONTAINER"
+check_tz_run 'TZ[run] 卷内配置逐字节不变' tz_assert_volume_unchanged "$TZ_VOLUME" "$TEST_ROOT/tz-run-hash"
+
+TZ_VOL_BASE=$FIXTURE_FAILURES
+fixture_step 'TZ[volume] 夹具：不注入 TZ 启动正式入口并进入就绪' tz_start_container ''
+TZ_VOL_READY=0
+if [[ $FIXTURE_FAILURES == $TZ_VOL_BASE ]]; then TZ_VOL_READY=1; fi
+check_tz_vol 'TZ[volume] 未传 TZ 时读取卷内 Asia/Shanghai（配置入口有效值）' tz_assert_effective Asia/Shanghai "$TZ_CONTAINER"
+check_tz_vol 'TZ[volume] 调度器按卷内 Asia/Shanghai 计算同步与 hosts 触发' \
+    tz_assert_scheduler Asia/Shanghai "$TZ_SYNC_SHANGHAI" "$TZ_HOSTS_SHANGHAI" "$TZ_CONTAINER"
+check_tz_vol 'TZ[volume] 卷内配置逐字节不变' tz_assert_volume_unchanged "$TZ_VOLUME" "$TEST_ROOT/tz-run-hash"
+
+TZ_DEF_BASE=$FIXTURE_FAILURES
+fixture_step 'TZ[default] 夹具：全新命名卷且不注入 TZ 启动并进入就绪' tz_prepare_fresh_volume_then_start
+TZ_DEF_READY=0
+if [[ $FIXTURE_FAILURES == $TZ_DEF_BASE ]]; then TZ_DEF_READY=1; fi
+check_tz_def 'TZ[default] 全新卷未传 TZ 时默认 Asia/Shanghai（配置入口有效值）' tz_assert_effective Asia/Shanghai "$TZ_CONTAINER"
+docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
+docker volume rm -f "$TZ_VOLUME" >/dev/null 2>&1 || true
+
 if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
     # 后续所有 compose 子命令（ps/logs/down）都需成功渲染镜像引用，故在此统一导出 IMAGE_TAG。
     export IMAGE_TAG=$COMPOSE_TAG
@@ -2458,6 +2612,39 @@ if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
     check 'Compose 环境变量覆盖场景就绪' compose_wait_running
     check '显式环境变量覆盖卷内配置（配置入口）' compose_env_overrides_volume_config
     check '显式环境变量覆盖卷内配置（真实监听）' compose_daemon_listens_from_env
+    compose_remove_container
+
+    # 场景 S0c：Compose 环境 TZ 覆盖卷内 TZ（run 路径的编排等价物）。卷内写入 TZ=Asia/Shanghai，
+    # 环境 TZ=UTC 时容器最终有效值必须为 UTC 且两类调度按 UTC 计算；不注入 TZ 时读取卷内 Asia/Shanghai。
+    # 卷内配置逐字节不变；夹具失败独立计数并 gate 依赖断言。
+    TZ_COMPOSE_BASE=$FIXTURE_FAILURES
+    fixture_step 'TZ[compose] 夹具：卷内写入 TZ=Asia/Shanghai 与固定 cron' tz_prepare_volume "$COMPOSE_VOLUME"
+    fixture_step 'TZ[compose] 夹具：记录卷内配置摘要' tz_record_volume_hash "$COMPOSE_VOLUME" "$TEST_ROOT/tz-compose-hash"
+    COMPOSE_ENV=("REPOS=$TEST_REPO" "TZ=UTC")
+    fixture_step 'TZ[compose] 夹具：环境 TZ=UTC 编排启动' compose_up
+    fixture_step 'TZ[compose] 夹具：环境 TZ=UTC 场景就绪' compose_wait_running
+    TZ_COMPOSE_READY=0
+    if [[ $FIXTURE_FAILURES == $TZ_COMPOSE_BASE ]]; then TZ_COMPOSE_READY=1; fi
+    check_tz_compose 'TZ[compose] 环境 TZ=UTC 覆盖卷内 Asia/Shanghai（配置入口有效值）' \
+        tz_assert_effective UTC "$(compose_container_id)"
+    check_tz_compose 'TZ[compose] 调度器按环境最终有效时区 UTC 计算同步与 hosts 触发' \
+        tz_assert_scheduler UTC "$TZ_SYNC_UTC" "$TZ_HOSTS_UTC" "$(compose_container_id)"
+    check_tz_compose 'TZ[compose] 卷内配置逐字节不变' \
+        tz_assert_volume_unchanged "$COMPOSE_VOLUME" "$TEST_ROOT/tz-compose-hash"
+    compose_remove_container
+
+    TZ_COMPOSE2_BASE=$FIXTURE_FAILURES
+    COMPOSE_ENV=("REPOS=$TEST_REPO")
+    fixture_step 'TZ[compose] 夹具：不注入 TZ 编排启动' compose_up
+    fixture_step 'TZ[compose] 夹具：不注入 TZ 场景就绪' compose_wait_running
+    TZ_COMPOSE2_READY=0
+    if [[ $FIXTURE_FAILURES == $TZ_COMPOSE2_BASE ]]; then TZ_COMPOSE2_READY=1; fi
+    check_tz_compose2 'TZ[compose] 未注入 TZ 时读取卷内 Asia/Shanghai（配置入口有效值）' \
+        tz_assert_effective Asia/Shanghai "$(compose_container_id)"
+    check_tz_compose2 'TZ[compose] 调度器按卷内 Asia/Shanghai 计算同步与 hosts 触发' \
+        tz_assert_scheduler Asia/Shanghai "$TZ_SYNC_SHANGHAI" "$TZ_HOSTS_SHANGHAI" "$(compose_container_id)"
+    check_tz_compose2 'TZ[compose] 无 TZ 时卷内配置逐字节不变' \
+        tz_assert_volume_unchanged "$COMPOSE_VOLUME" "$TEST_ROOT/tz-compose-hash"
     compose_remove_container
 
     # 场景 S1：运行期只读根与全进程非 root、实例数据落卷、发布边界、失败保留、数据重建保留。
