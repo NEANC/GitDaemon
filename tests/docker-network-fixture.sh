@@ -142,6 +142,7 @@ assert_product_egress() {
     DNS_GENERATION=''
     printf 'PRODUCT_GENERATION=%s ID=%s\n' "$generation" "$id"
     assert_container_network_policy "$id" || return $?
+    id=$(docker inspect -f '{{.Id}}' "$id") || return $?
     address=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$id") || return $?
     [[ $address == 172.30.243.4 && ${DNS_CALIBRATED:-0} == 1 ]] || return 1
     for spec in 'cross-network 172.30.244.53:19419' 'host-published 172.30.243.1:49382' 'host-input 172.30.243.1:49383'; do

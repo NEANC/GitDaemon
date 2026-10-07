@@ -172,7 +172,8 @@ contract_case() {
             docker() {
                 case "$*" in
                     *'.IPAddress'*) printf '%s' "$product_address" ;;
-                    *'.HostConfig.NetworkMode'*) printf 'container:product 10001:10001' ;;
+                    *'.HostConfig.NetworkMode'*) printf 'container:product-id 10001:10001' ;;
+                    *'.Id'*product) printf 'product-id' ;;
                     *'.Id'*) printf 'tool' ;;
                     *'id -ru'*) printf '10001 10001' ;;
                 esac
