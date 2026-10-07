@@ -40,9 +40,42 @@ guard_gm() {
     printf 'SU_EXIT=%s\n' "$rc" >> "$E/su-status.log"
     return "$rc"
 }
+# 为本次失败生成独立恢复脚本；先成功清空标签资源，再撤销当前精确规则。
+guard_write_recovery() {
+    {
+        printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+        printf 'RUN=%q\nRUNNER=%q\n' "$RUN" "$RUNNER"
+        declare -p OWN_RULES OWN_CHAINS
+        declare -f guard_remove_rules
+        cat <<'RECOVERY'
+# 管理员须先确认本轮 runner 已停止，再显式授权恢复。
+[[ ${1:-} == --runner-stopped ]] || exit 64
+[[ $(id -u) == 0 ]] || exit 77
+# 通过普通宿主用户删除每个重新枚举到的精确对象。
+recover_remove() {
+    local command
+    printf -v command '%q ' docker "$@"
+    su -s /bin/bash "$RUNNER" -c "$command"
+}
+ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN")
+for item in $ids; do recover_remove rm -f "$item"; done
+for kind in network volume; do
+    ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN")
+    for item in $ids; do recover_remove "$kind" rm "$item"; done
+done
+ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN")
+[[ -z $ids ]]
+for kind in network volume; do
+    ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN")
+    [[ -z $ids ]]
+done
+guard_remove_rules
+RECOVERY
+    } > "$E/recover.sh"
+}
 # 清理前先保存输入关联的容器状态、日志与规则计数。
 guard_cleanup() {
-    local primary=$? clean=0 item
+    local primary=$? clean=0 item ids kind residual isolated=1
     trap - EXIT TERM INT
     set +e
     if [[ -n ${CHILD:-} ]]; then
@@ -53,19 +86,34 @@ guard_cleanup() {
         fi
         wait "$CHILD"; printf 'CLEANUP_CHILD_WAIT_EXIT=%s\n' "$?" >> "$E/exit-status.txt"
     fi
-    iptables-save -c > "$E/rules-before-cleanup.txt"
-    for item in $(docker ps -aq --filter "label=gitdaemon.run=$RUN"); do
-        docker inspect "$item" > "$E/inspect-$item.json"
-        docker logs "$item" > "$E/container-$item.log" 2>&1
-        guard_gm docker rm -f "$item" || clean=2
+    iptables-save -c > "$E/rules-before-cleanup.txt" || clean=2
+    ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+    for item in $ids; do
+        docker inspect "$item" > "$E/inspect-$item.json" || clean=2
+        docker logs "$item" > "$E/container-$item.log" 2>&1 || clean=2
+        guard_gm docker rm -f "$item" || { clean=2; isolated=0; }
     done
-    for item in $(docker network ls -q --filter "label=gitdaemon.run=$RUN"); do guard_gm docker network rm "$item" || clean=2; done
-    for item in $(docker volume ls -q --filter "label=gitdaemon.run=$RUN"); do guard_gm docker volume rm "$item" || clean=2; done
-    guard_remove_rules || clean=2
-    iptables-save -c > "$E/rules-after-cleanup.txt"
-    docker ps -a --filter "label=gitdaemon.run=$RUN" > "$E/residual-containers.txt"
-    docker network ls --filter "label=gitdaemon.run=$RUN" > "$E/residual-networks.txt"
-    docker volume ls --filter "label=gitdaemon.run=$RUN" > "$E/residual-volumes.txt"
+    for kind in network volume; do
+        ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+        for item in $ids; do
+            guard_gm docker "$kind" rm "$item" || { clean=2; isolated=0; }
+        done
+    done
+    residual=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+    printf '%s\n' "$residual" > "$E/residual-containers.txt"
+    [[ -z $residual ]] || { clean=2; isolated=0; }
+    for kind in network volume; do
+        residual=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+        printf '%s\n' "$residual" > "$E/residual-${kind}s.txt"
+        [[ -z $residual ]] || { clean=2; isolated=0; }
+    done
+    if (( isolated )); then
+        guard_remove_rules || clean=2
+    else
+        printf 'ISOLATION_RETAINED=1\nRUN=%s\nRecovery: confirm runner stopped, then run bash recover.sh --runner-stopped as the authorized host administrator. The script re-queries only label gitdaemon.run=%s and requires empty resources before reversing the embedded active rule/chain manifest. Never flush global tables.\n' "$RUN" "$RUN" >> "$E/recovery.txt"
+        guard_write_recovery || clean=2
+    fi
+    iptables-save -c > "$E/rules-after-cleanup.txt" || clean=2
     printf 'PRIMARY_EXIT=%s\nCLEANUP_EXIT=%s\n' "$primary" "$clean" >> "$E/exit-status.txt"
     exit "$(guard_result "$primary" "$clean")"
 }
