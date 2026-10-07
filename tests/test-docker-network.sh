@@ -22,7 +22,7 @@ contract_guard_driver() {
     }
     iptables-save() { return 0; }
     iptables() { printf '%s\n' "$*" >> "$SCRATCH/rules"; }
-    su() { sleep 0.1; bash -c "${@: -1}"; }
+    su() { sleep 0.1; bash -c 'id() { printf "10001\n"; }; export -f id; eval "$1"' _ "${@: -1}"; }
     setsid() { "$@"; }
     export -f docker su
     local driver_pid=$BASHPID injected=0
