@@ -65,24 +65,73 @@ network_fixture_stop() {
     for id in $ids; do docker stop -t 1 "$id" || status=1; done
     return "$status"
 }
-# 从外层原始快照读取限定源目的规则的单条计数。
+# 校验完整五条精确 DROP 键后读取指定计数，拒绝缺失或重复证据。
 network_count() {
-    awk -v tag="$IT_RUN_ID-$2" 'index($0,"--comment " tag " ") && /-j DROP/ {split($1,a,":");gsub(/\[/,"",a[1]);print a[1];n++} END{if(n!=1)exit 1}' "$IT_EVIDENCE_DIR/snapshot-$1.rules"
+    awk -v run="$IT_RUN_ID" -v wanted="$2" '
+    BEGIN {
+        split("cross-network host-published host-input dns-udp dns-tcp", keys, " ")
+        split("172.30.244.53 172.30.243.1 172.30.243.1 172.30.244.53 172.30.244.53", dst, " ")
+        split("tcp tcp tcp udp tcp", proto, " "); split("19419 49382 49383 53 53", port, " ")
+    }
+    /--comment/ {
+        tag=""; source=""; target=""; protocol=""; dport=""; action=""; chain=""
+        for(i=2;i<NF;i++) {
+            if($i=="--comment"){tag=$(i+1);gsub(/"/,"",tag)}
+            if($i=="-s")source=$(i+1); if($i=="-d")target=$(i+1)
+            if($i=="-p")protocol=$(i+1); if($i=="--dport")dport=$(i+1)
+            if($i=="-j")action=$(i+1); if($i=="-A")chain=$(i+1)
+        }
+        for(k=1;k<=5;k++)if(tag==run "-" keys[k]) {
+            seen[k]++
+            if($1!~/^\[[0-9]+:[0-9]+\]$/ || source!="172.30.243.4/32" || target!=dst[k] "/32" || protocol!=proto[k] || dport!=port[k] || action!="DROP" || chain!="E" run)bad=1
+            split($1,a,":");gsub(/\[/,"",a[1]);counts[k]=a[1]
+        }
+    }
+    END {
+        for(k=1;k<=5;k++){if(seen[k]!=1)bad=1;if(keys[k]==wanted)value=counts[k]}
+        if(bad || value=="")exit 1; print value
+    }' "$IT_EVIDENCE_DIR/snapshot-$1.rules"
 }
-# 接收端协议向量独立于宿主 DROP 计数。
+# 接收端恰好三个协议端口键，输出固定顺序且只接受非负整数。
 network_witness() {
-    awk '$3=="RETURN" {print $1}' "$IT_EVIDENCE_DIR/snapshot-$1.witness"
+    awk '
+    $3=="RETURN" {
+        key=$4 ":" $11; n++
+        if($1!~/^[0-9]+$/ || $2!~/^[0-9]+$/ || $10!=$4 || $8!="0.0.0.0/0" || $9!="0.0.0.0/0" || (key!="tcp:dpt:19419" && key!="udp:dpt:53" && key!="tcp:dpt:53"))bad=1
+        seen[key]++; count[key]=$1
+    }
+    END {
+        if(bad || n!=3 || seen["tcp:dpt:19419"]!=1 || seen["udp:dpt:53"]!=1 || seen["tcp:dpt:53"]!=1)exit 1
+        print count["tcp:dpt:19419"];print count["udp:dpt:53"];print count["tcp:dpt:53"]
+    }' "$IT_EVIDENCE_DIR/snapshot-$1.witness"
+}
+# 校准仅允许当前 DNS 协议增长，其他见证项必须不变。
+network_witness_delta() {
+    local before=$1 after=$2 proto=$3
+    awk -v before="$before" -v after="$after" -v proto="$proto" 'BEGIN {
+        if(split(before,b,"\n")!=3 || split(after,a,"\n")!=3 || (proto!="udp" && proto!="tcp"))exit 1
+        target=(proto=="udp"?2:3)
+        for(i=1;i<=3;i++) {
+            if(b[i]!~/^[0-9]+$/ || a[i]!~/^[0-9]+$/)exit 1
+            if(i==target){if(a[i]+0<=b[i]+0)exit 1}else if(a[i]!=b[i])exit 1
+        }
+    }'
 }
 # 每次请求比较目标 DROP 增量和接收端零增量，保留原始退出状态。
 network_negative() {
-    local label=$1 before after rc=0 key; shift
+    local label=$1 before after rc=0 key wb wa cb ca; shift
     network_control snapshot || return $?; before=$CONTROL_SEQ
     "$@" || rc=$?
     network_control snapshot || return $?; after=$CONTROL_SEQ
     printf 'NEGATIVE=%s EXIT=%s BEFORE=%s AFTER=%s\n' "$label" "$rc" "$before" "$after"
-    [[ $rc != 0 && $(network_count "$after" "$label") -gt $(network_count "$before" "$label") && $(network_witness "$before") == "$(network_witness "$after")" ]] || return 1
+    wb=$(network_witness "$before") || return $?
+    wa=$(network_witness "$after") || return $?
+    [[ $rc != 0 && $wb == "$wa" ]] || return 1
     for key in cross-network host-published host-input dns-udp dns-tcp; do
-        if [[ $key != "$label" ]]; then [[ $(network_count "$before" "$key") == "$(network_count "$after" "$key")" ]] || return 1; fi
+        cb=$(network_count "$before" "$key") || return $?
+        ca=$(network_count "$after" "$key") || return $?
+        if [[ $key == "$label" ]]; then [[ $ca -gt $cb ]] || return 1
+        else [[ $cb == "$ca" ]] || return 1; fi
     done
 }
 # 产品内 curl 逐个验证三个受控目的；不向真实公网发送探测。
@@ -97,14 +146,18 @@ assert_product_egress() {
 }
 # 校准两协议见证，包括健康负对照；结束撤销通路，产品尚未启动。
 assert_dns_witness() {
-    local generation=$1 proto before after result rc=0 prefix=gm-$IT_RUN_ID
+    local generation=$1 proto before after result rc=0 prefix=gm-$IT_RUN_ID wb wa protocol
     for proto in +notcp +tcp; do
         network_control snapshot || return $?; before=$CONTROL_SEQ
         result=$(docker exec "$prefix-client" dig +time=1 +tries=1 "$proto" @172.30.244.53 "$IT_RUN_ID-$generation-positive.invalid" A) || return $?
         network_control snapshot || return $?; after=$CONTROL_SEQ
         printf '%s\n' "$result"
-        [[ $result == *'status: NXDOMAIN'* && $(network_witness "$before") != "$(network_witness "$after")" ]] || return 1
-        rc=0; [[ $(network_witness "$before") == "$(network_witness "$after")" ]] || rc=$?
+        [[ $result == *'status: NXDOMAIN'* ]] || return 1
+        wb=$(network_witness "$before") || return $?
+        wa=$(network_witness "$after") || return $?
+        protocol=udp; [[ $proto != +tcp ]] || protocol=tcp
+        network_witness_delta "$wb" "$wa" "$protocol" || return $?
+        rc=0; [[ $wb == "$wa" ]] || rc=$?
         [[ $rc == 1 ]] || return 1
         printf 'ZERO_INCREMENT_CONTROL_EXIT=%s PROTOCOL=%s\n' "$rc" "$proto"
     done

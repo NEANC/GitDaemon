@@ -5,7 +5,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -103,6 +103,53 @@ contract_case() {
                     done
                 done
             done
+            ;;
+        counter_evidence_rejects_invalid)
+            local IT_EVIDENCE_DIR IT_RUN_ID=counttest fault file actual spec label dest proto port count
+            IT_EVIDENCE_DIR=$(mktemp -d)
+            for fault in missing empty duplicate protocol integer negative; do
+                file=$IT_EVIDENCE_DIR/snapshot-1.witness
+                rm -f "$file"
+                if [[ $fault != missing ]]; then
+                    : > "$file"
+                    if [[ $fault != empty ]]; then
+                        for spec in 'tcp 19419' 'udp 53' 'tcp 53'; do
+                            read -r proto port <<< "$spec"; count=0
+                            [[ $fault != protocol ]] || proto=icmp
+                            [[ $fault != integer ]] || count=1.5
+                            [[ $fault != negative ]] || count=-1
+                            printf '%s 0 RETURN %s -- * * 0.0.0.0/0 0.0.0.0/0 %s dpt:%s\n' "$count" "$proto" "$proto" "$port" >> "$file"
+                        done
+                        [[ $fault != duplicate ]] || printf '0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n' >> "$file"
+                    fi
+                fi
+                actual=0; network_witness 1 >/dev/null 2>&1 || actual=$?
+                [[ $actual != 0 ]] || { printf 'witness accepted %s\n' "$fault"; return 1; }
+            done
+            for fault in missing empty duplicate protocol integer negative; do
+                file=$IT_EVIDENCE_DIR/snapshot-1.rules
+                rm -f "$file"
+                if [[ $fault != missing ]]; then
+                    : > "$file"
+                    if [[ $fault != empty ]]; then
+                        for spec in 'cross-network 172.30.244.53 tcp 19419' 'host-published 172.30.243.1 tcp 49382' 'host-input 172.30.243.1 tcp 49383' 'dns-udp 172.30.244.53 udp 53' 'dns-tcp 172.30.244.53 tcp 53'; do
+                            read -r label dest proto port <<< "$spec"; count=0
+                            [[ $fault != protocol ]] || proto=icmp
+                            [[ $fault != integer ]] || count=1.5
+                            [[ $fault != negative ]] || count=-1
+                            printf '[%s:0] -A Ecounttest -s 172.30.243.4/32 -d %s/32 -p %s -m %s --dport %s -m comment --comment counttest-%s -j DROP\n' "$count" "$dest" "$proto" "$proto" "$port" "$label" >> "$file"
+                        done
+                        [[ $fault != duplicate ]] || printf '[0:0] -A Ecounttest -s 172.30.243.4/32 -d 172.30.244.53/32 -p tcp -m tcp --dport 19419 -m comment --comment counttest-cross-network -j DROP\n' >> "$file"
+                    fi
+                fi
+                actual=0; network_count 1 cross-network >/dev/null 2>&1 || actual=$?
+                [[ $actual != 0 ]] || { printf 'drop accepted %s\n' "$fault"; return 1; }
+            done
+            network_witness_delta $'0\n0\n0' $'0\n1\n0' udp || return 1
+            network_witness_delta $'0\n0\n0' $'0\n0\n1' tcp || return 1
+            network_witness_delta $'0\n0\n0' $'0\n0\n1' udp && return 1
+            network_witness_delta $'0\n0\n0' $'0\n1\n1' udp && return 1
+            rm -rf "$IT_EVIDENCE_DIR"
             ;;
         conditional_library_failure_stops)
             local fault actual scratch IT_RUN_ID=conditional IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE=tools IT_NETWORK_GUARD_READY=1
