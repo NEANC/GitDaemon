@@ -218,6 +218,21 @@ printf "r2-tls-ok\n" > index.html
     network_run -d --name "$prefix-tls" --network "$IT_NETWORK" --network-alias github.com "${NETSAFE[@]}" --dns "$IT_DNS_IP" -v "$prefix-tls:/var/lib/git-daemon:ro" --entrypoint sh "$IT_PRODUCT_IMAGE" -c 'cd /var/lib/git-daemon; exec openssl s_server -quiet -accept 443 -cert server.crt -key server.key -WWW'
     network_run -d --name "$prefix-product" --network "$IT_NETWORK" --ip 172.30.243.4 "${NETSAFE[@]}" --dns "$IT_DNS_IP" -p 127.0.0.1:49383:19419 -v "$prefix-data:/var/lib/git-daemon" -v "$prefix-ca:/ca:ro" --entrypoint sh "$IT_PRODUCT_IMAGE" -c 'exec busybox nc -lk -p 19419 -e /bin/cat'
 }
+# 发布端口管线立即保存各成员状态，回显成功不能覆盖 timeout 失败。
+network_published_check() {
+    local result status rc=0
+    local -a statuses
+    if printf 'r2-published\n' | timeout 3 nc -w 1 127.0.0.1 49383 > "$IT_EVIDENCE_DIR/control/published.txt"; then
+        statuses=("${PIPESTATUS[@]}")
+    else
+        statuses=("${PIPESTATUS[@]}")
+    fi
+    printf 'PUBLISHED_PIPESTATUS=%s\n' "${statuses[*]}" >> "$IT_EVIDENCE_DIR/control/pipeline-status.txt"
+    for status in "${statuses[@]}"; do if (( status != 0 )); then rc=$status; fi; done
+    (( rc == 0 )) || return "$rc"
+    result=$(cat "$IT_EVIDENCE_DIR/control/published.txt") || return $?
+    [[ $result == r2-published ]]
+}
 # 探针仅验证网络能力，不冒称 O1/full 生命周期已接入。
 network_probe() {
     local prefix=gm-$IT_RUN_ID id tool query rc=0
@@ -230,8 +245,7 @@ network_probe() {
     docker exec "$id" curl --noproxy '*' --connect-timeout 2 --max-time 5 https://github.com/index.html || rc=$?
     [[ $rc == 60 ]] || return 1
     printf 'TLS_UNTRUSTED_CONTROL_EXIT=%s\n' "$rc"
-    result=$(printf 'r2-published\n' | timeout 3 nc -w 1 127.0.0.1 49383)
-    [[ $result == r2-published ]] || return 1
+    network_published_check || return $?
     printf 'HOST_PUBLISHED_PASS=1\n'
     docker network connect "$IT_WITNESS_NETWORK" "$id"
     rc=0; assert_container_network_policy "$id" || rc=$?
@@ -240,7 +254,8 @@ network_probe() {
     printf 'SECONDARY_NETWORK_REJECTED_EXIT=%s\n' "$rc"
     query="$IT_RUN_ID-$RANDOM.invalid"
     docker exec "$id" busybox nslookup "$query" 127.0.0.11 || rc=$?
-    docker logs "$prefix-dns" 2>&1 | grep -F "$query"
+    docker logs "$prefix-dns" > "$IT_EVIDENCE_DIR/control/dns-query.log" 2>&1 || return $?
+    grep -F "$query" "$IT_EVIDENCE_DIR/control/dns-query.log" || return $?
     assert_product_egress "$id" probe
     assert_dns_witness probe
     printf 'NETWORK_PROBE_PASS=1 O1_FULL_NOT_INTEGRATED=1\n'

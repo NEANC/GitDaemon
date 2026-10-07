@@ -91,7 +91,7 @@ guard_cleanup() {
         if [[ -f $E/control/runner.pid ]]; then
             guard_gm kill -TERM "$(cat "$E/control/runner.pid")" 2>/dev/null
         fi
-        wait "$CHILD"; printf 'CLEANUP_CHILD_WAIT_EXIT=%s\n' "$?" >> "$E/exit-status.txt"
+        wait "$CHILD"; printf 'SETSID_WAIT_EXIT=%s\n' "$?" >> "$E/exit-status.txt"
     fi
     iptables-save -c > "$E/rules-before-cleanup.txt" || clean=2
     ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
@@ -227,7 +227,8 @@ guard_main() {
     guard_rule raw -A "$RETURN" -d 172.30.243.0/24 -j DROP
     iptables-save -c > "$E/rules-ready.txt"
     printf -v command '%q ' env IT_RUN_ID="$RUN" IT_EVIDENCE_DIR="$E" IT_NETWORK="gm-$RUN-net" IT_WITNESS_NETWORK="gm-$RUN-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 bash "$source/tests/test-docker-network.sh" --live
-    setsid su -s /bin/bash "$RUNNER" -c "$command" > "$E/run.log" 2>&1 &
+    printf -v command 'su -s /bin/bash %q -c %q; rc=$?; printf "BUSINESS_SU_EXIT=%%s\\n" "$rc" > %q; exit "$rc"' "$RUNNER" "$command" "$E/business-su-status.txt"
+    setsid bash -c "$command" > "$E/run.log" 2>&1 &
     CHILD=$!
     guard_signal_checkpoint
     while [[ ! -f $E/control/runner.pid ]]; do
@@ -264,7 +265,7 @@ guard_main() {
     wait "$CHILD" || rc=$?
     guard_signal_checkpoint
     CHILD=''
-    printf 'RUNNER_WAIT_EXIT=%s\n' "$rc" >> "$E/exit-status.txt"
+    printf 'SETSID_WAIT_EXIT=%s\n' "$rc" >> "$E/exit-status.txt"
     return "$rc"
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then guard_main "$@"; fi

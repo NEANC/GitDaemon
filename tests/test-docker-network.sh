@@ -24,13 +24,13 @@ contract_guard_driver() {
     local driver_pid=$BASHPID injected=0
     set -T
     # DEBUG 在实际命令执行前同步送 TERM，精确命中调用成功后及后台 PID 登记前。
-    trap 'if [[ $BASHPID == "$driver_pid" && $injected == 0 ]]; then case "$WINDOW:$BASH_COMMAND" in rule:OWN_RULES+=*|chain:OWN_CHAINS+=*|spawn:CHILD=*) injected=1; kill -TERM "$BASHPID" ;; esac; fi' DEBUG
+    trap 'if [[ $BASHPID == "${driver_pid:-}" && ${injected:-1} == 0 ]]; then case "$WINDOW:$BASH_COMMAND" in rule:OWN_RULES+=*|chain:OWN_CHAINS+=*|spawn:CHILD=*) injected=1; kill -TERM "$BASHPID" ;; esac; fi' DEBUG
     guard_main --run-id timing --evidence-dir "$SCRATCH/evidence" --source-dir "$(cd "$HERE/.." && pwd)" --runner-user gmtest --mode probe --product-image product --tools-image tools
 }
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -128,6 +128,25 @@ contract_case() {
                     done
                 done
             done
+            ;;
+        independent_status_capture)
+            local WINDOW=exit7 SCRATCH actual
+            SCRATCH=$(mktemp -d)
+            export HERE WINDOW SCRATCH
+            export -f contract_guard_driver
+            actual=0; bash -c contract_guard_driver > "$SCRATCH/output" 2>&1 || actual=$?
+            [[ $actual == 7 ]] || { printf 'runner fixture exit=%s evidence=%s\n' "$actual" "$SCRATCH"; return 1; }
+            grep -qx 'RUNNER_EXIT=7' "$SCRATCH/evidence/control/runner-status.txt" || return 1
+            grep -qx 'BUSINESS_SU_EXIT=7' "$SCRATCH/evidence/business-su-status.txt" || return 1
+            grep -qx 'SETSID_WAIT_EXIT=7' "$SCRATCH/evidence/exit-status.txt" || return 1
+            grep -qx 'PRIMARY_EXIT=7' "$SCRATCH/evidence/exit-status.txt" || return 1
+            grep -qx 'CLEANUP_EXIT=0' "$SCRATCH/evidence/exit-status.txt" || return 1
+            local IT_EVIDENCE_DIR=$SCRATCH/evidence pipe_rc=0
+            timeout() { printf 'r2-published\n'; return 7; }
+            network_published_check || pipe_rc=$?
+            [[ $pipe_rc == 7 ]] || return 1
+            grep -qx 'PUBLISHED_PIPESTATUS=0 7' "$IT_EVIDENCE_DIR/control/pipeline-status.txt" || return 1
+            rm -rf "$SCRATCH"
             ;;
         reusable_generation_dns_contract)
             local IT_RUN_ID=reuse IT_TOOLS_IMAGE=tools actual product_address=172.30.243.5 DNS_CALIBRATED=1 DNS_BASELINE=$'0\n0\n0' DNS_GENERATION='' negative_calls='' generation
@@ -316,6 +335,7 @@ contract_case() {
 case "${1:-}" in
     --contracts) contracts ;;
     --live)
+        trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
         trap 'exit 143' TERM
         trap 'exit 130' INT
         printf '%s\n' "$$" > "$IT_EVIDENCE_DIR/control/runner.pid"
