@@ -5,7 +5,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -103,6 +103,43 @@ contract_case() {
                     done
                 done
             done
+            ;;
+        preflight_query_failure_blocks_start)
+            local fault actual scratch
+            scratch=$(mktemp -d)
+            for fault in network-list inspect route containers networks volumes links rules; do
+                actual=0
+                (
+                    # 模拟已授权宿主，查询故障必须在任何资源操作之前返回。
+                    id() { if [[ $# == 1 ]]; then printf '0\n'; else printf '10001\n'; fi; }
+                    ip() {
+                        case "$*" in
+                            '-4 addr show') printf 'inet 192.168.10.9/24\n' ;;
+                            '-4 route show') [[ $fault != route ]] || return 9 ;;
+                            'link show') [[ $fault != links ]] || return 9 ;;
+                            *) return 1 ;;
+                        esac
+                    }
+                    docker() {
+                        case "$*" in
+                            'network ls -q') [[ $fault != network-list ]] || return 9; printf 'existing\n' ;;
+                            'network inspect '*) [[ $fault != inspect ]] || return 9 ;;
+                            'ps -a '*) [[ $fault != containers ]] || return 9 ;;
+                            'network ls --format '*) [[ $fault != networks ]] || return 9 ;;
+                            'volume ls --format '*) [[ $fault != volumes ]] || return 9 ;;
+                            *) printf 'business\n' >> "$scratch/business" ;;
+                        esac
+                        return 0
+                    }
+                    iptables-save() { [[ $fault != rules ]] || return 9; }
+                    # 到达资源准备也算错误；防止红灯测试真实写宿主目录。
+                    mkdir() { printf 'business\n' >> "$scratch/business"; exit 91; }
+                    guard_main --run-id querytest --evidence-dir /nonexistent-r2-query-contract --source-dir /source --runner-user gmtest --mode probe --product-image product --tools-image tools
+                ) || actual=$?
+                [[ $actual == 9 && ! -e $scratch/business ]] || { printf 'preflight fault=%s exit=%s FAILED\n' "$fault" "$actual"; return 1; }
+                printf 'preflight fault=%s business=0 exit=9 PASS\n' "$fault"
+            done
+            rm -rf "$scratch"
             ;;
         interrupt_removes_owned_rules)
             OWN_RULES=('raw|-A PREROUTING -i gr-test -j R2-test')

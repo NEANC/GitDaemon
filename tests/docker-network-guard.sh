@@ -149,7 +149,7 @@ guard_close_calibration() {
 }
 # 固定入口解析、宿主预检、规则安装以及降权执行。
 guard_main() {
-    local mode='' source='' image='' tools='' existing table chain parent bridge seq request pid command rc=0
+    local mode='' source='' image='' tools='' existing table chain parent bridge seq request pid command rc=0 ids routes resources links rules
     RUN='' E='' RUNNER=''
     while (( $# )); do
         [[ $# -ge 2 ]] || return 2
@@ -167,13 +167,25 @@ guard_main() {
     [[ $E != /tmp/* && $E != /var/tmp/* && ! -e $E ]] || return 73
     [[ $(id -u "$RUNNER") != 0 ]] || return 77
     BR=g$RUN WBR=w$RUN CHAIN=G$RUN EARLY=E$RUN RETURN=R$RUN SEEN=S$RUN
-    existing=$(docker network inspect $(docker network ls -q) --format '{{range .IPAM.Config}}{{.Subnet}}{{println}}{{end}}'; ip -4 route show | awk '$1!="default" {print $1}')
+    ids=$(docker network ls -q) || return $?
+    existing=''
+    if [[ -n $ids ]]; then
+        existing=$(docker network inspect $ids --format '{{range .IPAM.Config}}{{.Subnet}}{{println}}{{end}}') || return $?
+    fi
+    routes=$(ip -4 route show) || return $?
+    routes=$(awk '$1!="default" {print $1}' <<< "$routes") || return $?
+    existing+=$'\n'"$routes"
     guard_subnets_clear "$existing" || return 70
-    if docker ps -a --format '{{.Names}}' | grep -F "gm-$RUN-"; then return 70; fi
-    if docker network ls --format '{{.Name}}' | grep -F "gm-$RUN-"; then return 70; fi
-    if docker volume ls --format '{{.Name}}' | grep -F "gm-$RUN-"; then return 70; fi
-    for bridge in "$BR" "$WBR"; do if ip link show "$bridge" >/dev/null 2>&1; then return 70; fi; done
-    for chain in "$CHAIN" "$EARLY" "$RETURN"; do if iptables-save | grep -w "$chain"; then return 70; fi; done
+    resources=$(docker ps -a --format '{{.Names}}') || return $?
+    if grep -F "gm-$RUN-" <<< "$resources"; then return 70; fi
+    resources=$(docker network ls --format '{{.Name}}') || return $?
+    if grep -F "gm-$RUN-" <<< "$resources"; then return 70; fi
+    resources=$(docker volume ls --format '{{.Name}}') || return $?
+    if grep -F "gm-$RUN-" <<< "$resources"; then return 70; fi
+    links=$(ip link show) || return $?
+    for bridge in "$BR" "$WBR"; do if grep -Eq "^[0-9]+: ${bridge}(@[^:]+)?:" <<< "$links"; then return 70; fi; done
+    rules=$(iptables-save) || return $?
+    for chain in "$CHAIN" "$EARLY" "$RETURN"; do if grep -w "$chain" <<< "$rules"; then return 70; fi; done
     mkdir -p "$E"; chmod 755 "$E"
     mkdir "$E/control"; chown "$RUNNER" "$E/control"
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
