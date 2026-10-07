@@ -5,7 +5,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -103,6 +103,34 @@ contract_case() {
                     done
                 done
             done
+            ;;
+        reusable_generation_dns_contract)
+            local IT_RUN_ID=reuse IT_TOOLS_IMAGE=tools actual product_address=172.30.243.5 DNS_CALIBRATED=1 DNS_BASELINE=$'0\n0\n0' DNS_GENERATION='' negative_calls='' generation
+            assert_container_network_policy() { return 0; }
+            docker() {
+                case "$*" in
+                    *'.IPAddress'*) printf '%s' "$product_address" ;;
+                    *'.HostConfig.NetworkMode'*) printf 'container:product 10001:10001' ;;
+                    *'.Id'*) printf 'tool' ;;
+                    *'id -ru'*) printf '10001 10001' ;;
+                esac
+                return 0
+            }
+            network_negative() { negative_calls+="$1 "; }
+            network_run() { return 0; }
+            network_control() { CONTROL_SEQ=$((CONTROL_SEQ + 1)); }
+            network_witness() { printf '0\n0\n0\n'; }
+            actual=0; assert_product_egress product wrong || actual=$?
+            [[ $actual != 0 && -z $negative_calls ]] || { printf 'wrong product address accepted\n'; return 1; }
+            product_address=172.30.243.4
+            for generation in one two; do
+                negative_calls=''
+                assert_product_egress product "$generation" || return 1
+                [[ $negative_calls == 'cross-network host-published host-input dns-udp dns-tcp ' ]] || return 1
+                assert_dns_witness "$generation" || return 1
+            done
+            actual=0; assert_dns_witness stale || actual=$?
+            [[ $actual != 0 ]] || return 1
             ;;
         counter_evidence_rejects_invalid)
             local IT_EVIDENCE_DIR IT_RUN_ID=counttest fault file actual spec label dest proto port count

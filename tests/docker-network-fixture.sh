@@ -57,6 +57,7 @@ network_fixture_start() {
         result=$(docker exec "$prefix-client" dig +time=1 +tries=1 "$proto" "@$IT_DNS_IP" "$IT_RUN_ID-local.invalid" A) || return $?
         [[ $result == *'status: NXDOMAIN'* ]] || return 1
     done
+    network_calibrate_dns || return $?
 }
 # 停止仅属于本轮的资源；异常外层还会以清单兜底。
 network_fixture_stop() {
@@ -134,19 +135,41 @@ network_negative() {
         else [[ $cb == "$ca" ]] || return 1; fi
     done
 }
-# 产品内 curl 逐个验证三个受控目的；不向真实公网发送探测。
+# 产品固定为 .4；每代验证三个受控目的、产品 UDP 及共享 netns 工具 TCP。
 assert_product_egress() {
-    local id=$1 generation=$2 spec label address
+    local id=$1 generation=$2 spec label address tool prefix=gm-$IT_RUN_ID
+    DNS_GENERATION=''
     printf 'PRODUCT_GENERATION=%s ID=%s\n' "$generation" "$id"
     assert_container_network_policy "$id" || return $?
+    address=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$id") || return $?
+    [[ $address == 172.30.243.4 && ${DNS_CALIBRATED:-0} == 1 ]] || return 1
     for spec in 'cross-network 172.30.244.53:19419' 'host-published 172.30.243.1:49382' 'host-input 172.30.243.1:49383'; do
         read -r label address <<< "$spec"
         network_negative "$label" docker exec "$id" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$address/" || return $?
     done
+    network_negative dns-udp docker exec "$id" timeout 4 busybox nslookup "$IT_RUN_ID-$generation-product.invalid" 172.30.244.53 || return $?
+    network_run -d --name "$prefix-tcp" --network "container:$id" "$IT_TOOLS_IMAGE" sleep 120 || return $?
+    tool=$(docker inspect -f '{{.Id}}' "$prefix-tcp") || return $?
+    docker inspect "$tool" || return $?
+    [[ $(docker inspect -f '{{.HostConfig.NetworkMode}} {{.Config.User}}' "$tool") == "container:$id 10001:10001" ]] || return 1
+    [[ $(docker exec "$tool" sh -c 'printf "%s %s" "$(id -ru)" "$(id -u)"') == '10001 10001' ]] || return 1
+    printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$id"
+    network_negative dns-tcp docker exec "$tool" dig +time=1 +tries=1 +tcp @172.30.244.53 "$IT_RUN_ID-$generation-tool.invalid" A || return $?
+    docker rm -f "$tool" || return $?
+    DNS_GENERATION=$generation
 }
-# 校准两协议见证，包括健康负对照；结束撤销通路，产品尚未启动。
+# 逐代见证只检查已完成的同代出口断言及校准关闭后的零增长，不重开通路。
 assert_dns_witness() {
-    local generation=$1 proto before after result rc=0 prefix=gm-$IT_RUN_ID wb wa protocol
+    local current
+    [[ ${DNS_CALIBRATED:-0} == 1 && ${DNS_GENERATION:-} == "$1" ]] || return 1
+    network_control snapshot || return $?
+    current=$(network_witness "$CONTROL_SEQ") || return $?
+    [[ $current == "$DNS_BASELINE" ]]
+}
+# 仅在夹具启动内校准一次；结束关闭通路并保存逐代基准。
+network_calibrate_dns() {
+    [[ ${DNS_CALIBRATED:-0} == 0 ]] || return 1
+    local generation=calibration proto before after result rc=0 prefix=gm-$IT_RUN_ID wb wa protocol
     for proto in +notcp +tcp; do
         network_control snapshot || return $?; before=$CONTROL_SEQ
         result=$(docker exec "$prefix-client" dig +time=1 +tries=1 "$proto" @172.30.244.53 "$IT_RUN_ID-$generation-positive.invalid" A) || return $?
@@ -172,7 +195,10 @@ assert_dns_witness() {
         result=$(docker exec "$prefix-client" dig +time=1 +tries=1 "$proto" @172.30.244.53 restored.invalid A) || return $?
         [[ $result == *'status: NXDOMAIN'* ]] || return 1
     done
-    network_control close
+    network_control close || return $?
+    network_control snapshot || return $?
+    DNS_BASELINE=$(network_witness "$CONTROL_SEQ") || return $?
+    DNS_CALIBRATED=1
 }
 # 独立命名卷生成短期 CA 与 TLS 端点，产品只挂载 CA 不接触私钥。
 network_tls() {
@@ -196,7 +222,6 @@ printf "r2-tls-ok\n" > index.html
 network_probe() {
     local prefix=gm-$IT_RUN_ID id tool query rc=0
     network_fixture_start
-    assert_dns_witness probe
     network_tls
     id=$(docker inspect -f '{{.Id}}' "$prefix-product")
     assert_container_network_policy "$id"
@@ -217,13 +242,6 @@ network_probe() {
     docker exec "$id" busybox nslookup "$query" 127.0.0.11 || rc=$?
     docker logs "$prefix-dns" 2>&1 | grep -F "$query"
     assert_product_egress "$id" probe
-    network_negative dns-udp docker exec "$id" timeout 4 busybox nslookup "$IT_RUN_ID-product.invalid" 172.30.244.53
-    network_run -d --name "$prefix-tcp" --network "container:$id" "$IT_TOOLS_IMAGE" sleep 120
-    tool=$(docker inspect -f '{{.Id}}' "$prefix-tcp")
-    docker inspect "$tool"
-    [[ $(docker inspect -f '{{.HostConfig.NetworkMode}} {{.Config.User}}' "$tool") == "container:$id 10001:10001" ]]
-    [[ $(docker exec "$tool" sh -c 'printf "%s %s" "$(id -ru)" "$(id -u)"') == '10001 10001' ]]
-    printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$id"
-    network_negative dns-tcp docker exec "$tool" dig +time=1 +tries=1 +tcp @172.30.244.53 "$IT_RUN_ID-tool.invalid" A
+    assert_dns_witness probe
     printf 'NETWORK_PROBE_PASS=1 O1_FULL_NOT_INTEGRATED=1\n'
 }
