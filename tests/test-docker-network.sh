@@ -2,6 +2,31 @@
 # 网络编排行为契约与受控宿主探针入口。
 set -Eeuo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# 运行真实 guard 入口；仅替换授权宿主、Docker、su 与规则等外部边界。
+contract_guard_driver() {
+    source "$HERE/docker-network-guard.sh"
+    id() { if [[ $# == 1 ]]; then printf '0\n'; else printf '10001\n'; fi; }
+    ip() { [[ $* != '-4 addr show' ]] || printf 'inet 192.168.10.9/24\n'; return 0; }
+    chown() { return 0; }
+    docker() {
+        case "$*" in
+            'network create '*) printf 'business\n' >> "$SCRATCH/business"; return 7 ;;
+            'network ls -q'|'ps -a '*|'network ls --format '*|'volume ls --format '*|'ps -aq '*|'network ls -q '*|'volume ls -q '*) return 0 ;;
+            'image inspect '*) printf '{}\n' ;;
+            *) return 0 ;;
+        esac
+    }
+    iptables-save() { return 0; }
+    iptables() { printf '%s\n' "$*" >> "$SCRATCH/rules"; }
+    su() { sleep 0.1; bash -c "${@: -1}"; }
+    setsid() { "$@"; }
+    export -f docker su
+    local driver_pid=$BASHPID injected=0
+    set -T
+    # DEBUG 在实际命令执行前同步送 TERM，精确命中调用成功后及后台 PID 登记前。
+    trap 'if [[ $BASHPID == "$driver_pid" && $injected == 0 ]]; then case "$WINDOW:$BASH_COMMAND" in rule:OWN_RULES+=*|chain:OWN_CHAINS+=*|spawn:CHILD=*) injected=1; kill -TERM "$BASHPID" ;; esac; fi' DEBUG
+    guard_main --run-id timing --evidence-dir "$SCRATCH/evidence" --source-dir "$(cd "$HERE/.." && pwd)" --runner-user gmtest --mode probe --product-image product --tools-image tools
+}
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
@@ -273,11 +298,18 @@ contract_case() {
             rm -rf "$scratch"
             ;;
         interrupt_removes_owned_rules)
-            OWN_RULES=('raw|-A PREROUTING -i gr-test -j R2-test')
-            OWN_CHAINS=('raw|R2-test')
-            iptables() { removed+="$*;"; }
-            guard_remove_rules || return 1
-            [[ $removed == *'-D PREROUTING -i gr-test -j R2-test'* && $removed == *'-X R2-test'* && $removed != *'-F'* ]]
+            local WINDOW SCRATCH actual installed deleted
+            export HERE WINDOW SCRATCH
+            export -f contract_guard_driver
+            for WINDOW in chain rule spawn; do
+                SCRATCH=$(mktemp -d); actual=0
+                bash -c contract_guard_driver > "$SCRATCH/output" 2>&1 || actual=$?
+                installed=$(awk '$3=="-A" || $3=="-I" || $3=="-N" {n++} END {print n+0}' "$SCRATCH/rules")
+                deleted=$(awk '$3=="-D" || $3=="-X" {n++} END {print n+0}' "$SCRATCH/rules")
+                [[ $actual == 143 && $installed == "$deleted" && ! -e $SCRATCH/business ]] || { printf 'window=%s exit=%s installed=%s deleted=%s evidence=%s FAIL\n' "$WINDOW" "$actual" "$installed" "$deleted" "$SCRATCH"; return 1; }
+                printf 'window=%s owned=%s exit=143 PASS\n' "$WINDOW" "$installed"
+                rm -rf "$SCRATCH"
+            done
             ;;
     esac
 }
@@ -287,6 +319,11 @@ case "${1:-}" in
         trap 'exit 143' TERM
         trap 'exit 130' INT
         printf '%s\n' "$$" > "$IT_EVIDENCE_DIR/control/runner.pid"
+        while [[ ! -f $IT_EVIDENCE_DIR/control/start ]]; do
+            [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
+            sleep 0.1
+        done
+        [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
         source "$HERE/docker-network-fixture.sh"
         network_probe
         ;;

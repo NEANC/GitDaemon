@@ -2,6 +2,11 @@
 # 授权宿主专属规则外层；不接受任意业务命令。
 set -Eeuo pipefail
 OWN_RULES=() OWN_CHAINS=()
+PENDING_SIGNAL=0
+# 仅在所有权登记及启动握手安全点处理可捕获信号。
+guard_signal_checkpoint() {
+    if (( PENDING_SIGNAL != 0 )); then exit "$PENDING_SIGNAL"; fi
+}
 # 比较 CIDR 区间，创建资源前拒绝任何网段覆盖。
 guard_subnets_clear() {
     awk 'function ip(s,a){split(s,a,".");return ((a[1]*256+a[2])*256+a[3])*256+a[4]} BEGIN{lo=ip("172.30.243.0");hi=ip("172.30.244.255")} /\./{split($1,c,"/");p=(c[2]==""?32:c[2]);z=2^(32-p);s=int(ip(c[1])/z)*z;if(s<=hi && s+z-1>=lo)exit 1}' <<< "$1"
@@ -31,6 +36,7 @@ guard_rule() {
     iptables -t "$table" "$@"
     OWN_RULES+=("$table|$*")
     printf '%s|%s\n' "$table" "$*" >> "$E/rules.owned"
+    guard_signal_checkpoint
 }
 # 实际以普通宿主用户调用 Docker，记录 su 直接状态。
 guard_gm() {
@@ -76,13 +82,14 @@ RECOVERY
 # 清理前先保存输入关联的容器状态、日志与规则计数。
 guard_cleanup() {
     local primary=$? clean=0 item ids kind residual isolated=1
-    trap - EXIT TERM INT
+    trap '' TERM INT
+    trap - EXIT
     set +e
     if [[ -n ${CHILD:-} ]]; then
+        # 未获启动许可的 runner 只接受停止请求，不会创建业务。
+        touch "$E/control/stop"
         if [[ -f $E/control/runner.pid ]]; then
             guard_gm kill -TERM "$(cat "$E/control/runner.pid")" 2>/dev/null
-        else
-            kill -TERM -- "-$CHILD" 2>/dev/null
         fi
         wait "$CHILD"; printf 'CLEANUP_CHILD_WAIT_EXIT=%s\n' "$?" >> "$E/exit-status.txt"
     fi
@@ -195,12 +202,13 @@ guard_main() {
     iptables-save -c > "$E/rules-before.txt"
     printf 'Run=%s\nRemove only listed labeled resources and reverse rules.owned after SIGKILL; never flush global tables.\n' "$RUN" > "$E/recovery.txt"
     trap guard_cleanup EXIT
-    trap 'exit 143' TERM
-    trap 'exit 130' INT
+    trap 'PENDING_SIGNAL=143' TERM
+    trap 'PENDING_SIGNAL=130' INT
     for spec in "filter|$CHAIN" "raw|$EARLY" "raw|$RETURN"; do
         table=${spec%%|*}; chain=${spec#*|}
         iptables -t "$table" -N "$chain"; OWN_CHAINS+=("$spec")
         printf '%s\n' "$spec" >> "$E/chains.owned"
+        guard_signal_checkpoint
     done
     guard_rule filter -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT
     guard_rule filter -A "$CHAIN" -i "$BR" -o "$BR" -s 172.30.243.0/24 -d 172.30.243.0/24 -j ACCEPT
@@ -221,8 +229,17 @@ guard_main() {
     printf -v command '%q ' env IT_RUN_ID="$RUN" IT_EVIDENCE_DIR="$E" IT_NETWORK="gm-$RUN-net" IT_WITNESS_NETWORK="gm-$RUN-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 bash "$source/tests/test-docker-network.sh" --live
     setsid su -s /bin/bash "$RUNNER" -c "$command" > "$E/run.log" 2>&1 &
     CHILD=$!
+    guard_signal_checkpoint
+    while [[ ! -f $E/control/runner.pid ]]; do
+        guard_signal_checkpoint
+        kill -0 "$CHILD" 2>/dev/null || break
+        sleep 0.1
+    done
+    guard_signal_checkpoint
+    [[ ! -f $E/control/runner.pid ]] || touch "$E/control/start"
     seq=1
     while kill -0 "$CHILD" 2>/dev/null; do
+        guard_signal_checkpoint
         if [[ -f $E/control/request-$seq ]]; then
             request=$(cat "$E/control/request-$seq")
             case "$request" in
@@ -245,6 +262,7 @@ guard_main() {
         sleep 0.1
     done
     wait "$CHILD" || rc=$?
+    guard_signal_checkpoint
     CHILD=''
     printf 'RUNNER_WAIT_EXIT=%s\n' "$rc" >> "$E/exit-status.txt"
     return "$rc"
