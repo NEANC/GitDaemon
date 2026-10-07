@@ -5,7 +5,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -103,6 +103,62 @@ contract_case() {
                     done
                 done
             done
+            ;;
+        conditional_library_failure_stops)
+            local fault actual scratch IT_RUN_ID=conditional IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE=tools IT_NETWORK_GUARD_READY=1
+            scratch=$(mktemp -d)
+            for fault in 1 2 3 4 5 6 7 8 9; do
+                (
+                    # 文件记录跨命令替换调用；每一个前置步骤失败后不得继续。
+                    docker() {
+                        local n=0
+                        [[ ! -f $scratch/count ]] || read -r n < "$scratch/count"
+                        n=$((n + 1)); printf '%s\n' "$n" > "$scratch/count"
+                        [[ $n != "$fault" ]] || return 9
+                        printf 'status: NXDOMAIN\n'
+                    }
+                    id() { printf '10001\n'; }
+                    network_control() { docker control; }
+                    actual=0; network_fixture_start || actual=$?
+                    read -r calls < "$scratch/count"
+                    [[ $actual == 9 && $calls == "$fault" ]]
+                ) || { printf 'conditional start fault=%s FAILED\n' "$fault"; return 1; }
+                rm "$scratch/count"
+            done
+            (
+                assert_container_network_policy() { return 9; }
+                network_negative() { calls=$((calls + 1)); }
+                actual=0; assert_product_egress product generation || actual=$?
+                [[ $actual == 9 && $calls == 0 ]]
+            ) || return 1
+            (
+                network_control() { return 9; }
+                actual=0; network_negative dns-udp false || actual=$?
+                [[ $actual == 9 ]]
+            ) || return 1
+            (
+                # 执行真实容器内 shell 片段，仅替换内核文件读取。
+                docker() {
+                    case "$*" in
+                        *'.NetworkSettings.Networks'*) printf 'n ' ;;
+                        *'.HostConfig.Dns'*) printf '[172.30.243.53]' ;;
+                        *'.Config.User'*) printf '10001:10001 true false [ALL] [no-new-privileges]' ;;
+                        *'.EnableIPv6'*) printf 'false' ;;
+                        *'.HostConfig.Sysctls'*) printf '1' ;;
+                        *'.HostConfig.ExtraHosts'*) printf '[] []' ;;
+                        *'.Destination'*) printf 'gm-conditional-ca false' ;;
+                        *'.Mounts'*) return 0 ;;
+                        *'id -ru'*) printf '10001 10001' ;;
+                        exec*) bash -c "${@: -1}" ;;
+                        *) return 99 ;;
+                    esac
+                }
+                cat() { if [[ $1 == /proc/* ]]; then printf '0'; else printf 'nameserver 127.0.0.11\n'; fi; }
+                export -f cat
+                actual=0; assert_container_network_policy product || actual=$?
+                [[ $actual != 0 ]]
+            ) || { printf 'IPv6 runtime rejection FAILED\n'; return 1; }
+            rm -rf "$scratch"
             ;;
         preflight_query_failure_blocks_start)
             local fault actual scratch
