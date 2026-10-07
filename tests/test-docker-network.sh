@@ -11,7 +11,11 @@ contract_guard_driver() {
     docker() {
         case "$*" in
             'network create '*) printf 'business\n' >> "$SCRATCH/business"; return 7 ;;
-            'network ls -q'|'ps -a '*|'network ls --format '*|'volume ls --format '*|'ps -aq '*|'network ls -q '*|'volume ls -q '*) return 0 ;;
+            'network ls -q') [[ $WINDOW != conflict ]] || printf 'existing\n'; return 0 ;;
+            'network inspect '*) [[ $WINDOW != conflict ]] || printf '172.30.240.0/20\n'; return 0 ;;
+            'ps -aq '*) [[ $WINDOW != cleanup7 ]] || printf 'owned\n'; return 0 ;;
+            'rm -f '*) [[ $WINDOW != cleanup7 ]] || return 9 ;;
+            'ps -a '*|'network ls --format '*|'volume ls --format '*|'network ls -q '*|'volume ls -q '*) return 0 ;;
             'image inspect '*) printf '{}\n' ;;
             *) return 0 ;;
         esac
@@ -52,19 +56,32 @@ contract_case() {
             [[ $result != 0 && $calls == 0 ]]
             ;;
         subnet_conflict_preserves_existing)
-            guard_subnets_clear '172.30.240.0/20' && return 1
-            guard_subnets_clear '172.30.243.1/32' && return 1
-            guard_subnets_clear '172.30.245.0/24' || return 1
-            [[ $calls == 0 ]]
+            local WINDOW=conflict SCRATCH actual=0
+            SCRATCH=$(mktemp -d)
+            export HERE WINDOW SCRATCH
+            export -f contract_guard_driver
+            bash -c contract_guard_driver > "$SCRATCH/output" 2>&1 || actual=$?
+            [[ $actual == 70 && ! -e $SCRATCH/business && ! -e $SCRATCH/rules && ! -e $SCRATCH/evidence ]] || return 1
+            rm -rf "$SCRATCH"
             ;;
         secondary_network_rejected)
-            policy_networks "$IT_NETWORK" || return 1
-            policy_networks "$IT_NETWORK other" && return 1
+            docker() { printf 'n other '; }
+            assert_container_network_policy product && return 1
             return 0
             ;;
         cleanup_preserves_primary_status)
-            [[ $(guard_result 7 2) == 7 ]] || return 1
-            [[ $(guard_result 0 2) == 2 ]]
+            local WINDOW=cleanup7 SCRATCH actual=0
+            SCRATCH=$(mktemp -d)
+            export HERE WINDOW SCRATCH
+            export -f contract_guard_driver
+            bash -c contract_guard_driver > "$SCRATCH/output" 2>&1 || actual=$?
+            [[ $actual == 7 ]] || return 1
+            grep -qx 'RUNNER_EXIT=7' "$SCRATCH/evidence/control/runner-status.txt" || return 1
+            grep -qx 'PRIMARY_EXIT=7' "$SCRATCH/evidence/exit-status.txt" || return 1
+            grep -qx 'CLEANUP_EXIT=2' "$SCRATCH/evidence/exit-status.txt" || return 1
+            grep -q -- '-D\|-X' "$SCRATCH/rules" && return 1
+            [[ -s $SCRATCH/evidence/recover.sh ]] || return 1
+            rm -rf "$SCRATCH"
             ;;
         cleanup_failure_keeps_isolation)
             local E RUN=contract RUNNER=gmtest primary actual fault fault_kind phase expected
