@@ -24,6 +24,7 @@ network_run() {
 }
 # 核查所有附件、安全选项、实际身份及命名卷，不接受额外网络。
 assert_container_network_policy() {
+    [[ ${IT_NETWORK_GUARD_READY:-} == 1 && -n ${IT_DNS_IP:-} ]] || return 77
     local id=$1 networks value mount mounts
     networks=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id") || return $?
     policy_networks "${networks% }" || return 1

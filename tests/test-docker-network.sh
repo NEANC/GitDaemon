@@ -65,6 +65,7 @@ contract_case() {
             rm -rf "$SCRATCH"
             ;;
         secondary_network_rejected)
+            local IT_NETWORK_GUARD_READY=1 IT_DNS_IP=172.30.243.53
             docker() { printf 'n other '; }
             assert_container_network_policy product && return 1
             return 0
