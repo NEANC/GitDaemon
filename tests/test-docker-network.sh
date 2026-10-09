@@ -363,6 +363,8 @@ case "${1:-}" in
             sleep 0.1
         done
         [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
+        # 降权后切换到可访问的源码目录，不继承管理员的私有工作目录。
+        cd -- "$HERE/.." || exit $?
         source "$HERE/docker-network-fixture.sh"
         network_probe
         ;;
