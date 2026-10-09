@@ -7,6 +7,7 @@ source "$HERE/docker-network-fixture.sh"
 # 模拟单一已授权普通网络与完整的非 root 容器安全属性。
 docker() {
     case "$*" in
+        *'.Config.Env'*) printf 'GIT_SSL_CAINFO=/ca/ca.crt\n' ;;
         *'.NetworkSettings.Networks'*) printf '%s ' "$ATTACHMENTS" ;;
         *'.HostConfig.Dns'*) printf '[172.30.243.53]' ;;
         *'.Config.User'*) printf '10001:10001 true false [ALL] [%s]' "$SECURITY_OPT" ;;

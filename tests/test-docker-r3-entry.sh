@@ -44,6 +44,14 @@ CLI
 chmod +x "$scratch/docker"
 PATH="$scratch:$PATH"
 export IT_RUN_ID=contract IT_NETWORK=gm-contract-net IT_DNS_IP=172.30.243.53 IT_NETWORK_GUARD_READY=1
+# 此契约只检查解析，受控启动的实际检查由辅助容器契约覆盖。
+integration_helper_run() {
+    local image=$4
+    shift 4
+    while [[ $1 != -- ]]; do printf '%s\n' "$1"; shift; done
+    shift
+    printf '%s\n' "$image" "$@"
+}
 output=$(docker run -d --name product --network "$IT_NETWORK" --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges -v gm-contract-data:/var/lib/git-daemon product)
 for expected in 172.30.243.4 172.30.243.53 net.ipv6.conf.all.disable_ipv6=1 gm-contract-ca:/ca:ro; do
     if [[ $output != *"$expected"* ]]; then printf 'STARTUP missing=%s\n' "$expected"; failed=1; fi
