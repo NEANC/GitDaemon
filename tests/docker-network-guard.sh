@@ -168,7 +168,7 @@ guard_runner_command() {
 }
 # 固定入口解析、宿主预检、规则安装以及降权执行。
 guard_main() {
-    local mode='' source='' image='' tools='' existing table chain parent bridge seq request pid command rc=0 ids routes resources links rules
+    local mode='' source='' image='' tools='' existing table chain parent bridge seq request token pid command rc=0 ids routes resources links rules
     RUN='' E='' RUNNER=''
     while (( $# )); do
         [[ $# -ge 2 ]] || return 2
@@ -258,7 +258,8 @@ guard_main() {
     while kill -0 "$CHILD" 2>/dev/null; do
         guard_signal_checkpoint
         if [[ -f $E/control/request-$seq ]]; then
-            request=$(cat "$E/control/request-$seq")
+            read -r request token < "$E/control/request-$seq"
+            [[ -n $token ]] || exit 65
             case "$request" in
                 witness)
                     pid=$(docker inspect -f '{{.State.Pid}}' "gm-$RUN-witness")
@@ -274,7 +275,9 @@ guard_main() {
                 snapshot) guard_snapshot "$seq" ;;
                 *) exit 65 ;;
             esac
-            touch "$E/control/ack-$seq"; seq=$((seq + 1))
+            printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
+            mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+            seq=$((seq + 1))
         fi
         sleep 0.1
     done

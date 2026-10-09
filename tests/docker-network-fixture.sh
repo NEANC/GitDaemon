@@ -9,11 +9,20 @@ policy_networks() {
 }
 # 请求固定枚举操作并有限等待，握手并不作为防火墙证明。
 network_control() {
-    local i
+    local i token ack control=$IT_EVIDENCE_DIR/control
     CONTROL_SEQ=$((CONTROL_SEQ + 1))
-    printf '%s\n' "$1" > "$IT_EVIDENCE_DIR/control/request-$CONTROL_SEQ" || return $?
+    while ! mkdir "$control/claim-$CONTROL_SEQ" 2>/dev/null; do
+        [[ -d $control/claim-$CONTROL_SEQ ]] || return 73
+        CONTROL_SEQ=$((CONTROL_SEQ + 1))
+    done
+    token=$BASHPID-$CONTROL_SEQ-$RANDOM
+    printf '%s %s\n' "$1" "$token" > "$control/claim-$CONTROL_SEQ/request" || return $?
+    mv "$control/claim-$CONTROL_SEQ/request" "$control/request-$CONTROL_SEQ" || return $?
     for ((i=0;i<100;i++)); do
-        if [[ -f $IT_EVIDENCE_DIR/control/ack-$CONTROL_SEQ ]]; then return 0; fi
+        if [[ -f $control/ack-$CONTROL_SEQ ]]; then
+            ack=$(cat "$control/ack-$CONTROL_SEQ") || return $?
+            [[ $ack != "$token" ]] || return 0
+        fi
         sleep 0.1
     done
     return 75
