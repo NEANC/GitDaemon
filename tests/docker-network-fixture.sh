@@ -20,10 +20,10 @@ network_control() {
 }
 # 以统一安全参数启动具名容器，不创建匿名卷。
 network_run() {
-    docker run --label "gitdaemon.run=$IT_RUN_ID" "${SAFE[@]}" "$@"
+    IT_NETWORK_LIBRARY_RUN=1 docker run --label "gitdaemon.run=$IT_RUN_ID" "${SAFE[@]}" "$@"
 }
 # 核查所有附件、安全选项、实际身份及命名卷，不接受额外网络。
-assert_container_network_policy() {
+assert_container_network_configuration() {
     [[ ${IT_NETWORK_GUARD_READY:-} == 1 && -n ${IT_DNS_IP:-} ]] || return 77
     local id=$1 networks value mount mounts
     networks=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id") || return $?
@@ -42,6 +42,10 @@ assert_container_network_policy() {
     while IFS= read -r mount; do
         [[ -z $mount || $mount == "volume gm-$IT_RUN_ID-"* ]] || return 1
     done <<< "$mounts"
+}
+assert_container_network_policy() {
+    local id=$1 value
+    assert_container_network_configuration "$id" || return $?
     value=$(docker exec "$id" sh -c 'printf "%s %s" "$(id -ru)" "$(id -u)"') || return $?
     [[ $value == '10001 10001' ]] || return 1
     docker exec "$id" sh -c 'test "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 1 && cat /etc/resolv.conf'

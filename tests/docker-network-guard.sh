@@ -154,6 +154,18 @@ guard_close_calibration() {
     for ((i=0;i<CAL_START;i++)); do keep+=("${OWN_RULES[i]}"); done
     OWN_RULES=("${keep[@]}")
 }
+# 生成固定入口命令；full 显式清除继承过滤，不能接收任意业务命令。
+guard_runner_command() {
+    local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6
+    local -a filter=(-u IT_FILTER) entry=(--integration)
+    case "$mode" in
+        o1) filter=(IT_FILTER=o1) ;;
+        full) ;;
+        probe) entry=(--live) ;;
+        *) return 2 ;;
+    esac
+    printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="gm-$run-net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 bash "$source/tests/test-docker-network.sh" "${entry[@]}"
+}
 # 固定入口解析、宿主预检、规则安装以及降权执行。
 guard_main() {
     local mode='' source='' image='' tools='' existing table chain parent bridge seq request pid command rc=0 ids routes resources links rules
@@ -168,7 +180,7 @@ guard_main() {
         shift 2
     done
     [[ $RUN =~ ^[a-zA-Z0-9-]{1,10}$ && $RUNNER == gmtest && $E == /* && $source == /* && -n $image && -n $tools ]] || return 2
-    case "$mode" in probe) ;; o1|full) printf 'R3 integration not implemented\n' >&2; return 64 ;; *) return 2 ;; esac
+    case "$mode" in probe|o1|full) ;; *) return 2 ;; esac
     [[ $(id -u) == 0 ]] || return 77
     ip -4 addr show | grep -q 'inet 192.168.10.9/' || return 77
     [[ $E != /tmp/* && $E != /var/tmp/* && ! -e $E ]] || return 73
@@ -196,8 +208,12 @@ guard_main() {
     mkdir -p "$E"; chmod 755 "$E"
     mkdir "$E/control"; chown "$RUNNER" "$E/control"
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
-    sha256sum "$source"/tests/docker-network-guard.sh "$source"/tests/docker-network-fixture.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/tests/test-docker-network.sh > "$E/inputs.sha256"
-    git -C "$source" status --short > "$E/git-state.txt" 2>&1 || true
+    sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
+    if [[ -d $source/.git ]]; then
+        git -C "$source" status --short > "$E/git-state.txt"
+    else
+        cp "$source/input-git-state.txt" "$E/git-state.txt"
+    fi
     docker image inspect "$image" "$tools" > "$E/images.json"
     iptables-save -c > "$E/rules-before.txt"
     printf 'Run=%s\nRemove only listed labeled resources and reverse rules.owned after SIGKILL; never flush global tables.\n' "$RUN" > "$E/recovery.txt"
@@ -226,7 +242,7 @@ guard_main() {
     guard_rule raw -A "$EARLY" -d 172.30.244.0/24 -j DROP
     guard_rule raw -A "$RETURN" -d 172.30.243.0/24 -j DROP
     iptables-save -c > "$E/rules-ready.txt"
-    printf -v command '%q ' env IT_RUN_ID="$RUN" IT_EVIDENCE_DIR="$E" IT_NETWORK="gm-$RUN-net" IT_WITNESS_NETWORK="gm-$RUN-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 bash "$source/tests/test-docker-network.sh" --live
+    command=$(guard_runner_command "$mode" "$source" "$RUN" "$E" "$image" "$tools")
     printf -v command 'su -s /bin/bash %q -c %q; rc=$?; printf "BUSINESS_SU_EXIT=%%s\\n" "$rc" > %q; exit "$rc"' "$RUNNER" "$command" "$E/business-su-status.txt"
     setsid bash -c "$command" > "$E/run.log" 2>&1 &
     CHILD=$!

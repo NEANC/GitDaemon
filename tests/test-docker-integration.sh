@@ -19,18 +19,19 @@
 
 set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=git-daemon:test
+IMAGE=${IT_PRODUCT_IMAGE:-git-daemon:test}
+source "$ROOT/tests/docker-integration-startup.sh"
 FAILURES=0
 CHECKS=0
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/git-docker-it.XXXXXXXX") || exit 1
 BUILD_LOG=$TEST_ROOT/build.log
-VOLUME=git-daemon-it-$$
+VOLUME=gm-${IT_RUN_ID:-it-$$}-scratch
 COMPOSE_FILE=$ROOT/compose.yml
 COMPOSE_OVERRIDE=$TEST_ROOT/compose.override.yml
 COMPOSE_TAG=it-$$
 COMPOSE_IMAGE=ghcr.io/neanc/git-daemon:$COMPOSE_TAG
 COMPOSE_PROJECT=gm-it-$$
-COMPOSE_VOLUME=gm-it-$$-data
+COMPOSE_VOLUME=gm-${IT_RUN_ID:-it-$$}-compose-data
 COMPOSE_PORT=$((40000 + ($$ % 10000)))
 # 卷内配置层回归断言用的非默认值：容器内 daemon 必须实际生效这些值而非默认值。
 COMPOSE_VOL_CONFIG_ADDR=127.0.0.1
@@ -41,17 +42,41 @@ COMPOSE_ENV_CONFIG_ADDR=0.0.0.0
 COMPOSE_ENV_CONFIG_PORT=19428
 # 上游占位仓库名刻意不存在于 GitHub：同步预期失败且快速返回，测试不依赖真实上游内容与体积。
 TEST_REPO=octocat/Nonexistent-$COMPOSE_TAG
+O1_NET=${IT_NETWORK:-gm-it-isolated-$$}
+O1_VOL=gm-${IT_RUN_ID:-it-$$}-rejectvol
+O1_CA_VOL=gm-${IT_RUN_ID:-it-$$}-ca
+O1_UP=gm-${IT_RUN_ID:-it-$$}-reject
+O1_CA=/ca/ca.crt
+
+# 创建共享拒绝端点和独立只读 CA 卷；产品空数据卷不预填。
+o1_prepare() {
+    network_fixture_start || return $?
+    docker volume create "$O1_VOL" >/dev/null || return 1
+    docker volume create "$O1_CA_VOL" >/dev/null || return 1
+    bash "$FIXTURE_SCRIPT" prepare "$O1_VOL" "$IMAGE" acme/reject || return 1
+    bash "$FIXTURE_SCRIPT" ca "$O1_VOL" "$IMAGE" | docker run --rm -i --network none \
+        --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
+        -v "$O1_CA_VOL:/var/lib/git-daemon" --entrypoint sh "$IMAGE" \
+        -c 'cat > /var/lib/git-daemon/ca.crt' || return 1
+    bash "$FIXTURE_SCRIPT" reject-start "$O1_VOL" "$IMAGE" "$O1_NET" "$O1_UP" || return 1
+    container_networks_internal "$O1_UP"
+}
+
+# 返回端点实际收到的请求数量，不以产品日志代替上游观测。
+o1_requests() {
+    docker exec "$O1_UP" sh -c 'if [ -f /var/lib/git-daemon/fixture/reject.requests ]; then wc -l < /var/lib/git-daemon/fixture/reject.requests; else printf "0\n"; fi'
+}
 # 就绪判据探针端口：在一次性容器内构造真实 LISTEN 与「本地端口恰为该端口」的非 LISTEN 已建立连接；
 # 容器使用独立网络命名空间，该端口只需在容器内空闲。
 READINESS_PORT=19424
 # 空命名卷正式启动校验使用的独立容器与卷名：检查内自清理，并由全局清理兜底。
 EMPTY_CONTAINER=gm-it-empty-$$
-EMPTY_VOLUME=gm-it-empty-$$-vol
+EMPTY_VOLUME=gm-${IT_RUN_ID:-it-$$}-empty
 # 阶段 D：TZ 覆盖与调度生效夹具。同一命名卷写入 TZ=Asia/Shanghai，run `-e TZ=UTC` 与 Compose 环境
 # TZ=UTC 都必须使最终有效值为 UTC；不传 TZ 时读取卷内值，全新卷回退默认 Asia/Shanghai。
 # 固定时间戳 TZ_FIXED_NOW 下，同步表达式与 hosts 表达式的下一次触发按最终有效时区各自独立推出。
 TZ_CONTAINER=gm-it-tz-$$
-TZ_VOLUME=gm-it-tzvol-$$
+TZ_VOLUME=gm-${IT_RUN_ID:-it-$$}-tz
 TZ_MOUNT=/var/lib/git-daemon
 TZ_CRON_SYNC='0 20 * * *'
 TZ_CRON_HOSTS='15 20 * * *'
@@ -72,14 +97,15 @@ TLS_FIXTURE_NAME=gm-it-tls-$$
 TLS_FIXTURE_PORT=$((COMPOSE_PORT + 10000))
 # 隔离 HTTPS 同步夹具：独立命名卷、自定义网络、github.com DNS 别名与测试 CA；夹具失败独立计数。
 FIXTURE_SCRIPT=$ROOT/tests/docker-https-fixture.sh
-FIXTURE_NET=gm-it-net-$$
-FIXTURE_FIX_VOL=gm-it-fixvol-$$
-FIXTURE_PROD_VOL=gm-it-prodvol-$$
+FIXTURE_NET=${IT_NETWORK:-gm-it-net-$$}
+FIXTURE_FIX_VOL=gm-${IT_RUN_ID:-it-$$}-fixvol
+FIXTURE_PROD_VOL=gm-${IT_RUN_ID:-it-$$}-prodvol
 FIXTURE_NAME=gm-it-upstream-$$
 FIXTURE_PROD=gm-it-sync-$$
 FIXTURE_REPO=acme/demo
 FIXTURE_MOUNT=/var/lib/git-daemon
 FIXTURE_HOME=$FIXTURE_MOUNT/home
+FIXTURE_CA_VOL=gm-${IT_RUN_ID:-it-$$}-fixture-ca
 FIXTURE_CA=$FIXTURE_MOUNT/fixture/tls/ca.crt
 FIXTURE_CHECKS=0
 FIXTURE_FAILURES=0
@@ -109,8 +135,8 @@ HOSTS_READY=0
 PROXY_READY=0
 # 凭据隔离夹具：独立网络与产品卷；合成测试 Token（非真实私人 Token），只在容器环境变量中传递。
 AUTH_TOKEN=ghp_SYNTHETICB2ATOKEN0000000000000000
-AUTH_NET=gm-it-authnet-$$
-AUTH_PROD_VOL=gm-it-authvol-$$
+AUTH_NET=${IT_NETWORK:-gm-it-authnet-$$}
+AUTH_PROD_VOL=gm-${IT_RUN_ID:-it-$$}-authvol
 AUTH_UP=gm-it-authup-$$
 AUTH_PROD=gm-it-authsync-$$
 AUTH_READY=0
@@ -122,15 +148,25 @@ COMPOSE_ENV=()
 # 不设置时行为不变（执行完整套件）。
 IT_FILTER=${IT_FILTER-}
 
+# o1 使用明确场景白名单；c2 保留历史共享空卷与 TZ 前置。
+integration_group_selected() {
+    case "${IT_FILTER:-}:$1" in
+        :*) return 0 ;;
+        o1:network|o1:empty|o1:tz|o1:compose-publish) return 0 ;;
+        c2:network|c2:empty|c2:tz|c2:c2) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 阶段 C-2 有界停止场景：独立命名网络 + 「快速失败/挂起」TCP 端点夹具 + 共享 PID 命名空间的采样侧车。
 # 夹具在 443 上接受后立即关闭（使首次同步/首次刷新快速失败，容器能进入就绪）；
 # 在 8443 上前 N 次同样立即关闭、之后挂起不响应（使首次任务或定时任务形成可控长进程与多层子孙）。
-C2_NET=gm-it-c2net-$$
+C2_NET=${IT_NETWORK:-gm-it-c2net-$$}
 C2_FIX=gm-it-c2fix-$$
 C2_PROD=gm-it-c2prod-$$
 C2_SAMP=gm-it-c2samp-$$
-C2_VOL=gm-it-c2vol-$$
-C2_LOG_VOL=gm-it-c2log-$$
+C2_VOL=gm-${IT_RUN_ID:-it-$$}-c2vol
+C2_LOG_VOL=gm-${IT_RUN_ID:-it-$$}-c2log
 C2_MOUNT=/var/lib/git-daemon
 # 采样侧车挂载产品运行卷的路径：仅用于在 PID1 存活窗口内尝试取操作锁，绝不写入产品卷。
 C2_PROD_MOUNT=/prod
@@ -154,10 +190,59 @@ write_compose_override() {
 services:
   git-daemon:
     restart: "no"
+    labels:
+      gitdaemon.run: "$IT_RUN_ID"
+    dns:
+      - $IT_DNS_IP
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+    networks:
+      default:
+        ipv4_address: 172.30.243.4
+    environment:
+      - GIT_SSL_CAINFO=$O1_CA
+    volumes:
+      - type: volume
+        source: test-ca
+        target: /ca
+        read_only: true
 volumes:
+  test-ca:
+    external: true
+    name: $O1_CA_VOL
   git-daemon-data:
     name: $COMPOSE_VOLUME
+    labels:
+      gitdaemon.run: "$IT_RUN_ID"
+networks:
+  default:
+    external: true
+    name: $O1_NET
 EOF
+}
+
+# 在删除资源前保存日志与网络附件；证据目录必须位于 TEST_ROOT 清理范围之外。
+archive_container() {
+    local name=$1 network destination identity
+    [[ -n ${IT_EVIDENCE_DIR:-} ]] || return 0
+    identity=$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null) || return 0
+    destination=$IT_EVIDENCE_DIR/control/artifacts/$identity-$(date +%s%N)
+    mkdir -p "$destination"
+    docker inspect "$name" >"$destination/inspect.json" 2>/dev/null || return 0
+    docker logs "$name" >"$destination/container.log" 2>&1 || true
+    while IFS= read -r network; do
+        [[ -n $network ]] || continue
+        docker network inspect "$network" >"$destination/$network.network.json" 2>/dev/null || true
+    done < <(docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$name")
+    docker exec "$name" sh -c 'if [ -f /var/lib/git-daemon/fixture/reject.requests ]; then cat /var/lib/git-daemon/fixture/reject.requests; fi' \
+        >"$destination/requests.log" 2>/dev/null || true
+    return 0
+}
+
+# 核查全部网络附件及完整受控策略，非 internal 授权网络也必须通过。
+container_networks_internal() {
+    archive_container "$1"
+    assert_container_network_policy "$1"
 }
 
 # 静态断言 compose.yml 的生产重启策略仍为 unless-stopped，避免读者把 override 的测试作用域
@@ -184,6 +269,14 @@ compose_available() {
 # 仅清理本脚本创建的临时目录、测试作用域卷、compose 项目/网络、夹具容器与本脚本附加的镜像标签；
 # 被检查镜像保留。绝不删除 compose.yml 绑定的全局卷 git-daemon-data。
 cleanup() {
+    local name
+    for name in "$O1_UP" "$EMPTY_CONTAINER" "$TZ_CONTAINER" "$FIXTURE_NAME" "$FIXTURE_PROD" "$AUTH_UP" "$AUTH_PROD" "$C2_FIX" "$C2_PROD"; do
+        archive_container "$name"
+    done
+    if [[ -n ${IT_EVIDENCE_DIR:-} ]]; then
+        mkdir -p "$IT_EVIDENCE_DIR/control/artifacts"
+        cp -R "$TEST_ROOT/." "$IT_EVIDENCE_DIR/control/artifacts/" || return 2
+    fi
     if [[ -n ${C2_SAMP:-} ]]; then
         docker rm -f "$C2_SAMP" >/dev/null 2>&1 || true
     fi
@@ -192,9 +285,6 @@ cleanup() {
     fi
     if [[ -n ${C2_FIX:-} ]]; then
         docker rm -f "$C2_FIX" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${C2_NET:-} ]]; then
-        docker network rm "$C2_NET" >/dev/null 2>&1 || true
     fi
     if [[ -n ${C2_VOL:-} || -n ${C2_LOG_VOL:-} ]]; then
         docker volume rm -f "$C2_VOL" "$C2_LOG_VOL" >/dev/null 2>&1 || true
@@ -235,14 +325,8 @@ cleanup() {
     if [[ -n ${AUTH_PROD:-} ]]; then
         docker rm -f "$AUTH_PROD" >/dev/null 2>&1 || true
     fi
-    if [[ -n ${FIXTURE_NET:-} ]]; then
-        docker network rm "$FIXTURE_NET" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${AUTH_NET:-} ]]; then
-        docker network rm "$AUTH_NET" >/dev/null 2>&1 || true
-    fi
     if [[ -n ${FIXTURE_FIX_VOL:-} || -n ${FIXTURE_PROD_VOL:-} ]]; then
-        docker volume rm -f "$FIXTURE_FIX_VOL" "$FIXTURE_PROD_VOL" >/dev/null 2>&1 || true
+        docker volume rm -f "$FIXTURE_FIX_VOL" "$FIXTURE_PROD_VOL" "$FIXTURE_CA_VOL" >/dev/null 2>&1 || true
     fi
     if [[ -n ${AUTH_PROD_VOL:-} ]]; then
         docker volume rm -f "$AUTH_PROD_VOL" >/dev/null 2>&1 || true
@@ -256,6 +340,8 @@ cleanup() {
     if [[ -n ${VOLUME:-} ]]; then
         docker volume rm -f "$VOLUME" >/dev/null 2>&1 || true
     fi
+    docker rm -f "$O1_UP" >/dev/null 2>&1 || true
+    docker volume rm -f "$O1_VOL" "$O1_CA_VOL" >/dev/null 2>&1 || true
     if [[ -n ${TEST_ROOT:-} && -d $TEST_ROOT && ! -L $TEST_ROOT ]]; then
         rm -rf -- "$TEST_ROOT"
     fi
@@ -453,7 +539,8 @@ empty_volume_formal_startup() {
     docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
     docker volume create "$EMPTY_VOLUME" >/dev/null 2>&1 || return 1
     if ! docker run -d --name "$EMPTY_CONTAINER" --read-only --cap-drop ALL \
-        --security-opt no-new-privileges --user 10001:10001 \
+        --security-opt no-new-privileges --user 10001:10001 --network "$O1_NET" \
+        -v "$O1_CA_VOL:/ca:ro" -e "GIT_SSL_CAINFO=$O1_CA" \
         -v "$EMPTY_VOLUME:/var/lib/git-daemon" \
         -e "REPOS=$TEST_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no \
         "$IMAGE" >/dev/null 2>&1; then
@@ -490,6 +577,9 @@ empty_volume_formal_startup() {
         printf '空命名卷正式启动校验失败，日志尾部：\n' >&2
         docker logs "$id" 2>&1 | tail -n 20 >&2 2>&1 || true
     fi
+    container_networks_internal "$id" || ok=0
+    assert_product_egress "$id" empty || ok=0
+    assert_dns_witness empty || ok=0
     docker rm -f "$id" >/dev/null 2>&1 || true
     docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
     [[ $ok == 1 ]]
@@ -523,10 +613,12 @@ tz_record_volume_hash() {
 tz_start_container() {
     local tz=$1 i
     local -a args=(-d --name "$TZ_CONTAINER" --read-only --cap-drop ALL --security-opt no-new-privileges \
-        --user 10001:10001 -v "$TZ_VOLUME:$TZ_MOUNT" -e "REPOS=$TEST_REPO" -e ENABLE_HOSTS_UPDATE=no)
+        --user 10001:10001 --network "$O1_NET" -v "$O1_CA_VOL:/ca:ro" -e "GIT_SSL_CAINFO=$O1_CA" \
+        -v "$TZ_VOLUME:$TZ_MOUNT" -e "REPOS=$TEST_REPO" -e ENABLE_HOSTS_UPDATE=no)
     [[ -z $tz ]] || args+=(-e "TZ=$tz")
     docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
     docker run "${args[@]}" "$IMAGE" >/dev/null 2>&1 || return 1
+    container_networks_internal "$TZ_CONTAINER" || return 1
     for i in $(seq 1 120); do
         if docker logs "$TZ_CONTAINER" 2>&1 | grep -q '容器前台就绪'; then return 0; fi
         if [[ $(docker inspect -f '{{.State.Running}}' "$TZ_CONTAINER" 2>/dev/null) == false ]]; then break; fi
@@ -637,9 +729,17 @@ compose_up() {
     local log=$TEST_ROOT/compose-up.log status=0
     (
         export IMAGE_TAG="$COMPOSE_TAG" PUBLISHED_PORT="$COMPOSE_PORT"
-        unset GIT_PORT LISTEN_ADDRESS TZ
+        unset GIT_PORT LISTEN_ADDRESS TZ PROXY_URL GITHUB_TOKEN GITHUB_TOKEN_FILE \
+            HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy \
+            HOSTS_URL HOSTS_URL_FALLBACK HOSTS_FALLBACK_URL ENABLE_HOSTS_UPDATE ENABLE_CRON CRON_SCHEDULE HOSTS_CRON REPOS SHORT_LINKS
         if [[ ${#COMPOSE_ENV[@]} -gt 0 ]]; then export "${COMPOSE_ENV[@]}"; fi
-        compose up -d --force-recreate
+        compose config > "$TEST_ROOT/compose-rendered.yml" || exit 1
+        compose up -d --force-recreate || exit 1
+        if [[ ${1:-} == expected-exit ]]; then
+            assert_container_network_configuration "$(compose_container_id)"
+        else
+            container_networks_internal "$(compose_container_id)"
+        fi
     ) >"$log" 2>&1 || status=$?
     if (( status != 0 )); then
         printf 'compose up 失败（%s），输出：\n' "$status" >&2
@@ -684,6 +784,7 @@ compose_remove_container() {
     id=$(compose_container_id) || id=
     if [[ -n $id ]]; then
         docker stop -t 30 "$id" >/dev/null 2>&1 || true
+        archive_container "$id"
         docker rm -f "$id" >/dev/null 2>&1 || true
     fi
     return 0
@@ -696,6 +797,7 @@ compose_kill_container() {
     id=$(compose_container_id) || return 1
     [[ -n $id ]] || return 1
     docker kill "$id" >/dev/null 2>&1 || return 1
+    archive_container "$id"
     docker rm -f "$id" >/dev/null 2>&1 || true
     return 0
 }
@@ -896,11 +998,13 @@ compose_publish_daemon_listens_9418() {
     return 1
 }
 
+# 宿主普通用户 Git 客户端使用同一冻结镜像提取的二进制及库，不创建 host 网络容器。
+source "$ROOT/tests/docker-host-git.sh"
+source "$ROOT/tests/docker-push-denial.sh"
 # 宿主侧真实 git 客户端经容器发布端口访问：带 export-ok 的仓库可 ls-remote。
 compose_publish_exported_readable() {
     local out status=0
-    out=$(docker run --rm --network host --entrypoint git "$IMAGE" \
-        ls-remote "git://127.0.0.1:$COMPOSE_PORT/fixtures/pub.git" 2>&1) || status=$?
+    out=$(host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/fixtures/pub.git" 2>&1) || status=$?
     if [[ $status == 0 ]]; then return 0; fi
     printf 'ls-remote 失败诊断：%s\n' "$out" >&2
     return 1
@@ -910,8 +1014,7 @@ compose_publish_exported_readable() {
 compose_publish_unexported_rejected() {
     compose_publish_exported_readable || return 1
     local out status=0
-    out=$(docker run --rm --network host --entrypoint git "$IMAGE" \
-        ls-remote "git://127.0.0.1:$COMPOSE_PORT/fixtures/secret.git" 2>&1) || status=$?
+    out=$(host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/fixtures/secret.git" 2>&1) || status=$?
     [[ $status != 0 ]] || return 1
     case "$out" in *'not exported'*) return 0 ;; esac
     printf '未发布仓库拒绝诊断：%s\n' "$out" >&2
@@ -921,21 +1024,17 @@ compose_publish_unexported_rejected() {
 # 即使夹具设置了 daemon.receivepack=true，daemon 以 --disable/--forbid-override 启动仍必须拒绝 push。
 compose_publish_push_rejected() {
     compose_publish_exported_readable || return 1
-    local script
-    script='set -e
-cd /tmp
-rm -rf pushsrc; git init -q pushsrc; cd pushsrc
-git config user.email t@example.com
-git config user.name t
-printf x > f
-git add f
-git commit -qm c
-if git push "git://127.0.0.1:'"$COMPOSE_PORT"'/fixtures/pub.git" HEAD:refs/heads/gm-push >/dev/null 2>&1; then
-    exit 1
-fi
-exit 0
-'
-    docker run --rm --network host --user 10001:10001 --entrypoint /bin/sh "$IMAGE" -c "$script" >/dev/null 2>&1
+    local directory=$TEST_ROOT/pushsrc status=0 out
+    mkdir -p "$directory"
+    host_git init -q "$directory" || return $?
+    host_git -C "$directory" config user.email fixture@example.invalid
+    host_git -C "$directory" config user.name fixture
+    printf x > "$directory/file"
+    host_git -C "$directory" add file
+    host_git -C "$directory" commit -qm fixture
+    out=$(host_git -C "$directory" push "git://127.0.0.1:$COMPOSE_PORT/fixtures/pub.git" HEAD:refs/heads/gm-push 2>&1) || status=$?
+    printf 'HOST_PUSH_EXIT=%s OUTPUT=%s\n' "$status" "$out"
+    host_push_denied "$status" "$out"
 }
 
 # 记录重建前卷内 mirror.env 的摘要，供“重建后字节不变”断言比对。
@@ -972,9 +1071,10 @@ compose_retention_repo_present() {
     ' >/dev/null 2>&1
 }
 
-# 容器内真实执行同步（上游仓库不存在，预期失败）：失败后必须保留已有 refs，且确实写入了新一轮同步日志。
+# 容器内真实执行拒绝上游同步，三代复用同一缓存且验证真实宿主发布。
 compose_sync_failure_retains_cache() {
-    local id dir before after before_count after_count script
+    local CACHE_GENERATION=$1
+    local id dir before after before_count after_count script status=0 requests_before requests_after
     id=$(compose_container_id) || return 1
     [[ -n $id ]] || return 1
     dir="/var/lib/git-daemon/repos/octocat/Nonexistent-$COMPOSE_TAG.git"
@@ -995,20 +1095,37 @@ git clone -q --bare "$work" '"$dir"'
 git --git-dir='"$dir"' remote set-url origin https://github.com/octocat/Nonexistent-'"$COMPOSE_TAG"'.git
 : > '"$dir"'/git-daemon-export-ok
 '
-    docker exec "$id" sh -c "$script" >/dev/null 2>&1 || return 1
+    if [[ $CACHE_GENERATION == 1 ]]; then
+        docker exec "$id" sh -c "$script" >/dev/null 2>&1 || return 1
+    fi
+    assert_product_egress "$id" "cache-$CACHE_GENERATION" || return 1
+    assert_dns_witness "cache-$CACHE_GENERATION" || return 1
     before=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
         -c "git --git-dir=$dir for-each-ref --format='%(refname) %(objectname)'" 2>/dev/null) || return 1
     [[ -n $before ]] || return 1
+    if [[ $CACHE_GENERATION == 1 ]]; then
+        printf '%s\n' "$before" > "$TEST_ROOT/cache-original-refs"
+    else
+        [[ $before == "$(cat "$TEST_ROOT/cache-original-refs")" ]] || return 1
+    fi
+    host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/octocat/Nonexistent-$COMPOSE_TAG.git" > "$TEST_ROOT/cache-host-before-$CACHE_GENERATION" || return 1
     before_count=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
         -c "grep -c 'Nonexistent-$COMPOSE_TAG' /var/lib/git-daemon/logs/sync.log 2>/dev/null || echo 0" 2>/dev/null) || before_count=0
     before_count=${before_count:-0}
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 90 docker exec -e HOME=/var/lib/git-daemon/home -e "REPOS=octocat/Nonexistent-$COMPOSE_TAG" "$id" \
-            /usr/local/lib/git-mirror/git-mirror-sync.sh >/dev/null 2>&1 || true
-    else
-        docker exec -e HOME=/var/lib/git-daemon/home -e "REPOS=octocat/Nonexistent-$COMPOSE_TAG" "$id" \
-            /usr/local/lib/git-mirror/git-mirror-sync.sh >/dev/null 2>&1 || true
-    fi
+    docker exec "$id" git ls-remote "git://127.0.0.1:9418/$TEST_REPO" >"$TEST_ROOT/cache-read-before.log" 2>&1 || return 1
+    requests_before=$(o1_requests) || return 1
+    timeout 90 docker exec -e HOME=/var/lib/git-daemon/home -e "REPOS=octocat/Nonexistent-$COMPOSE_TAG" "$id" \
+        /usr/local/lib/git-mirror/git-mirror-sync.sh >"$TEST_ROOT/cache-sync-$CACHE_GENERATION.log" 2>&1 || status=$?
+    requests_after=$(o1_requests) || return 1
+    printf '缓存失败同步：generation=%s exit=%s requests=%s->%s\n' "$CACHE_GENERATION" "$status" "$requests_before" "$requests_after"
+    [[ $status != 0 && $status != 124 && $status != 137 && $requests_after -gt $requests_before ]] || return 1
+    grep -q '同步失败' "$TEST_ROOT/cache-sync-$CACHE_GENERATION.log" || return 1
+    grep -q '503' "$TEST_ROOT/cache-sync-$CACHE_GENERATION.log" || return 1
+    docker exec "$id" test -f "$dir/git-daemon-export-ok" || return 1
+    docker exec "$id" git ls-remote "git://127.0.0.1:9418/$TEST_REPO" >"$TEST_ROOT/cache-read.log" 2>&1 || return 1
+    cmp -s "$TEST_ROOT/cache-read-before.log" "$TEST_ROOT/cache-read.log" || return 1
+    host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/octocat/Nonexistent-$COMPOSE_TAG.git" > "$TEST_ROOT/cache-host-after-$CACHE_GENERATION" || return 1
+    cmp -s "$TEST_ROOT/cache-host-before-$CACHE_GENERATION" "$TEST_ROOT/cache-host-after-$CACHE_GENERATION" || return 1
     after=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
         -c "git --git-dir=$dir for-each-ref --format='%(refname) %(objectname)'" 2>/dev/null) || return 1
     after_count=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
@@ -1126,7 +1243,7 @@ compose_write_invalid_config() {
 # 非法卷内配置下编排启动并等待容器退出（restart=no 下退出稳定可观测）。
 compose_start_expect_failure() {
     local id i
-    compose_up || return 1
+    compose_up expected-exit || return 1
     for i in $(seq 1 40); do
         id=$(compose_container_id) || id=
         if [[ -n $id ]] && [[ $(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null) == false ]]; then
@@ -1172,14 +1289,16 @@ compose_start_tls_fixture() {
     id=$(compose_container_id) || return 1
     [[ -n $id ]] || return 1
     docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
-    script='cd /tmp
+    script='mkdir -p /var/lib/git-daemon/tls-probe && cd /var/lib/git-daemon/tls-probe || exit 1
 printf "%s\n" "140.82.112.3 github.com" > hosts
 if [ ! -f cert.pem ]; then
     openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=127.0.0.1 -keyout key.pem -out cert.pem -days 1 >/dev/null 2>&1
 fi
 exec openssl s_server -accept '"$TLS_FIXTURE_PORT"' -cert cert.pem -key key.pem -WWW -quiet
 '
-    docker run -d --rm --name "$TLS_FIXTURE_NAME" --network "container:$id" --user 10001:10001 \
+    docker volume create "gm-$IT_RUN_ID-tls-probe" >/dev/null || return 1
+    docker run -d --name "$TLS_FIXTURE_NAME" --network "container:$id" --user 10001:10001 \
+        -v "gm-$IT_RUN_ID-tls-probe:/var/lib/git-daemon" \
         --entrypoint /bin/sh "$IMAGE" -c "$script" >/dev/null 2>&1 || return 1
     for i in $(seq 1 20); do
         rc=0
@@ -1232,7 +1351,7 @@ compose_hosts_unreachable_retained() {
     recorded=$(cat "$TEST_ROOT/snapshot.sha" 2>/dev/null) || recorded=
     [[ -n $recorded ]] || return 1
     docker exec -e HOME=/var/lib/git-daemon/home -e ENABLE_HOSTS_UPDATE=yes -e HOSTS_URL_FALLBACK= \
-        -e "HOSTS_URL=https://unreachable.invalid/hosts" \
+        -e "HOSTS_URL=https://github.com/hosts" \
         "$id" /usr/local/lib/git-mirror/update-github-hosts.sh >/dev/null 2>&1 || status=$?
     [[ $status != 0 ]] || return 1
     now=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
@@ -1275,6 +1394,16 @@ check_gated() {
 # 三组夹具各自独立就绪标志：任一组夹具不可用只记夹具失败并阻止其依赖断言。
 check_https_sync() { check_gated FIXTURE_READY "$@"; }
 check_proxy_sync() { check_gated PROXY_READY "$@"; }
+
+# 仅显式选择时延期依赖新增 NAT 的真实映射成功断言，不计为通过。
+check_mapping_sync() {
+    if [[ ${IT_DEFER_MAPPING:-0} == 1 ]]; then
+        DEFERRED=$((${DEFERRED:-0} + 1))
+        printf 'DEFER %s：用户延期新增 NAT 及依赖的真实 mapping 成功验证\n' "$1"
+        return 0
+    fi
+    check_proxy_sync "$@"
+}
 check_auth_sync() { check_gated AUTH_READY "$@"; }
 check_auth_prod() { check_gated AUTH_PROD_READY "$@"; }
 check_hosts_content() { check_gated HOSTS_READY "$@"; }
@@ -1289,8 +1418,21 @@ check_tz_compose2() { check_gated TZ_COMPOSE2_READY "$@"; }
 fixture_create_network_and_volumes() {
     docker volume create "$FIXTURE_FIX_VOL" >/dev/null 2>&1 || return 1
     docker volume create "$FIXTURE_PROD_VOL" >/dev/null 2>&1 || return 1
-    docker network create --subnet "$FIXTURE_SUBNET" "$FIXTURE_NET" >/dev/null 2>&1 || return 1
+    [[ -n ${IT_NETWORK:-} && $FIXTURE_NET == "$IT_NETWORK" ]] || return 77
     return 0
+}
+
+# 仅导出公开证书到独立客户端信任卷；私钥始终留在上游资产卷。
+fixture_prepare_client_ca() {
+    docker volume create "$FIXTURE_CA_VOL" >/dev/null || return 1
+    local cert
+    for cert in ca.crt hosts-bad.crt; do
+        docker run --rm -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT:ro" --entrypoint sh "$IMAGE" \
+            -c "cat $FIXTURE_MOUNT/fixture/tls/$cert" > "$TEST_ROOT/$cert" || return 1
+        docker run --rm -i -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT" --entrypoint sh "$IMAGE" \
+            -c "mkdir -p $FIXTURE_MOUNT/fixture/tls; cat > $FIXTURE_MOUNT/fixture/tls/$cert" \
+            < "$TEST_ROOT/$cert" || return 1
+    done
 }
 
 # 夹具就绪探测：用真实 TLS 客户端经 github.com DNS 别名取到静态 info/refs；连接失败即夹具失败。
@@ -1298,7 +1440,7 @@ fixture_wait_upstream() {
     local i rc=0 code
     for i in $(seq 1 30); do
         rc=0
-        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" \
+        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" \
             --entrypoint /bin/sh "$IMAGE" -c \
             "curl -sS --cacert $FIXTURE_CA --max-time 5 -o /dev/null -w '%{http_code}' https://github.com/$FIXTURE_REPO.git/info/refs" \
             2>"$TEST_ROOT/upstream-probe.err") || rc=$?
@@ -1328,6 +1470,7 @@ fixture_start_product() {
         -e "REPOS=$FIXTURE_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no \
         -e GIT_SMART_HTTP=0 -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$IMAGE" \
         >"$TEST_ROOT/fixture-up.log" 2>&1 || return 1
+    container_networks_internal "$FIXTURE_PROD" || return 1
     for i in $(seq 1 150); do
         if docker logs "$FIXTURE_PROD" 2>&1 | grep -q '容器前台就绪'; then return 0; fi
         if [[ $(docker inspect -f '{{.State.Running}}' "$FIXTURE_PROD" 2>/dev/null) == false ]]; then
@@ -1431,10 +1574,12 @@ fixture_push_rejected() {
     fixture_publish_both_forms || return 1
     docker exec -e "HOME=$FIXTURE_HOME" "$FIXTURE_PROD" sh -c \
         "git --git-dir=$FIXTURE_MOUNT/repos/$FIXTURE_REPO.git config daemon.receivepack true" || return 1
+    docker volume create "gm-$IT_RUN_ID-push-client" >/dev/null || return 1
     out=$(docker run --rm --network "container:$FIXTURE_PROD" --user 10001:10001 -e "HOME=$FIXTURE_HOME" \
+        -v "gm-$IT_RUN_ID-push-client:/var/lib/git-daemon" \
         --entrypoint /bin/sh "$IMAGE" -c '
         set -e
-        cd /tmp; rm -rf pushsrc; git init -q pushsrc; cd pushsrc
+        cd /var/lib/git-daemon; rm -rf pushsrc; git init -q pushsrc; cd pushsrc
         git config user.email fixture@example.invalid
         git config user.name fixture
         printf x > f; git add f; git commit -qm c
@@ -1474,13 +1619,22 @@ fixture_remote_update_reflected() {
 
 # 上游不可达时同步必须失败，且已有引用逐字节保留（失败不破坏缓存）。
 fixture_failure_retains_refs() {
-    local before after status=0
+    local before after status=0 requests_before requests_after read_before read_after
     before=$(fixture_local_refs) || return 1
-    bash "$FIXTURE_SCRIPT" stop "$FIXTURE_NAME" || return 1
+    read_before=$(docker exec "$FIXTURE_PROD" git ls-remote "git://127.0.0.1:9418/$FIXTURE_REPO") || return 1
+    archive_container "$FIXTURE_NAME"
+    bash "$FIXTURE_SCRIPT" reject-start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_NAME" || return 1
+    container_networks_internal "$FIXTURE_NAME" || return 1
+    requests_before=$(docker exec "$FIXTURE_NAME" sh -c 'if [ -f /var/lib/git-daemon/fixture/reject.requests ]; then wc -l < /var/lib/git-daemon/fixture/reject.requests; else echo 0; fi') || return 1
     fixture_exec_sync "$FIXTURE_REPO" >"$TEST_ROOT/fixture-fail.log" 2>&1 || status=$?
-    [[ $status != 0 ]] || return 1
+    requests_after=$(docker exec "$FIXTURE_NAME" sh -c 'wc -l < /var/lib/git-daemon/fixture/reject.requests') || return 1
+    printf 'HTTPS 拒绝同步：exit=%s requests=%s->%s\n' "$status" "$requests_before" "$requests_after"
+    [[ $status != 0 && $status != 124 && $status != 137 && $requests_after -gt $requests_before ]] || return 1
     after=$(fixture_local_refs) || return 1
-    [[ $before == "$after" ]] || return 1
+    read_after=$(docker exec "$FIXTURE_PROD" git ls-remote "git://127.0.0.1:9418/$FIXTURE_REPO") || return 1
+    docker exec "$FIXTURE_PROD" test -f "$FIXTURE_MOUNT/repos/$FIXTURE_REPO.git/git-daemon-export-ok" || return 1
+    [[ $before == "$after" && $read_before == "$read_after" ]] || return 1
+    archive_container "$FIXTURE_NAME"
     grep -q '同步失败' "$TEST_ROOT/fixture-fail.log"
 }
 
@@ -1509,6 +1663,13 @@ compose_teardown() {
     docker volume rm -f "$COMPOSE_VOLUME" >/dev/null 2>&1 || true
     docker image rm -f "$COMPOSE_IMAGE" >/dev/null 2>&1 || true
     return 0
+}
+
+# 串行交接固定产品地址和上游别名；保留认证仍需使用的夹具卷与共享网络。
+fixture_release_shared_endpoints() {
+    local name
+    for name in "$@"; do archive_container "$name"; done
+    docker rm -f "$@" >/dev/null 2>&1
 }
 
 # 读取代理侧 CONNECT 计数（夹具卷内计数文件；缺失时夹具脚本输出 0）。
@@ -1545,7 +1706,7 @@ fixture_wait_proxy() {
         return 1
     }
     for i in $(seq 1 30); do
-        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" \
+        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" \
             --entrypoint /bin/sh "$IMAGE" -c \
             "curl -sS --cacert $FIXTURE_CA --proxy $FIXTURE_PROXY_URL --proxy-cacert $FIXTURE_CA \
                 -o /dev/null -w '%{http_code}' https://github.com/$FIXTURE_REPO.git/info/refs" \
@@ -1593,7 +1754,7 @@ fixture_exec_sync_scenario() {
 # 代理成功路径：配置 PROXY_URL 时真实同步成功，日志记录使用配置代理，且代理侧计数确实增加。
 fixture_proxy_path_succeeds() {
     local out before after
-    out=$(fixture_exec_sync_scenario "$FIXTURE_PROXY_URL" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    out=$(fixture_exec_sync_scenario "$FIXTURE_PROXY_URL" "$([[ ${IT_DEFER_MAPPING:-0} == 1 ]] && printf no || printf yes)" "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-run-output"
     fixture_record_count "$TEST_ROOT/proxy-after-run"
     [[ $out == *'本次同步成功'* ]] || { printf '%s\n' "$out" >&2; return 1; }
@@ -1671,19 +1832,32 @@ fixture_direct_attempts_leave_proxy_untouched() {
     return 0
 }
 
+# 系统 DNS 直连仍独立验证成功与代理计数不变，不依赖延期的映射结果。
+fixture_system_direct_leaves_proxy_untouched() {
+    local out before after rejected_before rejected_after
+    rejected_before=$(fixture_read_count "$TEST_ROOT/proxy-system-before")
+    rejected_after=$(fixture_read_count "$TEST_ROOT/proxy-system-after")
+    (( rejected_after > rejected_before )) || return 1
+    before=$(fixture_connect_count)
+    out=$(fixture_exec_sync_scenario '' no "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    after=$(fixture_connect_count)
+    printf '%s\n' "$out" > "$TEST_ROOT/proxy-system-direct-output"
+    [[ $out == *'本次同步成功'* && $out == *'同步传输路径：直连系统 DNS'* && $before == "$after" ]]
+}
+
 # 凭据夹具：在独立网络上以 github.com 别名启动需要 Basic 凭据的认证上游；
 # 就绪判据是未带凭据的真实请求得到 401，证明该夹具确实要求鉴权。
 fixture_start_auth_upstream() {
     local expect i code
     expect="Basic $(printf 'x-access-token:%s' "$AUTH_TOKEN" | base64 | tr -d '\n')"
-    docker network create "$AUTH_NET" >/dev/null 2>&1 || return 1
+    [[ -n ${IT_NETWORK:-} && $AUTH_NET == "$IT_NETWORK" ]] || return 77
     bash "$FIXTURE_SCRIPT" auth-start "$FIXTURE_FIX_VOL" "$IMAGE" "$AUTH_NET" "$AUTH_UP" "$expect" || return 1
     [[ $(docker inspect -f '{{.State.Running}}' "$AUTH_UP" 2>/dev/null) == true ]] || {
         printf '认证上游容器未运行，判定凭据夹具失败\n' >&2
         return 1
     }
     for i in $(seq 1 30); do
-        code=$(docker run --rm --network "$AUTH_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+        code=$(docker run --rm --network "$AUTH_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" -c \
             "curl -sS --cacert $FIXTURE_CA -o /dev/null -w '%{http_code}' https://github.com/$FIXTURE_REPO.git/info/refs" \
             2>/dev/null) || code=
         if [[ $code == 401 ]]; then return 0; fi
@@ -1710,6 +1884,8 @@ fixture_start_auth_product() {
         -e "REPOS=$FIXTURE_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no -e GIT_SMART_HTTP=0 \
         -e "GITHUB_TOKEN=$AUTH_TOKEN" -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$IMAGE" \
         >"$TEST_ROOT/auth-product.log" 2>&1 || return 1
+    container_networks_internal "$AUTH_PROD" || return 1
+    container_networks_internal "$AUTH_UP" || return 1
     for i in $(seq 1 150); do
         if docker logs "$AUTH_PROD" 2>&1 | grep -q '容器前台就绪'; then return 0; fi
         if [[ $(docker inspect -f '{{.State.Running}}' "$AUTH_PROD" 2>/dev/null) == false ]]; then
@@ -1763,11 +1939,9 @@ fixture_daemon_env_excludes_token() {
 # 对照：真实 Git 客户端不带凭据访问同一受认证夹具必须失败，证明鉴权断言非空转。
 fixture_auth_requires_token() {
     local out status=0
-    out=$(docker run --rm --network "$AUTH_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
-        "cd /tmp && rm -rf anon.git && git init -q --bare anon.git && \
-         git --git-dir=/tmp/anon.git remote add origin https://github.com/$FIXTURE_REPO.git && \
-         GIT_TERMINAL_PROMPT=0 GIT_SMART_HTTP=0 git -c http.sslCAInfo=$FIXTURE_CA \
-         --git-dir=/tmp/anon.git fetch --atomic --prune origin" 2>&1) || status=$?
+    out=$(docker run --rm --network "$AUTH_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" -c \
+        "GIT_TERMINAL_PROMPT=0 GIT_SMART_HTTP=0 git -c http.sslCAInfo=$FIXTURE_CA \
+         ls-remote https://github.com/$FIXTURE_REPO.git" 2>&1) || status=$?
     [[ $status != 0 ]] || { printf '无凭据访问意外成功\n' >&2; return 1; }
     case "$out" in
         *401*|*'Authentication failed'*|*authentication*|*'could not read Username'*|*认证*) return 0 ;;
@@ -1883,7 +2057,7 @@ fixture_wait_hosts_endpoints() {
     local i rc code probe
     for i in $(seq 1 30); do
         rc=0
-        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+        code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" -c \
             "curl -sS --cacert $FIXTURE_CA --max-time 5 -o /dev/null -w '%{http_code}' https://$FIXTURE_HOSTS_ALIAS/hosts" \
             2>"$TEST_ROOT/hosts-probe.err") || rc=$?
         if [[ $rc == 0 && $code == 200 ]]; then break; fi
@@ -1895,7 +2069,7 @@ fixture_wait_hosts_endpoints() {
         sleep 1
     done
     rc=0
-    probe=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" -c \
+    probe=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" -c \
         "curl -sS --cacert $FIXTURE_CA --max-time 5 -o /dev/null -w '%{http_code} %{size_download}' https://$FIXTURE_HOSTS_ALIAS/empty" \
         2>"$TEST_ROOT/hosts-empty-probe.err") || rc=$?
     [[ $rc == 0 && $probe == '200 0' ]] || {
@@ -1908,11 +2082,11 @@ fixture_wait_hosts_endpoints() {
         "curl -sS --max-time 5 -o /dev/null https://$FIXTURE_HOSTS_ALIAS/hosts" >/dev/null 2>&1 || rc=$?
     [[ $rc != 0 ]] || { printf '可信端点未校验证书却成功，夹具前提不成立\n' >&2; return 1; }
     rc=0
-    code=$(docker run --rm --network "$FIXTURE_NET" --entrypoint /bin/sh "$IMAGE" -c \
-        "curl -sS -k --max-time 5 -o /dev/null -w '%{http_code}' https://$FIXTURE_HOSTS_BAD_ALIAS/hosts" \
+    code=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" -c \
+        "curl -sS --cacert $FIXTURE_MOUNT/fixture/tls/hosts-bad.crt --max-time 5 -o /dev/null -w '%{http_code}' https://$FIXTURE_HOSTS_BAD_ALIAS/hosts" \
         2>"$TEST_ROOT/hosts-bad-probe.err") || rc=$?
     [[ $rc == 0 && $code == 200 ]] || {
-        printf '错误证书端点不可达（-k 探测失败，curl %s，HTTP %s）：\n' "$rc" "$code" >&2
+        printf '错误证书端点不可达（独立信任探测失败，curl %s，HTTP %s）：\n' "$rc" "$code" >&2
         cat "$TEST_ROOT/hosts-bad-probe.err" >&2 2>/dev/null || true
         return 1
     }
@@ -1976,7 +2150,7 @@ fixture_hosts_oversize_fails_retains() {
 # 证明刷新失败只能归因于体积上限，而非「无有效记录」——这是与全零字节内容的判别依据。
 fixture_hosts_oversize_content_valid_without_cap() {
     local out rc=0 count
-    out=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_FIX_VOL:$FIXTURE_MOUNT" --entrypoint /bin/bash "$IMAGE" -c "
+    out=$(docker run --rm --network "$FIXTURE_NET" -v "$FIXTURE_CA_VOL:$FIXTURE_MOUNT:ro" --entrypoint /bin/bash "$IMAGE" -c "
         source /usr/local/lib/git-mirror/lib/foundation.sh
         curl -sS --cacert $FIXTURE_CA --max-time 30 -- 'https://$FIXTURE_HOSTS_ALIAS/big' \
             | gm_hosts_filter_records \
@@ -2088,8 +2262,10 @@ check_c2() { check_gated C2_READY "$@"; }
 
 # 销毁上一场 C-2 场景的网络、卷与容器；全部属测试作用域，绝不触碰全局命名卷。
 c2_scene_teardown() {
+    archive_container "$C2_FIX"
+    archive_container "$C2_PROD"
+    archive_container "$C2_SAMP"
     docker rm -f "$C2_SAMP" "$C2_PROD" "$C2_FIX" >/dev/null 2>&1 || true
-    docker network rm "$C2_NET" >/dev/null 2>&1 || true
     docker volume rm -f "$C2_VOL" "$C2_LOG_VOL" >/dev/null 2>&1 || true
     return 0
 }
@@ -2099,7 +2275,7 @@ c2_scene_teardown() {
 c2_scene_fixture() {
     local hang_after=$1 script
     c2_scene_teardown
-    docker network create "$C2_NET" >/dev/null 2>&1 || return 1
+    [[ -n ${IT_NETWORK:-} && $C2_NET == "$IT_NETWORK" ]] || return 77
     docker volume create "$C2_VOL" >/dev/null 2>&1 || return 1
     docker volume create "$C2_LOG_VOL" >/dev/null 2>&1 || return 1
     script=$(cat <<'EOS'
@@ -2140,7 +2316,9 @@ c2_scene_start_product() {
     docker rm -f "$C2_PROD" >/dev/null 2>&1 || true
     docker run -d --name "$C2_PROD" --network "$C2_NET" --read-only --cap-drop ALL \
         --security-opt no-new-privileges --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" \
-        "${args[@]}" "$IMAGE" >/dev/null 2>&1
+        "${args[@]}" "$IMAGE" >/dev/null 2>&1 || return 1
+    container_networks_internal "$C2_PROD" || return 1
+    container_networks_internal "$C2_FIX"
 }
 
 # 判定本地时间线是否已出现目标模式的「多层任务树」：同步模式等传输助手（git-remote-*/fetch --progress），
@@ -2540,7 +2718,14 @@ c2_run_scenario() {
     c2_scene_teardown
 }
 
+# 定向契约探针只加载函数，不启动业务、构建镜像或发出上游请求。
+if [[ ${IT_SOURCE_ONLY:-0} == 1 ]]; then
+    return 0
+fi
+
 # docker 完全不可用（CLI 缺失或守护进程不可达）才整体跳过并返回 77。
+[[ ${IT_NETWORK_GUARD_READY:-} == 1 && $(id -u) != 0 ]] || exit 77
+case "$IT_FILTER" in ''|o1|c2) ;; *) exit 64 ;; esac
 if ! docker_available; then
     printf 'SKIP：docker 不可用，未执行\n'
     exit 77
@@ -2551,9 +2736,16 @@ write_compose_override
 COMPOSE_ENABLED=0
 if compose_available; then
     COMPOSE_ENABLED=1
+elif [[ $IT_FILTER != c2 ]]; then
+    printf 'FAIL：必需的 Docker Compose 不可用，未执行集成业务\n' >&2
+    exit 1
 fi
 
-check 'docker build --no-cache 退出码为 0' build_image
+if [[ -n ${IT_PRODUCT_IMAGE:-} ]]; then
+    check '已冻结产品镜像可用（构建由非 root 预备阶段完成）' docker image inspect "$IMAGE"
+else
+    check 'docker build --no-cache 退出码为 0' build_image
+fi
 check '镜像默认运行身份为 10001:10001' image_user_is_nonroot
 check '镜像实际运行身份真实与有效 UID 均为 10001' run_identity_nonroot
 check '由 RUN 生成的路径属主为 10001（构建步骤非 root）' build_paths_owned_by_app
@@ -2566,6 +2758,9 @@ check '入口拒绝 UID 0（UID 查询替身，非实际 root 容器）' entry_r
 # 就绪判据：正式入口按内核 LISTEN 状态与本地地址端口判定，同端口非 LISTEN 连接不得算就绪。
 readiness_assert '就绪判据：真实 LISTEN 判定为就绪（正对照）' readiness_positive_control
 readiness_assert '就绪判据：同端口非 LISTEN 连接不判为就绪' readiness_rejects_nonlisten
+
+fixture_step 'O1 共享受控网络与可信 HTTPS 拒绝端点' o1_prepare
+[[ $FIXTURE_FAILURES == 0 ]] || exit 1
 
 # 正常启动路径：正式入口在空命名卷上生成配置、初始目录权限正确、进入前台就绪且 daemon 真实监听。
 check '空命名卷正式启动：配置生成、初始目录权限正确且 daemon 真实监听' empty_volume_formal_startup
@@ -2602,7 +2797,7 @@ check_tz_def 'TZ[default] 首次地址刷新被禁用，未向真实公网发起
 docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
 docker volume rm -f "$TZ_VOLUME" >/dev/null 2>&1 || true
 
-if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
+if integration_group_selected compose-publish && [[ $COMPOSE_ENABLED == 1 ]]; then
     # 后续所有 compose 子命令（ps/logs/down）都需成功渲染镜像引用，故在此统一导出 IMAGE_TAG。
     export IMAGE_TAG=$COMPOSE_TAG
     check 'Compose 为本地镜像附加 registry 标签' compose_tag_local_image
@@ -2682,16 +2877,18 @@ if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
     check '发布边界：未带 export-ok 仓库被拒绝' compose_publish_unexported_rejected
     check '发布边界：即使 receivepack=true 也拒绝 push' compose_publish_push_rejected
     compose_record_mirror_env_sha
-    check '同步失败保留已有缓存（容器内真实同步）' compose_sync_failure_retains_cache
+    check '同步失败保留已有缓存（容器内真实同步）' compose_sync_failure_retains_cache 1
     compose_remove_container
     check 'Compose 停止并删除容器后重建（保留命名卷）' compose_start
     check '数据保留：重建后容器就绪' compose_wait_running
+    check '重建代拒绝上游且保留同一缓存与宿主发布' compose_sync_failure_retains_cache 2
     check '数据保留：卷内标记文件仍在' compose_retention_marker_present
     check '数据保留：卷内预置仓库与导出标记仍在' compose_retention_repo_present
     check '数据保留：daemon 重建后仍对外提供该仓库' compose_publish_exported_readable
     check '卷内配置：重建后 mirror.env 字节不变' compose_mirror_env_unchanged
     compose_remove_container
 
+    if integration_group_selected compose-runtime; then
     # 场景 S2：调度真实派发与以非 root 执行；随后 docker stop 宽限期内退出且无残留进程。
     COMPOSE_ENV=("REPOS=$TEST_REPO" "ENABLE_HOSTS_UPDATE=no" "ENABLE_CRON=yes" "CRON_SCHEDULE=* * * * *")
     check 'Compose 调度场景启动' compose_start
@@ -2730,6 +2927,7 @@ if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
     check '地址刷新：来源不可达仍保留旧快照且容器不退出' compose_hosts_unreachable_retained
     compose_remove_container
 
+    fi
     # 场景 S6：docker kill（SIGKILL）终止容器后同卷重建。SIGKILL 不触发入口信号处理，
     # 卷内残留 OpenRC 用户态“已启动”状态与陈旧 pidfile；重建后 daemon 必须真实恢复监听，
     # 并通过发布端口对外可达（而非仅 .State.Running 为真）。
@@ -2742,6 +2940,7 @@ if [[ $COMPOSE_ENABLED == 1 && $IT_FILTER != c2 ]]; then
     check '强杀重建场景：docker kill（SIGKILL）并删除容器' compose_kill_container
     check 'Compose 强杀后同卷重建启动' compose_start
     check 'Compose 强杀后同卷重建就绪' compose_wait_running
+    check '强杀重建代拒绝上游且保留同一缓存与宿主发布' compose_sync_failure_retains_cache 3
     check '强杀重建后 daemon 真实监听 9418' compose_publish_daemon_listens_9418
     check '强杀重建后发布端口真实可达（非仅 State.Running）' compose_publish_exported_readable
     compose_remove_container
@@ -2752,7 +2951,8 @@ else
 fi
 
 # 隔离夹具组（S7/S8/S10/S9）：设置 IT_FILTER=c2 时跳过，便于只跑 C-2 有界停止场景。
-if [[ $IT_FILTER != c2 ]]; then
+if integration_group_selected https; then
+fixture_step 'TLS 夹具：释放前序 github.com 拒绝端点' fixture_release_shared_endpoints "$O1_UP"
 # 场景 S7：隔离 HTTPS 夹具（自定义网络 + github.com DNS 别名 + 测试 CA）下的真实成功同步。
 # 夹具不在生产镜像内；夹具准备/就绪失败记为独立的夹具失败并阻止依赖断言，
 # 依赖断言只在夹具就绪后以真实 Git 客户端与真实网络请求的观察结果判定。
@@ -2760,6 +2960,7 @@ TLS_FIXTURE_BASE=$FIXTURE_FAILURES
 fixture_step 'TLS 夹具：创建隔离网络与命名卷' fixture_create_network_and_volumes
 fixture_step 'TLS 夹具：生成 Git dumb HTTP 上游与测试 CA' \
     bash "$FIXTURE_SCRIPT" prepare "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO"
+fixture_step 'TLS 夹具：仅导出公开证书至客户端信任卷' fixture_prepare_client_ca
 fixture_step 'TLS 夹具：启动 github.com:443 TLS 上游' \
     bash "$FIXTURE_SCRIPT" start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_NAME"
 fixture_step 'TLS 夹具：上游 HTTPS 就绪探测' fixture_wait_upstream
@@ -2789,9 +2990,10 @@ fixture_step 'HTTPS 代理：记录代理基线计数' fixture_record_proxy_base
 if [[ $FIXTURE_FAILURES == $S8_BASE ]]; then PROXY_READY=1; fi
 check_proxy_sync 'HTTPS 代理：配置 PROXY_URL 时真实同步成功（代理路径）' fixture_proxy_path_succeeds
 check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT 且计数增加' fixture_proxy_connect_evidence
-check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
+check_mapping_sync '传输顺序：代理可达但拒绝 CONNECT 后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
 check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
-check_proxy_sync '传输顺序：非 proxy 直连尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
+check_mapping_sync '传输顺序：非 proxy 映射直连尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
+check_proxy_sync '传输顺序：非 proxy 系统 DNS 直连尝试不增加代理计数' fixture_system_direct_leaves_proxy_untouched
 
 # 场景 S10：正式镜像内地址快照内容级校验与证书失败（多地址/拒绝/空/超限/主备/原子替换/错误证书/系统文件）。
 # 端点与内容文件属测试私有夹具；夹具未就绪记独立夹具失败并阻止依赖断言；断言读真实卷内快照字节。
@@ -2820,7 +3022,9 @@ check_hosts_content '地址内容：项目运行不修改系统 hosts/resolv.con
 # 场景 S9：合成 Token 访问受认证夹具与常驻 daemon 进程的凭据隔离。
 # 使用独立网络与产品卷（github.com 别名冲突），Token 为合成测试值，仅以容器环境变量提供。
 S9_BASE=$FIXTURE_FAILURES
-fixture_step '凭据夹具：在独立网络启动受认证上游（未带凭据为 401）' fixture_start_auth_upstream
+fixture_step '凭据夹具：释放前序产品地址和上游别名并保留认证依赖卷' \
+    fixture_release_shared_endpoints "$FIXTURE_PROD" "$FIXTURE_NAME"
+fixture_step '凭据夹具：在共享网络启动受认证上游（未带凭据为 401）' fixture_start_auth_upstream
 fixture_step '凭据夹具：准备产品卷并信任测试 CA' fixture_prepare_auth_product_volume
 if [[ $FIXTURE_FAILURES == $S9_BASE ]]; then AUTH_READY=1; fi
 # 入口前台就绪属夹具步骤：因夹具/网络原因起不来只记夹具失败，不冒充产品断言，也不级联牵连后续断言。
@@ -2830,10 +3034,15 @@ if [[ $FIXTURE_FAILURES == $S9_PROD_BASE ]]; then AUTH_PROD_READY=1; fi
 check_auth_prod '凭据隔离：合成 Token 访问受认证夹具成功' fixture_auth_sync_with_token_succeeds
 check_auth_prod '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
 check_auth_sync '凭据夹具：真实 Git 客户端无凭据访问被拒绝（鉴权非空转）' fixture_auth_requires_token
+fixture_step '凭据夹具：释放产品地址和上游别名' fixture_release_shared_endpoints "$AUTH_PROD" "$AUTH_UP"
 fi
 
 # 场景 S11 前置：强杀重建相关产品改动的定向行为用例（无需 Compose），
 # 使「复位陈旧服务状态移除陈旧 pidfile」具备独立于 S6 的红绿覆盖。
+if integration_group_selected c2; then
+if [[ $IT_FILTER == c2 ]]; then
+    fixture_step 'C-2：释放共享 github.com 拒绝端点' fixture_release_shared_endpoints "$O1_UP"
+fi
 check 'C-2 复位陈旧服务状态移除陈旧 pidfile（PID 复用不误判）' c2_reset_removes_stale_pidfile
 
 # 场景 S11：有界停止（C-2）。首次同步、定时同步、定时 hosts 刷新分别构造可控长进程与多层子孙，
@@ -2845,6 +3054,7 @@ c2_run_scenario timedsync 1 TERM
 c2_run_scenario timedsync 1 INT
 c2_run_scenario timedhosts 1 TERM
 c2_run_scenario timedhosts 1 INT
+fi
 
-printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES"
+printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s；显式延期：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES" "${DEFERRED:-0}"
 [[ $FAILURES == 0 && $FIXTURE_FAILURES == 0 ]]

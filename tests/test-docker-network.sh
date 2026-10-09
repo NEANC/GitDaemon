@@ -353,7 +353,7 @@ contract_case() {
 }
 case "${1:-}" in
     --contracts) contracts ;;
-    --live)
+    --live|--integration)
         trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
         trap 'exit 143' TERM
         trap 'exit 130' INT
@@ -365,8 +365,14 @@ case "${1:-}" in
         [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
         # 降权后切换到可访问的源码目录，不继承管理员的私有工作目录。
         cd -- "$HERE/.." || exit $?
-        source "$HERE/docker-network-fixture.sh"
-        network_probe
+        if [[ $1 == --live ]]; then
+            source "$HERE/docker-network-fixture.sh"
+            network_probe
+        else
+            # 子进程保留自己的清理 trap，外层握手 runner 独立采集退出码。
+            [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
+            bash "$HERE/test-docker-integration.sh"
+        fi
         ;;
     *) printf 'usage: %s --contracts|--live\n' "$0" >&2; exit 2 ;;
 esac

@@ -17,6 +17,7 @@
 # 退出码：0 成功；80 夹具失败；2 用法错误。
 
 set -uo pipefail
+source "$(dirname -- "${BASH_SOURCE[0]}")/docker-integration-startup.sh"
 
 FIXTURE_MOUNT=/var/lib/git-daemon
 FIXTURE_ROOT=$FIXTURE_MOUNT/fixture
@@ -58,6 +59,7 @@ usage() {
 用法：
   docker-https-fixture.sh prepare     <volume> <image> <owner/name>
   docker-https-fixture.sh start       <volume> <image> <network> <name>
+  docker-https-fixture.sh reject-start <volume> <image> <network> <name>
   docker-https-fixture.sh update      <volume> <image> <owner/name> <branch> <message>
   docker-https-fixture.sh rev-parse   <volume> <image> <owner/name> <ref>
   docker-https-fixture.sh ca          <volume> <image>
@@ -264,6 +266,39 @@ AUTH
     return 0
 }
 
+# 稳定 HTTPS 拒绝端点：保持 github.com 别名，逐请求计数并返回有长度的 503，不触发外部 DNS。
+cmd_reject_start() {
+    local volume=$1 image=$2 network=$3 name=$4 body
+    body=$(cat <<'REJECT'
+#!/bin/bash
+set -eu
+R=/var/lib/git-daemon/fixture
+mkfifo "$R/reject.in" "$R/reject.out"
+exec 3<>"$R/reject.in"
+exec 4<>"$R/reject.out"
+openssl s_server -quiet -accept 443 -cert "$R/tls/srv.crt" -key "$R/tls/srv.key" <&3 >&4 2>/dev/null &
+server=$!
+trap 'kill "$server" 2>/dev/null || true' EXIT
+while IFS= read -r line <&4; do
+    while IFS= read -r header <&4; do
+        [[ ${header%$'\r'} == '' ]] && break
+    done
+    printf '%s\n' "$line" >> "$R/reject.requests"
+    printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n' >&3
+done
+REJECT
+)
+    volume_run "$volume" "$image" "rm -f $FIXTURE_ROOT/reject.in $FIXTURE_ROOT/reject.out" || return "$FIXTURE_FAILURE"
+    fixture_write_script "$volume" "$image" "$FIXTURE_ROOT/reject.sh" "$body" || return "$FIXTURE_FAILURE"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --network "$network" --network-alias github.com \
+        --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --sysctl net.ipv4.ip_unprivileged_port_start=443 --user 10001:10001 \
+        -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/bash "$image" "$FIXTURE_ROOT/reject.sh" \
+        >/dev/null || return "$FIXTURE_FAILURE"
+    fixture_wait_running "$name"
+}
+
 # 在自定义网络上以 github.com 别名启动 TLS 上游（非 root，静态 dumb HTTP）。
 cmd_start() {
     local volume=$1 image=$2 network=$3 name=$4
@@ -435,6 +470,7 @@ main() {
     case "$command" in
         prepare) [[ $# == 3 ]] || usage; cmd_prepare "$@" ;;
         start) [[ $# == 4 ]] || usage; cmd_start "$@" ;;
+        reject-start) [[ $# == 4 ]] || usage; cmd_reject_start "$@" ;;
         update) [[ $# == 5 ]] || usage; cmd_update "$@" ;;
         rev-parse) [[ $# == 4 ]] || usage; cmd_rev_parse "$@" ;;
         ca) [[ $# == 2 ]] || usage; cmd_ca "$@" ;;
