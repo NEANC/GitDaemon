@@ -224,25 +224,44 @@ EOF
 
 # 在删除资源前保存日志与网络附件；证据目录必须位于 TEST_ROOT 清理范围之外。
 archive_container() {
-    local name=$1 network destination identity
+    local rc=0
+    archive_container_files "$@" || rc=$?
+    if (( rc != 0 )); then
+        printf 'ARCHIVE=%s EXIT=%s\n' "$1" "$rc" >> "$IT_EVIDENCE_DIR/control/integration-failures.log" || return 2
+    fi
+    return "$rc"
+}
+
+# 查询成功且对象不存在才跳过；所有实际归档错误向上传播。
+archive_container_files() {
+    local name=$1 network destination identity networks running
     [[ -n ${IT_EVIDENCE_DIR:-} ]] || return 0
-    identity=$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null) || return 0
+    identity=$(docker ps -aq --filter "id=$name" --filter "label=gitdaemon.run=$IT_RUN_ID") || return $?
+    if [[ -z $identity ]]; then
+        identity=$(docker ps -aq --filter "name=^/$name$" --filter "label=gitdaemon.run=$IT_RUN_ID") || return $?
+    fi
+    [[ -n $identity ]] || return 0
+    identity=$(docker inspect -f '{{.Id}}' "$name") || return $?
     destination=$IT_EVIDENCE_DIR/control/artifacts/$identity-$(date +%s%N)
-    mkdir -p "$destination"
-    docker inspect "$name" >"$destination/inspect.json" 2>/dev/null || return 0
-    docker logs "$name" >"$destination/container.log" 2>&1 || true
+    mkdir -p "$destination" || return $?
+    docker inspect "$name" >"$destination/inspect.json" || return $?
+    docker logs "$name" >"$destination/container.log" 2>&1 || return $?
+    networks=$(docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$name") || return $?
     while IFS= read -r network; do
         [[ -n $network ]] || continue
-        docker network inspect "$network" >"$destination/$network.network.json" 2>/dev/null || true
-    done < <(docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$name")
-    docker exec "$name" sh -c 'if [ -f /var/lib/git-daemon/fixture/reject.requests ]; then cat /var/lib/git-daemon/fixture/reject.requests; fi' \
-        >"$destination/requests.log" 2>/dev/null || true
+        docker network inspect "$network" >"$destination/$network.network.json" || return $?
+    done <<< "$networks"
+    running=$(docker inspect -f '{{.State.Running}}' "$name") || return $?
+    if [[ $running == true ]]; then
+        docker exec "$name" sh -c 'if [ -f /var/lib/git-daemon/fixture/reject.requests ]; then cat /var/lib/git-daemon/fixture/reject.requests; fi' \
+            >"$destination/requests.log" || return $?
+    fi
     return 0
 }
 
 # 核查全部网络附件及完整受控策略，非 internal 授权网络也必须通过。
 container_networks_internal() {
-    archive_container "$1"
+    archive_container "$1" || return $?
     assert_container_network_policy "$1"
 }
 
@@ -270,82 +289,34 @@ compose_available() {
 # 仅清理本脚本创建的临时目录、测试作用域卷、compose 项目/网络、夹具容器与本脚本附加的镜像标签；
 # 被检查镜像保留。绝不删除 compose.yml 绑定的全局卷 git-daemon-data。
 cleanup() {
-    local name
-    for name in "$O1_UP" "$EMPTY_CONTAINER" "$TZ_CONTAINER" "$FIXTURE_NAME" "$FIXTURE_PROD" "$AUTH_UP" "$AUTH_PROD" "$C2_FIX" "$C2_PROD"; do
-        archive_container "$name"
-    done
+    local primary=$? clean=0 ids name
+    trap - EXIT
+    set +e
+    [[ ! -s $IT_EVIDENCE_DIR/control/integration-failures.log ]] || clean=2
     if [[ -n ${IT_EVIDENCE_DIR:-} ]]; then
-        mkdir -p "$IT_EVIDENCE_DIR/control/artifacts"
-        cp -R "$TEST_ROOT/." "$IT_EVIDENCE_DIR/control/artifacts/" || return 2
+        mkdir -p "$IT_EVIDENCE_DIR/control/artifacts" || clean=2
+        cp -R "$TEST_ROOT/." "$IT_EVIDENCE_DIR/control/artifacts/" || clean=2
     fi
-    if [[ -n ${C2_SAMP:-} ]]; then
-        docker rm -f "$C2_SAMP" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${C2_PROD:-} ]]; then
-        docker rm -f "$C2_PROD" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${C2_FIX:-} ]]; then
-        docker rm -f "$C2_FIX" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${C2_VOL:-} || -n ${C2_LOG_VOL:-} ]]; then
-        docker volume rm -f "$C2_VOL" "$C2_LOG_VOL" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${TLS_FIXTURE_NAME:-} ]]; then
-        docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${EMPTY_CONTAINER:-} ]]; then
-        docker rm -f "$EMPTY_CONTAINER" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${EMPTY_VOLUME:-} ]]; then
-        docker volume rm -f "$EMPTY_VOLUME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${TZ_CONTAINER:-} ]]; then
-        docker rm -f "$TZ_CONTAINER" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${TZ_VOLUME:-} ]]; then
-        docker volume rm -f "$TZ_VOLUME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${FIXTURE_NAME:-} ]]; then
-        docker rm -f "$FIXTURE_NAME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${FIXTURE_PROD:-} ]]; then
-        docker rm -f "$FIXTURE_PROD" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${FIXTURE_PROXY_NAME:-} ]]; then
-        docker rm -f "$FIXTURE_PROXY_NAME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${FIXTURE_HOSTS_NAME:-} ]]; then
-        docker rm -f "$FIXTURE_HOSTS_NAME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${FIXTURE_HOSTS_BAD_NAME:-} ]]; then
-        docker rm -f "$FIXTURE_HOSTS_BAD_NAME" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${AUTH_UP:-} ]]; then
-        docker rm -f "$AUTH_UP" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${AUTH_PROD:-} ]]; then
-        docker rm -f "$AUTH_PROD" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${FIXTURE_FIX_VOL:-} || -n ${FIXTURE_PROD_VOL:-} ]]; then
-        docker volume rm -f "$FIXTURE_FIX_VOL" "$FIXTURE_PROD_VOL" "$FIXTURE_CA_VOL" >/dev/null 2>&1 || true
-    fi
-    if [[ -n ${AUTH_PROD_VOL:-} ]]; then
-        docker volume rm -f "$AUTH_PROD_VOL" >/dev/null 2>&1 || true
-    fi
-    if [[ -f ${COMPOSE_OVERRIDE:-} ]]; then
+    ids=$(docker ps -aq --filter "label=gitdaemon.run=$IT_RUN_ID") || clean=2
+    for name in $ids; do
+        archive_container "$name" || { clean=2; continue; }
+        docker rm -f "$name" || clean=2
+    done
+    if [[ $clean == 0 && -f ${COMPOSE_OVERRIDE:-} ]]; then
         IMAGE_TAG=$COMPOSE_TAG REPOS=$TEST_REPO \
-            compose down -v --remove-orphans >/dev/null 2>&1 || true
+            compose down -v --remove-orphans || clean=2
     fi
-    docker volume rm -f "$COMPOSE_VOLUME" >/dev/null 2>&1 || true
-    docker image rm -f "$COMPOSE_IMAGE" >/dev/null 2>&1 || true
-    if [[ -n ${VOLUME:-} ]]; then
-        docker volume rm -f "$VOLUME" >/dev/null 2>&1 || true
+    ids=$(docker volume ls -q --filter "label=gitdaemon.run=$IT_RUN_ID") || clean=2
+    for name in $ids; do docker volume rm "$name" || clean=2; done
+    ids=$(docker image ls -q --filter "reference=$COMPOSE_IMAGE") || clean=2
+    if [[ -n $ids ]]; then docker image rm "$COMPOSE_IMAGE" || clean=2; fi
+    if [[ $clean == 0 && -n ${TEST_ROOT:-} && -d $TEST_ROOT && ! -L $TEST_ROOT ]]; then
+        rm -rf -- "$TEST_ROOT" || clean=2
     fi
-    docker rm -f "$O1_UP" >/dev/null 2>&1 || true
-    docker volume rm -f "$O1_VOL" "$O1_CA_VOL" >/dev/null 2>&1 || true
-    if [[ -n ${TEST_ROOT:-} && -d $TEST_ROOT && ! -L $TEST_ROOT ]]; then
-        rm -rf -- "$TEST_ROOT"
-    fi
+    printf 'INTEGRATION_PRIMARY_EXIT=%s\nINTEGRATION_CLEANUP_EXIT=%s\nTEST_ROOT=%s\nCOMPOSE_IMAGE=%s\n' \
+        "$primary" "$clean" "$TEST_ROOT" "$COMPOSE_IMAGE" > "$IT_EVIDENCE_DIR/control/integration-status.txt" || clean=2
+    if (( primary != 0 )); then exit "$primary"; fi
+    exit "$clean"
 }
 trap cleanup EXIT
 
