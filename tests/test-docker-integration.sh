@@ -2692,6 +2692,16 @@ c2_reset_removes_stale_pidfile() {
     [[ $out == *ABSENT* ]]
 }
 
+# 删除采样资源前按场景和实际产品身份保存不可复用的原始帧。
+c2_archive_scene() {
+    local mode=$1 signal=$2 identity destination
+    identity=$(docker inspect -f '{{.Id}}' "$C2_PROD") || return $?
+    destination=$IT_EVIDENCE_DIR/control/artifacts/c2/$mode/$signal/$identity
+    mkdir -p "$destination" || return $?
+    cp "$C2_TIMELINE" "$C2_FACT_FILE" "$C2_STOP_FILE" "$TEST_ROOT/c2-lock-busy" "$destination/" || return $?
+    printf 'MODE=%s\nSIGNAL=%s\nPRODUCT_ID=%s\n' "$mode" "$signal" "$identity" > "$destination/scene.txt"
+}
+
 # 执行一场 C-2 场景：夹具 → 产品启动 → 采样侧车 → 采样命名空间就绪 → 停止信号 → 断言。
 c2_run_scenario() {
     local mode=$1 hang=$2 sig=$3 base
@@ -2716,6 +2726,7 @@ c2_run_scenario() {
     check_c2 "C-2[$mode/$sig] 全树实际/有效 UID 均为 10001（无 root 业务进程）" c2_assert_uid_nonroot
     check_c2 "C-2[$mode/$sig] 停止前操作锁被持有" c2_assert_lock_busy
     check_c2 "C-2[$mode/$sig] 锁在 PID1 存活期间被释放（行为采样）" c2_assert_lock_free
+    c2_archive_scene "$mode" "$sig" || return $?
     c2_scene_teardown
 }
 
