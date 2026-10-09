@@ -9,7 +9,7 @@ docker() {
     case "$*" in
         *'.NetworkSettings.Networks'*) printf '%s ' "$ATTACHMENTS" ;;
         *'.HostConfig.Dns'*) printf '[172.30.243.53]' ;;
-        *'.Config.User'*) printf '10001:10001 true false [ALL] [no-new-privileges]' ;;
+        *'.Config.User'*) printf '10001:10001 true false [ALL] [%s]' "$SECURITY_OPT" ;;
         *'.EnableIPv6'*) printf 'false' ;;
         *'.Internal'*) printf 'false' ;;
         *'.HostConfig.Sysctls'*) printf '1' ;;
@@ -26,8 +26,10 @@ docker() {
 policy_contract() {
     local scenario=$1 expected=$2 actual=0
     local IT_RUN_ID=contract IT_NETWORK=authorized IT_DNS_IP=172.30.243.53
-    local IT_NETWORK_GUARD_READY=1 ATTACHMENTS=authorized
+    local IT_NETWORK_GUARD_READY=1 ATTACHMENTS=authorized SECURITY_OPT=no-new-privileges
     case "$scenario" in
+        compose-security) SECURITY_OPT=no-new-privileges:true ;;
+        disabled-security) SECURITY_OPT=no-new-privileges:false ;;
         secondary) ATTACHMENTS='authorized other' ;;
         missing-guard) unset IT_NETWORK_GUARD_READY ;;
         failed-guard) IT_NETWORK_GUARD_READY=0 ;;
@@ -39,9 +41,9 @@ policy_contract() {
 }
 
 failed=0
-for scenario in authorized secondary missing-guard failed-guard missing-dns; do
+for scenario in authorized compose-security disabled-security secondary missing-guard failed-guard missing-dns; do
     expected=77
-    case "$scenario" in authorized) expected=0 ;; secondary) expected=1 ;; esac
+    case "$scenario" in authorized|compose-security) expected=0 ;; secondary|disabled-security) expected=1 ;; esac
     ( policy_contract "$scenario" "$expected" ) || failed=1
 done
 exit "$failed"
