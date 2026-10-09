@@ -114,6 +114,10 @@ guard_cleanup() {
         printf '%s\n' "$residual" > "$E/residual-${kind}s.txt"
         [[ -z $residual ]] || { clean=2; isolated=0; }
     done
+    if [[ -f $E/control/integration-status.txt ]]; then
+        grep -qx 'INTEGRATION_CLEANUP_EXIT=0' "$E/control/integration-status.txt" || { clean=2; isolated=0; }
+    fi
+    [[ ! -s $E/control/integration-failures.log ]] || { clean=2; isolated=0; }
     if (( isolated )); then
         guard_remove_rules || clean=2
     else
