@@ -170,8 +170,8 @@ EOF
 # accept：计数后回 200 并双向中继；reject：计数后回 403（可达但拒绝目标 CONNECT）。
 set -u
 PORT=${1:?}; CERT=${2:?}; KEY=${3:?}; COUNT=${4:?}; UPSTREAM=${5:?}; MODE=${6:-accept}
-IN=$(mktemp -u /tmp/gmpx.in.XXXXXX)
-OUT=$(mktemp -u /tmp/gmpx.out.XXXXXX)
+IN=$(mktemp -u /var/lib/git-daemon/fixture/gmpx.in.XXXXXX)
+OUT=$(mktemp -u /var/lib/git-daemon/fixture/gmpx.out.XXXXXX)
 mkfifo "$IN" "$OUT"
 openssl s_server -quiet -accept "$PORT" -cert "$CERT" -key "$KEY" <"$IN" >"$OUT" 2>/dev/null &
 exec 3>"$IN"
@@ -223,8 +223,8 @@ PROXY
 # 参数：<端口> <证书> <私钥> <文档根> <期望的 Authorization 头值>
 set -u
 PORT=${1:?}; CERT=${2:?}; KEY=${3:?}; DOCROOT=${4:?}; EXPECT=${5:?}
-IN=$(mktemp -u /tmp/gmauth.in.XXXXXX)
-OUT=$(mktemp -u /tmp/gmauth.out.XXXXXX)
+IN=$(mktemp -u /var/lib/git-daemon/fixture/gmauth.in.XXXXXX)
+OUT=$(mktemp -u /var/lib/git-daemon/fixture/gmauth.out.XXXXXX)
 mkfifo "$IN" "$OUT"
 openssl s_server -quiet -accept "$PORT" -cert "$CERT" -key "$KEY" <"$IN" >"$OUT" 2>/dev/null &
 exec 3>"$IN"
