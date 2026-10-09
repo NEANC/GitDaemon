@@ -107,6 +107,7 @@ FIXTURE_MOUNT=/var/lib/git-daemon
 FIXTURE_HOME=$FIXTURE_MOUNT/home
 FIXTURE_CA_VOL=gm-${IT_RUN_ID:-it-$$}-fixture-ca
 FIXTURE_CA=$FIXTURE_MOUNT/fixture/tls/ca.crt
+FIXTURE_PRODUCT_CA=/ca/fixture/tls/ca.crt
 FIXTURE_CHECKS=0
 FIXTURE_FAILURES=0
 FIXTURE_READY=0
@@ -1452,11 +1453,12 @@ fixture_wait_upstream() {
     return 1
 }
 
-# 把测试 CA 从上游卷复制到产品卷：两个命名卷之间经标准输入传递，不落地宿主机路径映射。
+# 核对独立信任卷中的公开证书，产品数据卷不写入信任锚。
 fixture_copy_ca() {
     bash "$FIXTURE_SCRIPT" ca "$FIXTURE_FIX_VOL" "$IMAGE" >"$TEST_ROOT/fixture-ca.pem" || return 1
-    docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
-        -c "umask 022; mkdir -p ${FIXTURE_CA%/*} && cat > $FIXTURE_CA" <"$TEST_ROOT/fixture-ca.pem"
+    docker run --rm -v "$FIXTURE_CA_VOL:/ca:ro" --entrypoint cat "$IMAGE" "$FIXTURE_PRODUCT_CA" \
+        > "$TEST_ROOT/fixture-client-ca.pem" || return 1
+    cmp "$TEST_ROOT/fixture-ca.pem" "$TEST_ROOT/fixture-client-ca.pem"
 }
 
 # 以正式入口在产品卷上启动隔离同步场景：只读根、UID10001、cap_drop ALL、no-new-privileges、仅命名卷；
@@ -1467,8 +1469,9 @@ fixture_start_product() {
     docker rm -f "$FIXTURE_PROD" >/dev/null 2>&1 || true
     docker run -d --name "$FIXTURE_PROD" --network "$FIXTURE_NET" --read-only --cap-drop ALL \
         --security-opt no-new-privileges --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" \
+        -v "$FIXTURE_CA_VOL:/ca:ro" \
         -e "REPOS=$FIXTURE_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no \
-        -e GIT_SMART_HTTP=0 -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$IMAGE" \
+        -e GIT_SMART_HTTP=0 -e "GIT_SSL_CAINFO=$FIXTURE_PRODUCT_CA" "$IMAGE" \
         >"$TEST_ROOT/fixture-up.log" 2>&1 || return 1
     container_networks_internal "$FIXTURE_PROD" || return 1
     for i in $(seq 1 150); do
@@ -1504,11 +1507,11 @@ fixture_exec_sync() {
     local repos=$1
     if command -v timeout >/dev/null 2>&1; then
         timeout 120 docker exec -e "REPOS=$repos" -e "HOME=$FIXTURE_HOME" -e GIT_SMART_HTTP=0 \
-            -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$FIXTURE_PROD" \
+            -e "GIT_SSL_CAINFO=$FIXTURE_PRODUCT_CA" "$FIXTURE_PROD" \
             /usr/local/lib/git-mirror/git-mirror-sync.sh
     else
         docker exec -e "REPOS=$repos" -e "HOME=$FIXTURE_HOME" -e GIT_SMART_HTTP=0 \
-            -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$FIXTURE_PROD" \
+            -e "GIT_SSL_CAINFO=$FIXTURE_PRODUCT_CA" "$FIXTURE_PROD" \
             /usr/local/lib/git-mirror/git-mirror-sync.sh
     fi
 }
@@ -1735,7 +1738,7 @@ fixture_prepare_proxy_inputs() {
         '# FETCHED=2026-01-01T00:00:00+0000' '# DIGEST=sha256:fixture' '# COUNT=1' "$ip github.com" | \
         docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
         -c "umask 022; mkdir -p $FIXTURE_MOUNT/hosts; cat > $FIXTURE_SNAPSHOT" || return 1
-    printf '[http]\n\tproxySSLCAInfo = %s\n' "$FIXTURE_CA" | \
+    printf '[http]\n\tproxySSLCAInfo = %s\n' "$FIXTURE_PRODUCT_CA" | \
         docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
         -c "umask 022; mkdir -p $FIXTURE_MOUNT/fixture; cat > $FIXTURE_GITCONFIG" || return 1
     return 0
@@ -1746,7 +1749,7 @@ fixture_prepare_proxy_inputs() {
 fixture_exec_sync_scenario() {
     local proxy=$1 hosts_update=$2 repos=$3
     docker exec -e "REPOS=$repos" -e "HOME=$FIXTURE_HOME" -e GIT_SMART_HTTP=0 \
-        -e "GIT_SSL_CAINFO=$FIXTURE_CA" -e "GIT_CONFIG_GLOBAL=$FIXTURE_GITCONFIG" \
+        -e "GIT_SSL_CAINFO=$FIXTURE_PRODUCT_CA" -e "GIT_CONFIG_GLOBAL=$FIXTURE_GITCONFIG" \
         -e "PROXY_URL=$proxy" -e "ENABLE_HOSTS_UPDATE=$hosts_update" \
         "$FIXTURE_PROD" /usr/local/lib/git-mirror/git-mirror-sync.sh 2>&1
 }
@@ -1867,12 +1870,9 @@ fixture_start_auth_upstream() {
     return 1
 }
 
-# 凭据夹具：创建产品卷并把测试 CA 复制进去（命名卷之间经标准输入传递，无宿主机路径映射）。
+# 凭据夹具只创建空产品卷，实际信任锚由启动时的只读卷提供。
 fixture_prepare_auth_product_volume() {
-    docker volume create "$AUTH_PROD_VOL" >/dev/null 2>&1 || return 1
-    bash "$FIXTURE_SCRIPT" ca "$FIXTURE_FIX_VOL" "$IMAGE" > "$TEST_ROOT/auth-ca.pem" || return 1
-    docker run --rm -i --user 10001:10001 -v "$AUTH_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
-        -c "umask 022; mkdir -p ${FIXTURE_CA%/*}; cat > $FIXTURE_CA" < "$TEST_ROOT/auth-ca.pem"
+    docker volume create "$AUTH_PROD_VOL" >/dev/null 2>&1
 }
 
 # 带合成 Token 的产品容器：正式入口完成首次同步；Token 仅以容器环境变量形式提供。
@@ -1881,8 +1881,9 @@ fixture_start_auth_product() {
     docker rm -f "$AUTH_PROD" >/dev/null 2>&1 || true
     docker run -d --name "$AUTH_PROD" --network "$AUTH_NET" --read-only --cap-drop ALL \
         --security-opt no-new-privileges --user 10001:10001 -v "$AUTH_PROD_VOL:$FIXTURE_MOUNT" \
+        -v "$FIXTURE_CA_VOL:/ca:ro" \
         -e "REPOS=$FIXTURE_REPO" -e ENABLE_HOSTS_UPDATE=no -e ENABLE_CRON=no -e GIT_SMART_HTTP=0 \
-        -e "GITHUB_TOKEN=$AUTH_TOKEN" -e "GIT_SSL_CAINFO=$FIXTURE_CA" "$IMAGE" \
+        -e "GITHUB_TOKEN=$AUTH_TOKEN" -e "GIT_SSL_CAINFO=$FIXTURE_PRODUCT_CA" "$IMAGE" \
         >"$TEST_ROOT/auth-product.log" 2>&1 || return 1
     container_networks_internal "$AUTH_PROD" || return 1
     container_networks_internal "$AUTH_UP" || return 1
@@ -1958,7 +1959,7 @@ fixture_exec_hosts_refresh() {
     local hosts_url=$1 fallback=$2
     docker exec -e "HOME=$FIXTURE_HOME" -e ENABLE_HOSTS_UPDATE=yes \
         -e "HOSTS_URL=$hosts_url" -e "HOSTS_URL_FALLBACK=$fallback" \
-        -e "CURL_CA_BUNDLE=$FIXTURE_CA" \
+        -e "CURL_CA_BUNDLE=$FIXTURE_PRODUCT_CA" \
         "$FIXTURE_PROD" /bin/sh -c 'umask 022; exec /usr/local/lib/git-mirror/update-github-hosts.sh'
 }
 
@@ -2197,7 +2198,7 @@ fixture_hosts_atomic_replace_readers() {
         reader=$!
         umask 022
         ENABLE_HOSTS_UPDATE=yes HOSTS_URL='"$FIXTURE_HOSTS_URL"' HOSTS_URL_FALLBACK= \
-            HOME='"$FIXTURE_HOME"' CURL_CA_BUNDLE='"$FIXTURE_CA"' \
+            HOME='"$FIXTURE_HOME"' CURL_CA_BUNDLE='"$FIXTURE_PRODUCT_CA"' \
             /usr/local/lib/git-mirror/update-github-hosts.sh
         status=$?
         sleep 1
@@ -2964,7 +2965,7 @@ fixture_step 'TLS 夹具：仅导出公开证书至客户端信任卷' fixture_p
 fixture_step 'TLS 夹具：启动 github.com:443 TLS 上游' \
     bash "$FIXTURE_SCRIPT" start "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_NET" "$FIXTURE_NAME"
 fixture_step 'TLS 夹具：上游 HTTPS 就绪探测' fixture_wait_upstream
-fixture_step 'TLS 夹具：把测试 CA 复制进产品卷' fixture_copy_ca
+fixture_step 'TLS 夹具：独立只读信任卷公开证书匹配' fixture_copy_ca
 # TLS 夹具就绪只看本组夹具步骤是否全部成功：与进入本组前的夹具失败数基线比较，
 # 避免与就绪判据探针等无关夹具的失败耦合而误gate本组断言。
 if [[ $FIXTURE_FAILURES == $TLS_FIXTURE_BASE ]]; then FIXTURE_READY=1; fi

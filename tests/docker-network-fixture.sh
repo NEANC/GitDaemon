@@ -31,6 +31,27 @@ network_control() {
 network_run() {
     IT_NETWORK_LIBRARY_RUN=1 docker run --label "gitdaemon.run=$IT_RUN_ID" "${SAFE[@]}" "$@"
 }
+# 把实际信任路径与对应的独立只读卷关联，拒绝数据卷或路径逃逸。
+assert_container_trust_configuration() {
+    local id=$1 envs entry expected=gm-$IT_RUN_ID-ca path mount
+    envs=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$id") || return $?
+    while IFS= read -r entry; do
+        case "$entry" in
+            GIT_SSL_CAINFO=*|CURL_CA_BUNDLE=*)
+                path=${entry#*=}
+                case "$path" in
+                    /ca/ca.crt|/ca/ca.pem) expected=gm-$IT_RUN_ID-ca ;;
+                    /ca/fixture/tls/ca.crt) expected=gm-$IT_RUN_ID-fixture-ca ;;
+                    *) return 1 ;;
+                esac
+                mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/ca"}}{{.Name}} {{.RW}}{{end}}{{end}}' "$id") || return $?
+                [[ $mount == "$expected false" ]] || return 1
+                ;;
+        esac
+    done <<< "$envs"
+    mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/ca"}}{{.Name}} {{.RW}}{{end}}{{end}}' "$id") || return $?
+    [[ $mount == "$expected false" ]]
+}
 # 核查所有附件、安全选项、实际身份及命名卷，不接受额外网络。
 assert_container_network_configuration() {
     [[ ${IT_NETWORK_GUARD_READY:-} == 1 && -n ${IT_DNS_IP:-} ]] || return 77
@@ -46,7 +67,7 @@ assert_container_network_configuration() {
     [[ $(docker network inspect -f '{{.EnableIPv6}}' "$IT_NETWORK") == false ]] || return 1
     [[ $(docker inspect -f '{{index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6"}}' "$id") == 1 ]] || return 1
     [[ $(docker inspect -f '{{.HostConfig.ExtraHosts}} {{.HostConfig.CapAdd}}' "$id") == '[] []' ]] || return 1
-    [[ $(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/ca"}}{{.Name}} {{.RW}}{{end}}{{end}}' "$id") == "gm-$IT_RUN_ID-ca false" ]] || return 1
+    assert_container_trust_configuration "$id" || return $?
     mounts=$(docker inspect -f '{{range .Mounts}}{{.Type}} {{.Name}}{{println}}{{end}}' "$id") || return $?
     while IFS= read -r mount; do
         [[ -z $mount || $mount == "volume gm-$IT_RUN_ID-"* ]] || return 1
