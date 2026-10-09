@@ -37,3 +37,7 @@ docker run --rm --network "$IT_NETWORK" --entrypoint git image ls-remote https:/
 grep -q '^inspect ' "$scratch/calls"
 grep -q '^logs ' "$scratch/calls"
 [[ -n $(find "$scratch/control" -name inspect.json -print) ]]
+: > "$scratch/calls"
+docker run --rm --network none --entrypoint sh image -c true
+grep -q '^inspect ' "$scratch/calls"
+grep -q '^logs ' "$scratch/calls"
