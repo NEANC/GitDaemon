@@ -561,9 +561,18 @@ gm_validate_path() {
     else
         [[ -O $nearest && -w $nearest ]] || { gm_error '目标或最近父目录不属于调用者或不可写'; return 1; }
     fi
-    canonical=$(realpath -m -- "$path") || return 1
+    canonical=$(gm_realpath_missing "$path") || return 1
     [[ $canonical == "$path" ]] || { gm_error '路径不是规范化路径'; return 1; }
     return 0
+}
+
+gm_realpath_missing() {
+    local path=$1 existing=$1 suffix= component
+    if realpath -m -- "$path" >/dev/null 2>&1; then
+        realpath -m -- "$path"
+        return $?
+    fi
+    printf '%s\n' "$path"
 }
 
 # 按读写用途校验文件，拒绝链接、特殊文件、其他所有者和硬链接。
@@ -596,7 +605,7 @@ gm_validate_instance_paths() {
     [[ $run != "$install" && $run != "$install/"* && $install != "$run/"* ]] || {
         gm_error '程序根与运行根必须相互独立'; return 1;
     }
-    for directory in repos config secrets home hosts logs runtime cache tmp; do
+    for directory in repos config secrets home hosts logs runtime cache tmp state state/repos state/operations; do
         gm_validate_path "$run/$directory" || return 1
     done
     gm_validate_file "$run/config/mirror.env" || return 1
@@ -743,7 +752,7 @@ gm_prepare_runtime() {
     gm_validate_instance_paths "$run" "$install" || return 1
     gm_match_record "$install/installation.conf" "$(gm_program_record "$install")" || return 1
     gm_match_record "$run/config/installation.conf" "$(gm_instance_record "$run" "$install")" || return 1
-    for directory in repos config secrets home hosts logs runtime cache tmp; do
+    for directory in repos config secrets home hosts logs runtime cache tmp state state/repos state/operations; do
         [[ -d $run/$directory ]] || { gm_error '实例尚未完成初始化'; return 1; }
     done
     gm_check_private_directory "$run/runtime" || return 1
@@ -949,8 +958,8 @@ gm_stop_instance_service() {
     path=$INSTALL_ROOT/openrc/$service
     gm_validate_file "$path" read || return 1
     [[ -f $path && -x $path ]] || { gm_error '所需实例服务定义缺失'; return 1; }
-    rc-service --user -e "$service" >/dev/null 2>&1 || { gm_error "实例用户服务未登记或不可解析：$service"; return 1; }
-    rc-service --user "$service" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
+    rc-service --user -e "$path" >/dev/null 2>&1 || { gm_error "实例用户服务未登记或不可解析：$service"; return 1; }
+    rc-service --user "$path" stop || { gm_error '实例服务停止失败，未执行删除'; return 1; }
     return 0
 }
 
