@@ -81,6 +81,9 @@ gm_state_write_array_locked() {
     local file=$1 array_name=$2 directory temporary key status
     declare -n values=$array_name
     directory=${file%/*}
+    if [[ -e $file || -L $file ]]; then
+        gm_validate_file "$file" || return 1
+    fi
     temporary=$(mktemp "$directory/.state.XXXXXX") || return 1
     (
         umask 077
@@ -92,14 +95,14 @@ gm_state_write_array_locked() {
         gm_state_flush "$temporary" || exit 1
         if [[ ${GM_STATE_TEST_FAULT-} == rename ]]; then exit 1; fi
         mv -f -- "$temporary" "$file" || exit 1
-        if [[ ${GM_STATE_TEST_FAULT-} == directory-sync ]]; then exit 1; fi
+        if [[ ${GM_STATE_TEST_FAULT-} == directory-sync ]]; then exit 2; fi
         gm_state_flush "$directory" || exit 1
     )
     status=$?
     if [[ -e $temporary ]]; then
         rm -f -- "$temporary"
     fi
-    (( status == 0 )) || return 1
+    (( status == 0 )) || return "$status"
     return 0
 }
 
@@ -115,8 +118,6 @@ gm_repo_state_commit_locked() {
     gm_state_directory_prepare "${RUN_ROOT}/state" || return 1
     gm_state_directory_prepare "${RUN_ROOT}/state/repos" || return 1
     gm_state_directory_prepare "${RUN_ROOT}/state/repos/${repo%/*}" || return 1
-    gm_state_directory_prepare "${RUN_ROOT}/state/operations" || return 1
-    gm_state_directory_prepare "${RUN_ROOT}/state/operations/${repo%/*}" || return 1
     gm_state_directory_prepare "$owner" || return 1
     gm_state_directory_prepare "$directory" || return 1
     [[ -d $owner && ! -L $owner ]] || return 1
