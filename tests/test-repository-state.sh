@@ -2,7 +2,7 @@
 set -uo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/.repository-state-test.XXXXXXXX") || exit 1
+TEST_ROOT=$(mktemp -d "${TMPDIR:-$ROOT/.test-tmp}/.repository-state-test.XXXXXXXX") || exit 1
 FAILURES=0
 CHECKS=0
 export MSYS=winsymlinks:sys
@@ -10,6 +10,11 @@ unset GM_STATE_TEST_FAULT
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 source "$ROOT/scripts/lib/foundation.sh"
+
+state_library_loads_without_foundation() {
+    env -u BASH_ENV bash -c 'source "$1" || exit 1; declare -F gm_state_write_array_locked >/dev/null && declare -F gm_validate_file >/dev/null' _ "$ROOT/scripts/lib/repository-state.sh"
+}
+check state_library_loads_without_foundation state_library_loads_without_foundation
 source "$ROOT/scripts/lib/repository-state.sh"
 
 sync() {
@@ -113,7 +118,9 @@ directory_sync_is_indeterminate() {
     export GM_STATE_TEST_FAULT=directory-sync
     gm_repo_state_commit_locked "$repo" state >/dev/null 2>&1 || status=$?
     unset GM_STATE_TEST_FAULT
-    [[ $status == 2 && $(<"$root/state/repos/owner/repo.state") == *'generation=2'* ]]
+    [[ $status == 2 && $GM_STATE_COMMIT_RESULT == indeterminate && $(<"$root/state/repos/owner/repo.state") == *'generation=2'* ]] || return 1
+    gm_repo_state_read "$repo" state || return 1
+    [[ ${state[generation]} == 2 && ${state[message]} == new ]]
 }
 
 repository_and_operation_directories_are_independent() {
@@ -169,10 +176,14 @@ reject_unsafe_parent_and_file() {
 }
 
 reject_invalid_repo_and_create_directories() {
-    local root=$TEST_ROOT/invalid
+    local root=$TEST_ROOT/invalid path
     local -A state=()
     mkdir -p -- "$root" || return 1
     RUN_ROOT=$root
+    path=$root/../invalid
+    realpath() { return 1; }
+    gm_validate_path "$path" >/dev/null 2>&1 && return 1
+    unset -f realpath
     state[schema]=1 state[repo]=../escape state[generation]=1 state[desired]=present state[observed]=ready state[published]=yes state[message]=x
     gm_repo_state_commit_locked ../escape state >/dev/null 2>&1 && return 1
     state[repo]=owner/repo
