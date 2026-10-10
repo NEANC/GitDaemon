@@ -567,12 +567,12 @@ gm_validate_path() {
 }
 
 gm_realpath_missing() {
-    local path=$1 existing=$1 suffix= component
+    local path=$1
     if realpath -m -- "$path" >/dev/null 2>&1; then
-        realpath -m -- "$path"
-        return $?
+        realpath -m -- "$path" || return 1
+        return 0
     fi
-    printf '%s\n' "$path"
+    return 1
 }
 
 # 按读写用途校验文件，拒绝链接、特殊文件、其他所有者和硬链接。
@@ -593,6 +593,11 @@ gm_validate_file() {
     fi
     return 0
 }
+
+if [[ ${GM_REPOSITORY_STATE_LOADING-} == 1 ]]; then
+    declare -g GM_REPOSITORY_STATE_LOADING=0
+    source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/repository-state.sh" || return 1
+fi
 
 # 验证程序与运行根相互独立，并预检所有固定实例目录和元数据文件。
 gm_validate_instance_paths() {
