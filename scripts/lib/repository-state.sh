@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+if [[ ${GM_REPOSITORY_STATE_LOADING-} != 1 ]]; then
+    declare -g GM_REPOSITORY_STATE_LOADING=1
+    if ! declare -F gm_validate_file >/dev/null; then
+        source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/foundation.sh" || return 1
+    fi
+    declare -g GM_REPOSITORY_STATE_LOADING=0
+fi
+
 gm_state_repo_path() {
     local root=$1 repo=$2 kind=$3 owner name
     [[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
@@ -73,6 +81,7 @@ gm_state_flush() {
     local path=$1
     [[ -e $path || -d $path ]] || return 1
     if [[ ${GM_STATE_TEST_FAULT-} == sync ]]; then return 1; fi
+    if [[ ${GM_STATE_TEST_FAULT-} == directory-sync && -d $path ]]; then return 1; fi
     sync -- "$path" || return 1
     return 0
 }
@@ -80,6 +89,7 @@ gm_state_flush() {
 gm_state_write_array_locked() {
     local file=$1 array_name=$2 directory temporary key status
     declare -n values=$array_name
+    GM_STATE_COMMIT_RESULT=failed
     directory=${file%/*}
     if [[ -e $file || -L $file ]]; then
         gm_validate_file "$file" || return 1
@@ -95,14 +105,15 @@ gm_state_write_array_locked() {
         gm_state_flush "$temporary" || exit 1
         if [[ ${GM_STATE_TEST_FAULT-} == rename ]]; then exit 1; fi
         mv -f -- "$temporary" "$file" || exit 1
-        if [[ ${GM_STATE_TEST_FAULT-} == directory-sync ]]; then exit 2; fi
-        gm_state_flush "$directory" || exit 1
+        gm_state_flush "$directory" || exit 2
     )
     status=$?
+    if (( status == 2 )); then GM_STATE_COMMIT_RESULT=indeterminate; fi
     if [[ -e $temporary ]]; then
         rm -f -- "$temporary"
     fi
     (( status == 0 )) || return "$status"
+    GM_STATE_COMMIT_RESULT=committed
     return 0
 }
 
