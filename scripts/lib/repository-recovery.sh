@@ -479,6 +479,7 @@ gm_repo_rebuild_locked() {
             gm_repo_publish_locked "$repo" "${replacement[generation]}" || return $?
             if ! gm_publish_short_links "$RUN_ROOT" "$repo"; then gm_repo_unpublish_locked "$repo"; return 1; fi
             replacement[published_boot]=$GM_BOOT_GENERATION
+            replacement[config]=$(gm_repo_config_identity "$repo") || return 1
             gm_repo_replace_phase "$repo" replacement published || return $? ;;
         *) return 1 ;;
     esac
