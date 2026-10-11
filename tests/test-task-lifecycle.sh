@@ -227,6 +227,36 @@ test_unready_child_is_reaped() {
     [[ $outcome == 0 && ${result[result]} == INTERRUPTED && ${result[wait_start]-} == "${child[start]}" && ! -e $RUN_ROOT/written && $((after-before)) -ge 4900 && $((after-before)) -lt 7000 ]]
 }
 
+test_unsafe_blocks_local_entries() {
+    local mode
+    for mode in busy write; do
+        (
+            setup "unsafe-$mode" || exit 1
+            local -A result=() rejected=()
+            local holder= status=0 instance_fd sync_fd
+            start true || exit 1
+            instance_fd=${GM_LOCK_FDS[instance]} sync_fd=${GM_LOCK_FDS[sync]}
+            if [[ $mode == busy ]]; then
+                bash -c 'source "$1"; gm_lock_acquire dispatch exclusive || exit; touch "$RUN_ROOT/held"; while [[ ! -e $RUN_ROOT/release ]]; do sleep 0.02; done' _ "$ROOT/scripts/lib/foundation.sh" & holder=$!
+                until [[ -f $RUN_ROOT/held ]]; do sleep 0.02; done
+            else
+                gm_lifecycle_record() { return 1; }
+                GM_STATE_TEST_FAULT=write
+            fi
+            gm_task_finish_locked result && status=1
+            [[ ${result[result]} == UNSAFE && ${GM_LOCK_FDS[instance]-} == "$instance_fd" && ${GM_LOCK_FDS[sync]-} == "$sync_fd" ]] || status=1
+            if [[ -n $holder ]]; then touch "$RUN_ROOT/release"; wait "$holder" || status=1; fi
+            unset GM_STATE_TEST_FAULT
+            gm_begin_operation sync && status=1
+            [[ ${GM_LOCK_FDS[instance]-} == "$instance_fd" && ${GM_LOCK_FDS[sync]-} == "$sync_fd" ]] || status=1
+            gm_task_run_locked owner/other sync rejected touch "$RUN_ROOT/written" && status=1
+            if [[ ${rejected[result]} == RUNNING ]]; then gm_task_finish_locked rejected || true; fi
+            [[ ! -e $RUN_ROOT/written && ${GM_LOCAL_FROZEN-} == yes ]] || status=1
+            exit "$status"
+        ) || return 1
+    done
+}
+
 test_unready_immediate_exit() {
     setup immediate || return 1
     local -A result=()
@@ -239,5 +269,6 @@ test_unready_immediate_exit() {
 for test in test_second_container_refused test_stop_before_release_never_writes test_task_cancel_does_not_freeze test_instance_stop_blocks_resume test_delayed_grandchild_keeps_lock test_repeated_term_keeps_deadline test_nonzero_exit_is_known test_worker_does_not_inherit_lease test_registration_stop_never_releases test_unknown_wait_keeps_locks test_finish_state_failure_keeps_locks test_unreleased_worker_parent_disappears test_finished_channels_are_removed test_service_cannot_inherit_lease test_recovery_required_blocks_write test_late_term_at_journal test_late_term_at_cleanup test_unready_child_is_reaped test_unready_immediate_exit; do
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
+if ( test_unsafe_blocks_local_entries ); then printf '[PASS] test_unsafe_blocks_local_entries\n'; else printf '[FAIL] test_unsafe_blocks_local_entries\n'; FAILURES=$((FAILURES+1)); fi
 printf 'FAILURES=%s\n' "$FAILURES"
 exit "$FAILURES"

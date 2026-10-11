@@ -126,6 +126,7 @@ gm_task_run_locked() {
     shift 3
     local -n task=$output
     task=([repo]="$repo" [operation]="$operation" [result]=BLOCKED)
+    [[ ${GM_LOCAL_FROZEN-} != yes ]] || return 1
     [[ -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} && $# -gt 0 ]] || return 1
     [[ $operation =~ ^[a-z][a-z_-]*$ ]] || return 1
     gm_state_repo_path "$RUN_ROOT" "$repo" repos >/dev/null || return 1
@@ -197,6 +198,7 @@ gm_task_run_locked() {
 }
 
 gm_task_freeze() {
+    GM_LOCAL_FROZEN=yes
     gm_lock_acquire dispatch exclusive || return 1
     local status=0
     gm_lifecycle_record "$RUN_ROOT/runtime/frozen" 'FROZEN=1' || status=1
@@ -299,7 +301,7 @@ gm_task_finish_locked() {
     fi
     gm_task_journal "${finished[repo]}" "${finished[operation]}" "${finished[result]}" || { finished[result]=UNSAFE; gm_task_freeze; return 1; }
     if [[ -n ${finished[directory]-} ]]; then
-        gm_lock_acquire dispatch exclusive || { finished[result]=UNSAFE; return 1; }
+        gm_lock_acquire dispatch exclusive || { finished[result]=UNSAFE; gm_task_freeze; return 1; }
         status=0
         rm -f -- "$RUN_ROOT/runtime/task" "${finished[directory]}/gate" "${finished[directory]}/ready" "${finished[directory]}/status" &&
             rmdir -- "${finished[directory]}" && gm_state_flush "$RUN_ROOT/runtime" || status=1
