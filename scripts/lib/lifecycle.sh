@@ -16,7 +16,7 @@ gm_process_identity() {
     IFS= read -r line 2>/dev/null < "/proc/$pid/stat" || return 1
     read -r -a fields <<< "${line##*) }"
     local -n process_record=$target
-    process_record=([pid]="$pid" [state]="${fields[0]}" [pgid]="${fields[2]}" [session]="${fields[3]}" [start]="${fields[19]}")
+    process_record=([pid]="$pid" [state]="${fields[0]}" [ppid]="${fields[1]}" [pgid]="${fields[2]}" [session]="${fields[3]}" [start]="${fields[19]}")
 }
 
 gm_lifecycle_record() {
@@ -161,6 +161,9 @@ gm_task_run_locked() {
     export GM_BOOT_GENERATION
     setsid bash "$GM_LIFECYCLE_SOURCE" --worker "$directory" "${supervisor[pid]}" "${supervisor[start]}" "${GM_LOCK_FDS[container]-}" "${GM_LOCK_FDS[dispatch]}" "$@" &
     task[wait_pid]=$!
+    if gm_process_identity "${task[wait_pid]}" worker && [[ ${worker[ppid]} == "$BASHPID" ]]; then
+        task[wait_start]=${worker[start]}
+    fi
     gm_monotonic_ms start
     while [[ ! -s $directory/ready ]]; do
         gm_monotonic_ms now
@@ -205,6 +208,39 @@ gm_task_finish_locked() {
     local -n finished=$1
     local now deadline= term_at= killed=no alive status raw= wait_status interrupted=no
     local -A identity=() state=()
+    if [[ -n ${finished[wait_pid]-} && -z ${finished[pid]-} ]]; then
+        gm_monotonic_ms now || return 1
+        term_at=$((now+5000)); deadline=$((now+7000))
+        local sent=no exited=no
+        while :; do
+            if gm_process_identity "${finished[wait_pid]}" identity; then
+                [[ -n ${finished[wait_start]-} && ${identity[start]} == "${finished[wait_start]}" && ${identity[ppid]} == "$BASHPID" ]] || break
+                if [[ ${identity[state]} == Z || ${identity[state]} == X ]]; then exited=yes; break; fi
+            elif [[ ! -e /proc/${finished[wait_pid]} ]]; then
+                exited=yes; break
+            else break
+            fi
+            gm_monotonic_ms now || break
+            (( now < deadline )) || break
+            if [[ $sent == no ]]; then
+                kill -TERM "${finished[wait_pid]}" 2>/dev/null || break
+                sent=yes
+            elif (( now >= term_at )) && [[ $killed == no ]]; then
+                kill -KILL "${finished[wait_pid]}" 2>/dev/null || break
+                killed=yes
+            fi
+            sleep 0.05
+        done
+        if [[ $exited == yes ]]; then
+            wait_status=0
+            wait "${finished[wait_pid]}" || wait_status=$?
+            if (( wait_status != 127 )); then
+                raw=$wait_status
+                finished[raw_status]=$raw
+                finished[result]=INTERRUPTED
+            fi
+        fi
+    fi
     while [[ -n ${finished[pid]-} ]]; do
         if [[ -n ${GM_STOP_SCOPE-} && -z $deadline ]]; then
             gm_monotonic_ms now || break

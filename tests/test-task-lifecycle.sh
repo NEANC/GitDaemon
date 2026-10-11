@@ -206,7 +206,37 @@ test_late_term_at_cleanup() {
     return 0
 }
 
-for test in test_second_container_refused test_stop_before_release_never_writes test_task_cancel_does_not_freeze test_instance_stop_blocks_resume test_delayed_grandchild_keeps_lock test_repeated_term_keeps_deadline test_nonzero_exit_is_known test_worker_does_not_inherit_lease test_registration_stop_never_releases test_unknown_wait_keeps_locks test_finish_state_failure_keeps_locks test_unreleased_worker_parent_disappears test_finished_channels_are_removed test_service_cannot_inherit_lease test_recovery_required_blocks_write test_late_term_at_journal test_late_term_at_cleanup; do
+test_unready_child_is_reaped() {
+    setup unready || return 1
+    local -A result=() child=()
+    local before after outcome=0 pid
+    setsid() {
+        exec bash -c 'trap "" TERM; while :; do :; done'
+    }
+    start touch "$RUN_ROOT/written" && return 1
+    pid=${result[wait_pid]}
+    gm_process_identity "$pid" child || return 1
+    gm_monotonic_ms before
+    gm_task_finish_locked result || outcome=1
+    gm_monotonic_ms after
+    if [[ -e /proc/$pid/stat ]]; then
+        kill -KILL "$pid"
+        wait "$pid" 2>/dev/null || true
+        return 1
+    fi
+    [[ $outcome == 0 && ${result[result]} == INTERRUPTED && ${result[wait_start]-} == "${child[start]}" && ! -e $RUN_ROOT/written && $((after-before)) -ge 4900 && $((after-before)) -lt 7000 ]]
+}
+
+test_unready_immediate_exit() {
+    setup immediate || return 1
+    local -A result=()
+    setsid() { exit 42; }
+    start touch "$RUN_ROOT/written" && return 1
+    gm_task_finish_locked result || return 1
+    [[ ${result[result]} == INTERRUPTED && ! -e /proc/${result[wait_pid]}/stat && ! -e $RUN_ROOT/written ]]
+}
+
+for test in test_second_container_refused test_stop_before_release_never_writes test_task_cancel_does_not_freeze test_instance_stop_blocks_resume test_delayed_grandchild_keeps_lock test_repeated_term_keeps_deadline test_nonzero_exit_is_known test_worker_does_not_inherit_lease test_registration_stop_never_releases test_unknown_wait_keeps_locks test_finish_state_failure_keeps_locks test_unreleased_worker_parent_disappears test_finished_channels_are_removed test_service_cannot_inherit_lease test_recovery_required_blocks_write test_late_term_at_journal test_late_term_at_cleanup test_unready_child_is_reaped test_unready_immediate_exit; do
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
 printf 'FAILURES=%s\n' "$FAILURES"
