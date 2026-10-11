@@ -749,6 +749,44 @@ sync_repo_preserves_indeterminate_result() {
     [[ $status == 2 ]]
 }
 
+# 函数级隔离主函数的前置准备，记录仓库派发、链接发布与清理的实际调用顺序。
+gm_sync_main_checks_dispatch_after_first_repo_result() {
+    local first_status=$1 expected_status=$2 expected_calls=$3 status=0
+    local RUN_ROOT=$TEST_ROOT/main-dispatch calls=$TEST_ROOT/main-dispatch.calls
+    GM_REPOS=(owner/first owner/second)
+    GM_BRANCHES=('' main)
+    : > "$calls"
+    gm_check_identity() { return 0; }
+    gm_prepare_runtime() { return 0; }
+    gm_load_sync_credentials() { return 0; }
+    gm_begin_operation() { return 0; }
+    clear_proxy_environment() { return 0; }
+    prepare_credentials() { return 0; }
+    load_resolve_args() { return 0; }
+    build_transport_sequence() { return 0; }
+    # 首库注入指定结果，后续库若被派发则留下可断言的写入记录。
+    sync_repo() {
+        printf 'sync %s\n' "$1" >> "$calls"
+        if [[ $1 == owner/first ]]; then return "$first_status"; fi
+        return 0
+    }
+    gm_publish_short_links() { printf 'publish %s\n' "$2" >> "$calls"; }
+    gm_prune_short_links() { printf 'prune\n' >> "$calls"; }
+    gm_sync_main || status=$?
+    [[ $status == "$expected_status" && $(<"$calls") == "$expected_calls" ]] || {
+        printf '主函数返回码：%s（预期 %s）；写操作调用：\n%s\n' "$status" "$expected_status" "$(<"$calls")"
+        return 1
+    }
+    return 0
+}
+
+check 'gm_sync_main 函数级：首库返回 2 后停止后续仓库及链接写操作' \
+    gm_sync_main_checks_dispatch_after_first_repo_result 2 2 'sync owner/first'
+check 'gm_sync_main 函数级：首库返回 1 仍继续后续仓库及链接清理' \
+    gm_sync_main_checks_dispatch_after_first_repo_result 1 1 $'sync owner/first\nsync owner/second\npublish owner/second\nprune'
+check 'gm_sync_main 函数级：全部成功时发布链接并清理' \
+    gm_sync_main_checks_dispatch_after_first_repo_result 0 0 $'sync owner/first\npublish owner/first\nsync owner/second\npublish owner/second\nprune'
+
 check '配置失败必须显式传播（非仓库目录）' configure_propagates_failure
 check '缺键容错仅接受退出码 5' configure_tolerates_absent_key
 check '缺键时 configure_unset 返回 0' configure_unset_absent_key_returns_zero

@@ -448,7 +448,7 @@ gm_prune_short_links() {
 
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
 gm_sync_main() (
-    local index failed=0 install snapshot
+    local index failed=0 install snapshot status
     if [[ ${1-} == --help || ${1-} == -h ]]; then
         printf '%s\n' '用法：git-mirror-sync.sh；REPOS/SHORT_LINKS 仅来自当前环境'
         return 0
@@ -479,6 +479,8 @@ gm_sync_main() (
                 failed=1
             fi
         else
+            status=$?
+            if (( status == 2 )); then return 2; fi
             failed=1
         fi
     done
