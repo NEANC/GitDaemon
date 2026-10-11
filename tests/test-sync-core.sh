@@ -793,6 +793,144 @@ gm_sync_main_checks_dispatch_after_first_repo_result() {
     return 0
 }
 
+setup_sync_failure() {
+    source "$ROOT/scripts/lib/repository-recovery.sh" || return 1
+    RUN_ROOT=$TEST_ROOT/failure-$1
+    DIR=$RUN_ROOT/repos/owner/repo.git
+    UP=$RUN_ROOT/up.git
+    mkdir -p "$RUN_ROOT/runtime" "$RUN_ROOT/logs" || return 1
+    GM_BOOT_GENERATION=12345678-1234-1234-1234-123456789abc
+    printf '%s\n' "$GM_BOOT_GENERATION" > "$RUN_ROOT/runtime/generation"
+    gm_parse_repos owner/repo '' || return 1
+    build_upstream "$UP" "$RUN_ROOT/work" >/dev/null || return 1
+    init_mirror "$DIR" "$UP" || return 1
+    update_repo owner/repo "$DIR" '' >/dev/null || return 1
+    local -A initial=([schema]=1 [repo]=owner/repo [generation]=1 [desired]=present [observed]=ready [published]=no [message]=unchecked) checked=()
+    gm_repo_state_commit_locked owner/repo initial || return 1
+    gm_repo_check_locked owner/repo "$DIR" checked || return 1
+    gm_repo_publish_locked owner/repo 1 || return 1
+    gm_begin_operation sync
+}
+
+test_transport_failure_keeps_healthy_cache() {
+    require_function gm_sync_one_locked || return 1
+    setup_sync_failure transport || return 1
+    local -A result=() saved=()
+    git() {
+        if [[ " $* " == *' fetch '* ]]; then
+            printf "fatal: unable to access 'https://github.com/owner/repo.git/': Could not resolve host: github.com\n" >&2
+            return 128
+        fi
+        command git "$@"
+    }
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    gm_repo_state_read owner/repo saved || return 1
+    [[ ${result[transport_only]} == yes && ${saved[health]} == healthy && -f $DIR/git-daemon-export-ok ]]
+}
+
+test_local_write_failure_requires_recovery() {
+    require_function gm_sync_one_locked || return 1
+    setup_sync_failure local || return 1
+    local -A result=() saved=()
+    printf 'preserve\n' > "$DIR/config.lock"
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    gm_repo_state_read owner/repo saved || return 1
+    [[ ${result[transport_only]} == no && ${result[configuration_converged]} == no && ${saved[message]} == recovery_required && ! -e $DIR/git-daemon-export-ok && -f $DIR/config.lock ]] || return 1
+    gm_repo_check_locked owner/repo "$DIR" result || return 1
+    gm_repo_publish_locked owner/repo 1 || return 1
+    [[ -f $DIR/git-daemon-export-ok && -f $DIR/config.lock ]]
+}
+
+test_unknown_failure_is_not_network() {
+    require_function gm_sync_classify_failure || return 1
+    local stage text
+    local -A result=()
+    for stage in config fetch refs head maintenance publish; do
+        for text in '' 'fatal: unexplained failure' $'fatal: Could not resolve host: github.com\nerror: unable to write object' 'error: automatic maintenance failed'; do
+            gm_sync_classify_failure "$stage" "$text" result || return 1
+            [[ ${result[transport_only]} == no ]] || return 1
+        done
+    done
+    gm_sync_classify_failure fetch 'fatal: unable to access upstream: Failed to connect to github.com port 443: Connection refused' result || return 1
+    [[ ${result[transport_only]} == yes ]]
+}
+
+test_partial_ref_change_not_rolled_back() {
+    require_function gm_sync_one_locked || return 1
+    setup_sync_failure partial || return 1
+    GM_BRANCHES=(main)
+    local -A result=() saved=()
+    git() {
+        if [[ " $* " == *' update-ref -d refs/notes/commits '* ]]; then
+            printf 'error: unable to lock ref\n' >&2
+            return 1
+        fi
+        command git "$@"
+    }
+    if gm_sync_one_locked owner/repo main result; then return 1; fi
+    command git --git-dir="$DIR" show-ref --verify --quiet refs/heads/dev && return 1
+    command git --git-dir="$DIR" show-ref --verify --quiet refs/notes/commits || return 1
+    gm_repo_state_read owner/repo saved || return 1
+    [[ ${result[configuration_converged]} == no && ${saved[message]} == recovery_required && ! -e $DIR/git-daemon-export-ok ]] || return 1
+    gm_repo_check_locked owner/repo "$DIR" result || return 1
+    gm_repo_publish_locked owner/repo 1 || return 1
+    [[ -f $DIR/git-daemon-export-ok ]]
+}
+
+test_fetch_maintenance_remains_supervised() {
+    local up=$TEST_ROOT/maintenance-up.git dir=$TEST_ROOT/maintenance.git i oid
+    build_upstream "$up" "$TEST_ROOT/maintenance-work" >/dev/null || return 1
+    init_mirror "$dir" "$up" || return 1
+    for ((i=0; i<55; i++)); do
+        oid=$(printf 'maintenance-%s\n' "$i" | git --git-dir="$dir" hash-object -w --stdin) || return 1
+        printf '%s\n' "$oid" | git --git-dir="$dir" pack-objects "$dir/objects/pack/pack" >/dev/null || return 1
+    done
+    git --git-dir="$dir" config gc.autoDetach true || return 1
+    git --git-dir="$dir" config maintenance.autoDetach true || return 1
+    local GIT_TRACE2_EVENT=$TEST_ROOT/maintenance.trace
+    export GIT_TRACE2_EVENT
+    update_repo owner/repo "$dir" '' || return 1
+    grep -q '"repack"' "$GIT_TRACE2_EVENT" || { printf '真实自动维护没有执行 repack\n'; return 1; }
+    if grep -q '"argv":\["git","gc","--auto","--detach"\]' "$GIT_TRACE2_EVENT"; then return 1; fi
+    [[ $(git --git-dir="$dir" config gc.autoDetach) == true ]] || return 1
+    [[ $(git --git-dir="$dir" config maintenance.autoDetach) == true ]] || return 1
+    [[ $(find "$dir/objects/pack" -name '*.pack' | wc -l) -lt 55 ]] || return 1
+    printf 'REAL_FETCH_MAINTENANCE_REPACK=PASS git=%s\n' "$(git --version)"
+}
+
+test_single_repo_cli() {
+    local RUN_ROOT=$TEST_ROOT/cli calls=$TEST_ROOT/cli.calls status=0
+    GM_REPOS=(owner/first owner/second)
+    GM_BRANCHES=('' main)
+    mkdir -p "$RUN_ROOT/runtime"
+    : > "$calls"
+    gm_check_identity() { return 0; }
+    gm_prepare_runtime() { return 0; }
+    gm_load_sync_credentials() { return 0; }
+    clear_proxy_environment() { return 0; }
+    prepare_credentials() { return 0; }
+    load_resolve_args() { return 0; }
+    build_transport_sequence() { return 0; }
+    sync_repo() { printf '%s\n' "$1" >> "$calls"; }
+    gm_publish_short_links() { return 0; }
+    gm_prune_short_links() { return 0; }
+    gm_sync_main --repo owner/second || return 1
+    [[ $(<"$calls") == owner/second ]] || return 1
+    : > "$calls"
+    gm_sync_main --repo other/missing && return 1
+    gm_sync_main --repo ../second && return 1
+    : > "$RUN_ROOT/runtime/frozen"
+    gm_sync_main --repo owner/second && return 1
+    [[ ! -s $calls ]]
+}
+
+check 'test_transport_failure_keeps_healthy_cache' test_transport_failure_keeps_healthy_cache
+check 'test_local_write_failure_requires_recovery' test_local_write_failure_requires_recovery
+check 'test_unknown_failure_is_not_network' test_unknown_failure_is_not_network
+check 'test_partial_ref_change_not_rolled_back' test_partial_ref_change_not_rolled_back
+check 'test_fetch_maintenance_remains_supervised' test_fetch_maintenance_remains_supervised
+check 'test_single_repo_cli' test_single_repo_cli
+
 check 'gm_sync_main 函数级：首库返回 2 后停止后续仓库及链接写操作' \
     gm_sync_main_checks_dispatch_after_first_repo_result 2 2 'sync owner/first'
 check 'gm_sync_main 函数级：首库返回 1 仍继续后续仓库及链接清理' \
