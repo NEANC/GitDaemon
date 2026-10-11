@@ -924,6 +924,54 @@ test_single_repo_cli() {
     [[ ! -s $calls ]]
 }
 
+test_classified_fallback_can_succeed() {
+    setup_sync_failure fallback || return 1
+    local -A result=()
+    GM_TRANSPORT_SEQUENCE=(mapping system)
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:127.0.0.1)
+    git() {
+        if [[ " $* " == *' fetch '* && " $* " == *curloptResolve* ]]; then
+            printf "fatal: unable to access 'https://github.com/owner/repo.git/': Could not resolve host: github.com\n" >&2
+            return 128
+        fi
+        command git "$@"
+    }
+    gm_sync_one_locked owner/repo '' result || return 1
+    [[ ${result[configuration_converged]} == yes && -f $DIR/git-daemon-export-ok ]]
+}
+
+test_publish_failure_requires_recovery() {
+    setup_sync_failure publish || return 1
+    local -A result=() saved=()
+    gm_repo_publish_locked() { return 1; }
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    gm_repo_state_read owner/repo saved || return 1
+    [[ ${saved[health]} == recovery_required && ${saved[message]} == recovery_required && ! -e $DIR/git-daemon-export-ok ]]
+}
+
+test_convergence_record_survives_recovery() {
+    setup_sync_failure convergence || return 1
+    local -A result=() saved=()
+    GM_BRANCHES=(main)
+    git() {
+        if [[ " $* " == *' symbolic-ref HEAD '* ]]; then printf 'error: cannot lock HEAD\n' >&2; return 1; fi
+        command git "$@"
+    }
+    if gm_sync_one_locked owner/repo main result; then return 1; fi
+    [[ ${result[stage]} == head ]] || return 1
+    gm_repo_check_locked owner/repo "$DIR" result || return 1
+    gm_repo_publish_locked owner/repo 1 || return 1
+    gm_state_read_array "$RUN_ROOT/state/sync/owner/repo.state" owner/repo saved || return 1
+    [[ ${saved[message]} == configuration_pending ]] || return 1
+    unset -f git
+    gm_sync_one_locked owner/repo main result || return 1
+    gm_state_read_array "$RUN_ROOT/state/sync/owner/repo.state" owner/repo saved || return 1
+    [[ ${result[configuration_converged]} == yes && ${saved[message]} == configuration_converged ]]
+}
+
+check 'test_classified_fallback_can_succeed' test_classified_fallback_can_succeed
+check 'test_publish_failure_requires_recovery' test_publish_failure_requires_recovery
+check 'test_convergence_record_survives_recovery' test_convergence_record_survives_recovery
 check 'test_transport_failure_keeps_healthy_cache' test_transport_failure_keeps_healthy_cache
 check 'test_local_write_failure_requires_recovery' test_local_write_failure_requires_recovery
 check 'test_unknown_failure_is_not_network' test_unknown_failure_is_not_network
