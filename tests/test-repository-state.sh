@@ -9,12 +9,25 @@ export MSYS=winsymlinks:sys
 unset GM_STATE_TEST_FAULT
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
+REALPATH_SHIM_DIR=$TEST_ROOT/bin
+mkdir -p -- "$REALPATH_SHIM_DIR" || exit 1
+cat > "$REALPATH_SHIM_DIR/realpath" <<'EOF'
+#!/bin/sh
+if [ "$1" = -m ] && [ "$2" = -- ]; then
+    shift 2
+    case "$1" in
+        */..|*/../*) exit 1 ;;
+    esac
+    exec readlink -f "$1"
+fi
+exit 1
+EOF
+chmod +x "$REALPATH_SHIM_DIR/realpath"
+PATH=$REALPATH_SHIM_DIR:$PATH
+export PATH
+
 source "$ROOT/scripts/lib/foundation.sh"
 
-state_library_loads_without_foundation() {
-    env -u BASH_ENV bash -c 'source "$1" || exit 1; declare -F gm_state_write_array_locked >/dev/null && declare -F gm_validate_file >/dev/null' _ "$ROOT/scripts/lib/repository-state.sh"
-}
-check state_library_loads_without_foundation state_library_loads_without_foundation
 source "$ROOT/scripts/lib/repository-state.sh"
 
 sync() {
@@ -36,6 +49,12 @@ check() {
         FAILURES=$((FAILURES + 1))
     fi
 }
+
+state_library_loads_without_foundation() {
+    env -u BASH_ENV bash -c 'source "$1" || exit 1; declare -F gm_state_write_array_locked >/dev/null && declare -F gm_validate_file >/dev/null' _ "$ROOT/scripts/lib/repository-state.sh"
+}
+
+check state_library_loads_without_foundation state_library_loads_without_foundation
 
 roundtrip() {
     local root=$TEST_ROOT/roundtrip repo=owner/repo
