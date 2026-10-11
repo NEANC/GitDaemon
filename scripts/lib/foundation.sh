@@ -692,7 +692,7 @@ gm_check_private_directory() {
 gm_lock_acquire() {
     local name=$1 mode=$2 path descriptor status fingerprint current flag
     declare -gA GM_LOCK_FDS
-    case "$name" in instance|sync|hosts) ;; *) gm_error '不支持的实例锁名称'; return 1 ;; esac
+    case "$name" in instance|sync|hosts|dispatch|container) ;; *) gm_error '不支持的实例锁名称'; return 1 ;; esac
     case "$mode" in shared) flag=-s ;; exclusive) flag=-x ;; *) gm_error '不支持的锁模式'; return 1 ;; esac
     [[ ! ${GM_LOCK_FDS[$name]+present} ]] || { gm_error '当前进程已持有此锁'; return 1; }
     command -v flock >/dev/null 2>&1 || { gm_error '缺少必要依赖 flock'; return 1; }
@@ -736,7 +736,7 @@ gm_lock_acquire() {
 # 关闭本进程持有的锁描述符，不删除锁文件或改变锁的 inode。
 gm_lock_release() {
     local name=$1 descriptor
-    case "$name" in instance|sync|hosts) ;; *) return 1 ;; esac
+    case "$name" in instance|sync|hosts|dispatch|container) ;; *) return 1 ;; esac
     declare -gA GM_LOCK_FDS
     if [[ ${GM_LOCK_FDS[$name]+present} ]]; then
         descriptor=${GM_LOCK_FDS[$name]}
@@ -972,6 +972,7 @@ gm_stop_instance_service() {
 gm_resume_instance() (
     local run=$1 install=$2 service
     local -a services=(git-mirror-sync git-mirror-hosts git-daemon)
+    [[ ! -e $run/runtime/frozen && ! -L $run/runtime/frozen ]] || { gm_error '冻结仅允许容器新启动解除'; return 1; }
     gm_prepare_runtime "$run" "$install" || return $?
     command -v rc-service >/dev/null 2>&1 || { gm_error '缺少必要依赖：rc-service'; return 1; }
     gm_load_service_capabilities "$install" || return 1
@@ -1019,12 +1020,17 @@ gm_with_runtime_environment() (
 gm_begin_operation() {
     local operation=$1 status
     gm_lock_acquire instance shared || return $?
-    if [[ -e $RUN_ROOT/runtime/stopped ]]; then
+    if [[ -e $RUN_ROOT/runtime/stopped || -e $RUN_ROOT/runtime/frozen || -L $RUN_ROOT/runtime/frozen ]]; then
         gm_lock_release instance || return 1
         gm_error '实例已停止，拒绝启动新操作'
         return 1
     fi
     if gm_lock_acquire "$operation" exclusive; then
+        if [[ -e $RUN_ROOT/runtime/stopped || -e $RUN_ROOT/runtime/frozen || -L $RUN_ROOT/runtime/frozen ]]; then
+            gm_lock_release "$operation"
+            gm_lock_release instance
+            return 1
+        fi
         return 0
     else
         status=$?
