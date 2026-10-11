@@ -215,7 +215,7 @@ transport_label() {
     esac
 }
 
-# 拉取单个仓库，成功后缩减范围、跟随默认 HEAD 并写入发布标记。
+# 拉取单个仓库，成功后缩减范围并跟随默认 HEAD，不改变发布入口。
 update_repo() {
     local repo=$1 dir=$2 branches=$3 remote_head line attempt label remote_url
     local -a chosen=()
@@ -251,7 +251,6 @@ update_repo() {
             log "无法查询上游默认分支，保留当前 HEAD：$repo"
         fi
     fi
-    : > "$dir/git-daemon-export-ok" || return 1
     return 0
 }
 

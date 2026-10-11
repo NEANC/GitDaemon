@@ -153,7 +153,7 @@ run_cmd_preserves_status_and_filters() {
     grep -Fq -- '[new branch]' "$LOG_FILE"
 }
 
-# 完整镜像拉取应写入所有分支、标签与 notes，并在成功后发布仓库。
+# 完整镜像拉取应写入所有引用，但不自行发布仓库。
 update_repo_mirror_fetch() {
     require_function update_repo || return 1
     local up=$TEST_ROOT/mirror-up.git dir=$TEST_ROOT/mirror.git
@@ -164,7 +164,7 @@ update_repo_mirror_fetch() {
     git --git-dir="$dir" show-ref --verify --quiet refs/heads/dev || return 1
     git --git-dir="$dir" show-ref --verify --quiet refs/tags/v1 || return 1
     git --git-dir="$dir" show-ref --verify --quiet refs/notes/commits || return 1
-    [[ -f $dir/git-daemon-export-ok ]]
+    [[ ! -e $dir/git-daemon-export-ok ]]
 }
 
 # 拉取失败时保留既有引用、不写发布标记并返回非零。
@@ -185,16 +185,29 @@ update_repo_failure_retains_cache() {
     return 0
 }
 
-# 写入发布标记失败必须使本次同步失败。
+# 数据更新不操作发布标记，统一接口拒绝非法标记。
 update_repo_marker_failure() {
     require_function update_repo || return 1
-    local up=$TEST_ROOT/marker-up.git dir=$TEST_ROOT/marker.git
+    source "$ROOT/scripts/lib/repository-recovery.sh" || return 1
+    local RUN_ROOT=$TEST_ROOT/marker-run
+    local up=$TEST_ROOT/marker-up.git dir=$RUN_ROOT/repos/owner/repo.git
+    local GM_BOOT_GENERATION=12345678-1234-1234-1234-123456789abc
+    local -A state=([schema]=1 [repo]=owner/repo [generation]=1 [desired]=present [observed]=ready [published]=no [message]=unchecked) result=()
+    mkdir -p "$RUN_ROOT/runtime" || return 1
+    printf '%s\n' "$GM_BOOT_GENERATION" > "$RUN_ROOT/runtime/generation"
+    gm_parse_repos owner/repo '' || return 1
     build_upstream "$up" "$TEST_ROOT/marker-work" >/dev/null || return 1
     init_mirror "$dir" "$up" || return 1
     update_repo owner/repo "$dir" "" || return 1
+    [[ ! -e $dir/git-daemon-export-ok ]] || return 1
+    gm_repo_state_commit_locked owner/repo state || return 1
+    gm_repo_check_locked owner/repo "$dir" result || return 1
+    gm_repo_publish_locked owner/repo 1 || return 1
+    [[ -f $dir/git-daemon-export-ok ]] || return 1
     rm -f -- "$dir/git-daemon-export-ok" || return 1
     mkdir -- "$dir/git-daemon-export-ok" || return 1
-    if update_repo owner/repo "$dir" "" 2>/dev/null; then
+    update_repo owner/repo "$dir" "" || return 1
+    if gm_repo_publish_locked owner/repo 1 2>/dev/null; then
         printf '发布标记写入失败未被发现\n'
         return 1
     fi
@@ -224,7 +237,7 @@ branch_scope_prunes_and_sets_head() {
         return 1
     fi
     [[ $(git --git-dir="$dir" symbolic-ref HEAD) == refs/heads/dev ]] || return 1
-    [[ -f $dir/git-daemon-export-ok ]]
+    [[ ! -e $dir/git-daemon-export-ok ]]
 }
 
 # 从指定分支切回完整镜像必须恢复全部分支、标签与默认 HEAD。
