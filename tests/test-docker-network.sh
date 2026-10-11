@@ -353,7 +353,7 @@ contract_case() {
 }
 case "${1:-}" in
     --contracts) contracts ;;
-    --live|--integration)
+    --live|--integration|--startup-integration)
         trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
         trap 'exit 143' TERM
         trap 'exit 130' INT
@@ -368,6 +368,9 @@ case "${1:-}" in
         if [[ $1 == --live ]]; then
             source "$HERE/docker-network-fixture.sh"
             network_probe
+        elif [[ $1 == --startup-integration ]]; then
+            [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
+            bash "$HERE/test-docker-startup-integration.sh"
         else
             # 子进程保留自己的清理 trap，外层握手 runner 独立采集退出码。
             [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
