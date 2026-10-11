@@ -1053,6 +1053,40 @@ test_stale_health_cannot_write() {
     [[ $before == "$after" && ! -e $RUN_ROOT/state/sync/owner/repo.state ]]
 }
 
+# 真实 fetch 的合法分支和标签名称不应被当作维护诊断。
+test_fetch_failed_refs_succeed() {
+    setup_sync_failure ref-names || return 1
+    local -A result=()
+    local ref oid
+    oid=$(git --git-dir="$UP" rev-parse refs/heads/main) || return 1
+    for ref in refs/heads/failed refs/heads/feature/failed-build refs/tags/failed-release; do
+        git --git-dir="$UP" update-ref "$ref" "$oid" || return 1
+    done
+    gm_sync_one_locked owner/repo '' result || { printf '合法 failed 引用误判为 %s\n' "${result[stage]}"; return 1; }
+    for ref in refs/heads/failed refs/heads/feature/failed-build refs/tags/failed-release; do
+        [[ $(git --git-dir="$DIR" rev-parse "$ref") == "$oid" ]] || return 1
+    done
+    [[ ${result[configuration_converged]} == yes && -f $DIR/git-daemon-export-ok ]]
+}
+
+# fetch 返回成功但输出维护错误时，仍必须阻止后续引用与 HEAD 写入。
+test_fetch_success_with_maintenance_error() {
+    setup_sync_failure "maintenance-error-$RANDOM" || return 1
+    local injected=$1
+    local -A result=() saved=()
+    git() {
+        command git "$@" || return $?
+        if [[ " $* " == *' fetch '* ]]; then printf '%s\n' "$injected" >&2; fi
+        return 0
+    }
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    gm_repo_state_read owner/repo saved || return 1
+    [[ ${result[stage]} == maintenance && ${saved[health]} == recovery_required && ! -e $DIR/git-daemon-export-ok ]]
+}
+
+check 'test_fetch_failed_refs_succeed' test_fetch_failed_refs_succeed
+check 'test_fetch_success_maintenance_error' test_fetch_success_with_maintenance_error 'error: automatic maintenance failed'
+check 'test_fetch_success_maintenance_warning' test_fetch_success_with_maintenance_error 'warning: gc failed'
 check 'test_stale_health_boot' test_stale_health_cannot_write boot
 check 'test_stale_health_generation' test_stale_health_cannot_write generation
 check 'test_stale_health_identity' test_stale_health_cannot_write identity

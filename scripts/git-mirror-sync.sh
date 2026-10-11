@@ -251,7 +251,7 @@ update_repo() {
         return 1
     fi
     GM_SYNC_TRANSPORT_ONLY=no
-    if grep -Eiq 'error:|fatal:|failed|warning:.*(gc|maintenance)' "$GM_SYNC_DIAGNOSTIC"; then
+    if grep -Eiq $'(^|\r)(error:|fatal:|warning:.*(gc|maintenance))' "$GM_SYNC_DIAGNOSTIC"; then
         GM_SYNC_STAGE=maintenance
         return 1
     fi
