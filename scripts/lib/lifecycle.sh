@@ -149,7 +149,7 @@ gm_task_run_locked() {
             gm_lock_release dispatch
             return 1
         fi
-        if [[ ${eligibility[message]} == recovery_required && $operation != recovery && $operation != check ]]; then
+        if [[ ( ${eligibility[message]} == recovery_required || ${eligibility[health]-} == corrupt || ${eligibility[health]-} == recovery_required ) && $operation != recovery && $operation != check ]]; then
             task[result]=RECOVERY_REQUIRED
             gm_lock_release dispatch
             return 1
