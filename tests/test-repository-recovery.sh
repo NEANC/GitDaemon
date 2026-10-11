@@ -504,7 +504,41 @@ test_replacement_after_config_change() {
     done
 }
 
-for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion test_missing_old_requires_journal_without_aliases test_alias_pending_before_record test_replacement_after_config_change}; do
+# 健康副本跨配置复用后在 published 中断，必须仍能按当前配置重放。
+test_healthy_config_change_published_restart() {
+    setup_replacement healthy-config-restart || return 1
+    gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+    local -A journal=()
+    local operation identity config_a config_b status=0 replay_status=0
+    gm_repo_replacement_read owner/repo journal || return 1
+    [[ ${journal[phase]} == cleanup_complete ]] || return 1
+    operation=${journal[operation]}
+    identity=${journal[new_identity]}
+    config_a=${journal[config]}
+    gm_parse_repos 'owner/repo main' '' || return 1
+    configure_fetch "$DIR" main || return 1
+    prune_unselected_refs "$DIR" main || return 1
+    config_b=$(gm_repo_config_identity owner/repo) || return 1
+    [[ $config_a != "$config_b" ]] || return 1
+    restart_replacement || return 1
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    [[ ${RESULT[health]} == healthy ]] || return 1
+    GM_REPLACE_TEST_STOP=published
+    gm_repo_rebuild_locked owner/repo main RESULT || status=$?
+    gm_repo_replacement_read owner/repo journal || return 1
+    [[ $status == 1 && ${journal[phase]} == published && -f $DIR/git-daemon-export-ok ]] || return 1
+    [[ ${journal[operation]} == "$operation" && ${journal[new_identity]} == "$identity" ]] || return 1
+    restart_replacement || replay_status=$?
+    printf 'healthy-config phase=%s config_a=%s config_b=%s journal_config=%s replay_status=%s\n' "${journal[phase]}" "$config_a" "$config_b" "${journal[config]}" "$replay_status"
+    [[ $replay_status == 0 && ${journal[config]} == "$config_b" ]] || return 1
+    gm_repo_rebuild_locked owner/repo main RESULT || return 1
+    gm_repo_replacement_read owner/repo journal || return 1
+    [[ ${journal[phase]} == cleanup_complete && ${journal[config]} == "$config_b" ]] || return 1
+    [[ $(stat -c '%d-%i' "$DIR") == "$identity" && -f $DIR/git-daemon-export-ok ]] || return 1
+    [[ ! -e $RUN_ROOT/quarantine/$operation/repo.git && ! -e $RUN_ROOT/staging/$operation/repo.git ]]
+}
+
+for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion test_missing_old_requires_journal_without_aliases test_alias_pending_before_record test_replacement_after_config_change test_healthy_config_change_published_restart}; do
     CHECKS=$((CHECKS+1))
     if (declare -A STATE=() RESULT=(); declare -F gm_repo_check_locked >/dev/null && "$test"); then
         printf '[PASS] %s\n' "$test"
