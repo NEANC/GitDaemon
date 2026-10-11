@@ -560,7 +560,10 @@ update_repo_falls_back_over_paths() {
     GM_CREDENTIAL_ARGS=()
     git() { return 0; }
     run_cmd() {
-        if [[ " $* " == *' http.curloptResolve='* ]]; then return 1; fi
+        if [[ " $* " == *' http.curloptResolve='* ]]; then
+            printf "fatal: unable to access upstream: Could not resolve host: github.com\n" > "$GM_SYNC_DIAGNOSTIC"
+            return 1
+        fi
         return 0
     }
     update_repo owner/repo "$dir" "" || return 1
@@ -890,11 +893,20 @@ test_fetch_maintenance_remains_supervised() {
     local GIT_TRACE2_EVENT=$TEST_ROOT/maintenance.trace
     export GIT_TRACE2_EVENT
     update_repo owner/repo "$dir" '' || return 1
+    awk '
+        /"event":"child_start"/ { started++ }
+        /"event":"child_exit"/ { finished++ }
+        /"event":"cmd_name".*"hierarchy":"fetch\/maintenance\/repack/ { repack++ }
+        /"event":"exit"/ { exited++ }
+        /"event":"start"/ { running++ }
+        END { exit !(started > 0 && started == finished && running == exited && repack > 0) }
+    ' "$GIT_TRACE2_EVENT" || { cat "$GIT_TRACE2_EVENT"; return 1; }
     grep -q '"repack"' "$GIT_TRACE2_EVENT" || { printf '真实自动维护没有执行 repack\n'; return 1; }
     if grep -q '"argv":\["git","gc","--auto","--detach"\]' "$GIT_TRACE2_EVENT"; then return 1; fi
     [[ $(git --git-dir="$dir" config gc.autoDetach) == true ]] || return 1
     [[ $(git --git-dir="$dir" config maintenance.autoDetach) == true ]] || return 1
     [[ $(find "$dir/objects/pack" -name '*.pack' | wc -l) -lt 55 ]] || return 1
+    grep -E '"event":"(child_start|child_exit)".*(maintenance|repack|pack-objects|pre-auto-gc)|"event":"exit"' "$GIT_TRACE2_EVENT"
     printf 'REAL_FETCH_MAINTENANCE_REPACK=PASS git=%s\n' "$(git --version)"
 }
 
@@ -969,6 +981,30 @@ test_convergence_record_survives_recovery() {
     [[ ${result[configuration_converged]} == yes && ${saved[message]} == configuration_converged ]]
 }
 
+test_unknown_fetch_stops_fallback() {
+    setup_sync_failure unknown || return 1
+    local -A result=() saved=()
+    GM_TRANSPORT_SEQUENCE=(mapping system)
+    GM_RESOLVE_ARGS=(-c http.curloptResolve=github.com:443:127.0.0.1)
+    git() {
+        if [[ " $* " == *' fetch '* && " $* " == *curloptResolve* ]]; then return 1; fi
+        command git "$@"
+    }
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    gm_repo_state_read owner/repo saved || return 1
+    [[ ${saved[message]} == recovery_required && ! -e $DIR/git-daemon-export-ok ]]
+}
+
+test_unchecked_cli_cache_cannot_write() {
+    setup_sync_failure unchecked || return 1
+    local MIRROR_ROOT=$RUN_ROOT/repos
+    rm "$RUN_ROOT/state/repos/owner/repo.state" || return 1
+    if sync_repo owner/repo ''; then return 1; fi
+    return 0
+}
+
+check 'test_unknown_fetch_stops_fallback' test_unknown_fetch_stops_fallback
+check 'test_unchecked_cli_cache_cannot_write' test_unchecked_cli_cache_cannot_write
 check 'test_classified_fallback_can_succeed' test_classified_fallback_can_succeed
 check 'test_publish_failure_requires_recovery' test_publish_failure_requires_recovery
 check 'test_convergence_record_survives_recovery' test_convergence_record_survives_recovery
