@@ -101,7 +101,7 @@ gm_state_write_array_locked() {
         if [[ ${GM_STATE_TEST_FAULT-} == write ]]; then exit 1; fi
         printf 'schema=%s\nrepo=%s\ngeneration=%s\ndesired=%s\nobserved=%s\npublished=%s\nmessage=%s\n' \
             "${values[schema]}" "${values[repo]}" "${values[generation]}" "${values[desired]}" \
-            "${values[observed]}" "${values[published]}" "${values[message]}" > "$temporary"
+            "${values[observed]}" "${values[published]}" "${values[message]}" > "$temporary" || exit 1
         gm_state_flush "$temporary" || exit 1
         if [[ ${GM_STATE_TEST_FAULT-} == rename ]]; then exit 1; fi
         mv -f -- "$temporary" "$file" || exit 1

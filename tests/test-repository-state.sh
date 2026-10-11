@@ -234,6 +234,36 @@ reject_invalid_repo_and_create_directories() {
     [[ -f $root/state/repos/owner/repo.state && ! -e $root/state/operations ]]
 }
 
+# 模拟实际写入部分字节后失败，验证仓库及操作记录均保留旧内容。
+partial_write_keeps_old_record() {
+    local root=$TEST_ROOT/partial-write repo=owner/repo kind writer before status
+    local -A state=()
+    mkdir -p -- "$root" || return 1
+    RUN_ROOT=$root
+    state[schema]=1 state[repo]=$repo state[generation]=1 state[desired]=present state[observed]=ready state[published]=yes state[message]=old
+    for kind in repos operations; do
+        writer=gm_repo_state_commit_locked
+        if [[ $kind == operations ]]; then writer=gm_operation_commit_locked; fi
+        "$writer" "$repo" state || return 1
+        before=$(<"$root/state/$kind/owner/repo.state")
+        # 仅替换输出边界，其余临时文件、刷新及重命名仍使用实际实现。
+        printf() {
+            if [[ $1 == schema=* ]]; then
+                builtin printf 'schema=1\n'
+                return 1
+            fi
+            builtin printf "$@"
+        }
+        status=0
+        "$writer" "$repo" state || status=$?
+        unset -f printf
+        [[ $status == 1 && $GM_STATE_COMMIT_RESULT == failed ]] || return 1
+        [[ $(<"$root/state/$kind/owner/repo.state") == "$before" ]] || return 1
+        [[ -z $(find "$root/state/$kind/owner" -name '.state.*') ]] || return 1
+    done
+}
+
+check partial_write_keeps_old_record partial_write_keeps_old_record
 check roundtrip roundtrip
 check reject_symlink_and_duplicate_key reject_symlink_and_duplicate_key
 check reject_unknown_fields reject_unknown_fields
