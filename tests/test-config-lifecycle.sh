@@ -643,14 +643,16 @@ uninstall_behavior() {
         gm_check_private_directory() { return 0; }
         local status=0 output category run=$work/instance
         local -a options=(--run-root "$run" --install-root "$work/program")
-        # 服务控制边界桩：按登记名接受，-e 计数到独立文件，stop 记录到 services。
+        # 服务控制边界桩：校验安装目录绝对路径，再按服务名记录停止顺序。
         rc-service() {
             if [[ ${1-} == --user && ${2-} == -e && $# == 3 ]]; then
+                [[ $3 == "$work/program/openrc/"* && -x $3 ]] || return 90
                 printf 'exists %s\n' "${3-}" >> "$work/checks"
                 return 0
             fi
             [[ $# == 3 && ${1-} == --user && ${3-} == stop ]] || return 90
-            printf '%s\n' "$*" >> "$work/services"
+            [[ $2 == "$work/program/openrc/"* && -x $2 ]] || return 90
+            printf '%s\n' "--user ${2##*/} stop" >> "$work/services"
             if [[ $scenario == stop-failure ]]; then return 23; fi
             return 0
         }
@@ -848,7 +850,8 @@ managed_link_cleanup() {
     rc-service() {
         if [[ $# == 3 && $1 == --user && $2 == -e ]]; then return 0; fi
         [[ $# == 3 && $1 == --user && $3 == stop ]] || return 90
-        printf 'stop %s\n' "$2" >> "$work/calls"
+        [[ $2 == "$work/program/openrc/"* && -x $2 ]] || return 90
+        printf 'stop %s\n' "${2##*/}" >> "$work/calls"
         return 0
     }
     gm_lock_acquire() {
@@ -960,7 +963,8 @@ resume_lifecycle() {
         [[ $# == 3 && ${1-} == --user && ( ${3-} == stop || ${3-} == status ) ]] || return 90
         case "$3" in
             stop)
-                printf 'stop %s\n' "$2" >> "$work/calls"
+                [[ $2 == "$work/program/openrc/"* && -x $2 ]] || return 90
+                printf 'stop %s\n' "${2##*/}" >> "$work/calls"
                 if [[ $scenario == stop-failure ]]; then return 23; fi
                 return 0
                 ;;
