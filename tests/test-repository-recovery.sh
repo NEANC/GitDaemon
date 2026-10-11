@@ -170,7 +170,247 @@ test_replica_replaced() {
     if gm_repo_publish_locked owner/repo 1; then return 1; fi
 }
 
-for test in test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced; do
+setup_replacement() {
+    setup_repo "$1" || return 1
+    source "$ROOT/scripts/git-mirror-sync.sh" || return 1
+    LOG_FILE=$RUN_ROOT/logs/sync.log
+    GM_TRANSPORT_SEQUENCE=(system)
+    UPSTREAM=$RUN_ROOT/upstream.git
+    git clone -q --bare --no-local "$DIR" "$UPSTREAM" || return 1
+    git() {
+        local -a args=("$@")
+        local index
+        for index in "${!args[@]}"; do
+            if [[ ${args[$index]} == https://github.com/owner/repo.git ]]; then args[$index]=$UPSTREAM; fi
+        done
+        command git "${args[@]}"
+    }
+    local oid
+    oid=$(git --git-dir="$DIR" rev-parse HEAD) || return 1
+    rm -- "$DIR/objects/${oid:0:2}/${oid:2}" || return 1
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    [[ ${RESULT[health]} == corrupt ]]
+}
+
+restart_replacement() {
+    GM_BOOT_GENERATION=22345678-1234-1234-1234-123456789abc
+    printf '%s\n' "$GM_BOOT_GENERATION" > "$RUN_ROOT/runtime/generation"
+    if [[ -d $DIR ]]; then gm_repo_export_remove_locked owner/repo || return 1; fi
+    unset GM_REPLACE_TEST_STOP
+    gm_repo_replay_locked owner/repo RESULT
+}
+
+test_restart_each_replace_phase() {
+    local phase old
+    for phase in detected unpublished old_isolated candidate_building candidate_verified installed published cleanup_complete; do
+        setup_replacement "restart-$phase" || return 1
+        old=$(stat -c '%d-%i' "$DIR") || return 1
+        GM_REPLACE_TEST_STOP=$phase
+        if gm_repo_rebuild_locked owner/repo '' RESULT; then return 1; fi
+        local -A journal=()
+        gm_repo_replacement_read owner/repo journal || return 1
+        [[ ${journal[phase]} == "$phase" ]] || return 1
+        if [[ $phase != cleanup_complete ]]; then
+            [[ $(stat -c '%d-%i' "$DIR" 2>/dev/null) == "$old" || $(stat -c '%d-%i' "$RUN_ROOT/quarantine/${journal[operation]}/repo.git" 2>/dev/null) == "$old" ]] || return 1
+        fi
+        printf 'phase=%s old=%s operation=%s\n' "$phase" "$old" "${journal[operation]}"
+        restart_replacement || return 1
+        gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+        [[ -f $DIR/git-daemon-export-ok && ! -e $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]] || return 1
+        command git --git-dir="$DIR" fsck --full || return 1
+    done
+}
+
+test_live_reader_defers_move() {
+    setup_repo readers || return 1
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    gm_repo_publish_locked owner/repo 1 || return 1
+    local old oid
+    old=$(stat -c '%d-%i' "$DIR")
+    oid=$(git --git-dir="$DIR" rev-parse HEAD)
+    rm -- "$DIR/objects/${oid:0:2}/${oid:2}"
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    if gm_repo_rebuild_locked owner/repo '' RESULT; then return 1; fi
+    [[ ${RESULT[reason]-} == readers_unknown && $(stat -c '%d-%i' "$DIR") == "$old" && ! -e $DIR/git-daemon-export-ok ]] || return 1
+    local -A journal=()
+    gm_repo_replacement_read owner/repo journal || return 1
+    [[ ${journal[phase]} == unpublished ]]
+}
+
+test_failed_candidate_keeps_old() {
+    setup_replacement failed-candidate || return 1
+    local old
+    old=$(stat -c '%d-%i' "$DIR")
+    update_repo() { return 1; }
+    if gm_repo_rebuild_locked owner/repo '' RESULT; then return 1; fi
+    local -A journal=()
+    gm_repo_replacement_read owner/repo journal || return 1
+    [[ $(stat -c '%d-%i' "$RUN_ROOT/quarantine/${journal[operation]}/repo.git") == "$old" && ! -e $DIR/git-daemon-export-ok ]]
+}
+
+test_cleanup_failure_keeps_new() {
+    setup_replacement cleanup-failure || return 1
+    local -A journal=()
+    GM_REPLACE_TEST_STOP=published
+    gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+    unset GM_REPLACE_TEST_STOP
+    gm_repo_replacement_read owner/repo journal || return 1
+    chmod 500 "$RUN_ROOT/quarantine/${journal[operation]}"
+    local status=0
+    gm_repo_cleanup_old_locked owner/repo || status=$?
+    chmod 700 "$RUN_ROOT/quarantine/${journal[operation]}"
+    [[ $status != 0 && -f $DIR/git-daemon-export-ok && -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]] || return 1
+    gm_repo_cleanup_old_locked owner/repo
+}
+
+test_old_published_needs_current_fsck() {
+    setup_replacement old-published || return 1
+    GM_REPLACE_TEST_STOP=published
+    gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+    local -A journal=()
+    gm_repo_replacement_read owner/repo journal || return 1
+    restart_replacement || return 1
+    if gm_repo_cleanup_old_locked owner/repo; then return 1; fi
+    [[ -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git && ! -e $DIR/git-daemon-export-ok ]] || return 1
+    local oid
+    oid=$(git --git-dir="$DIR" rev-parse HEAD)
+    rm -- "$DIR/objects/${oid:0:2}/${oid:2}"
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    if gm_repo_rebuild_locked owner/repo '' RESULT; then return 1; fi
+    [[ -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]]
+}
+
+test_alias_transition_requires_journal() {
+    setup_replacement alias || return 1
+    gm_parse_repos 'owner/repo' 'owner/repo short' || return 1
+    mkdir -p "$RUN_ROOT/config/managed-links"
+    ln -s owner/repo.git "$RUN_ROOT/repos/short.git"
+    gm_write_link_record "$RUN_ROOT/config/managed-links/short.git" owner/repo.git || return 1
+    GM_REPLACE_TEST_STOP=old_isolated
+    gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+    gm_repo_validate_aliases_locked owner/repo || return 1
+    local record=$RUN_ROOT/state/replacements/owner/repo.state
+    mv "$record" "$record.saved"
+    if gm_repo_validate_aliases_locked owner/repo; then return 1; fi
+    mv "$record.saved" "$record"
+    rm "$RUN_ROOT/repos/short.git"
+    ln -s ../outside "$RUN_ROOT/repos/short.git"
+    if gm_repo_validate_aliases_locked owner/repo; then return 1; fi
+    rm "$RUN_ROOT/repos/short.git"
+    ln -s owner/repo.git "$RUN_ROOT/repos/short.git"
+    restart_replacement || return 1
+    gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+    gm_validate_managed_link "$RUN_ROOT" "$RUN_ROOT/repos/short.git"
+}
+
+test_scan_failure_blocks_cleanup() {
+    setup_replacement scan-failure || return 1
+    GM_REPLACE_TEST_STOP=published
+    gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+    unset GM_REPLACE_TEST_STOP
+    local -A journal=()
+    gm_repo_replacement_read owner/repo journal || return 1
+    find() { return 1; }
+    if gm_repo_cleanup_old_locked owner/repo; then return 1; fi
+    [[ -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]]
+}
+
+test_cleanup_checks_durable_boot() {
+    setup_replacement durable-boot || return 1
+    GM_REPLACE_TEST_STOP=published
+    gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+    unset GM_REPLACE_TEST_STOP
+    printf '%s\n' 22345678-1234-1234-1234-123456789abc > "$RUN_ROOT/runtime/generation"
+    if gm_repo_cleanup_old_locked owner/repo; then return 1; fi
+}
+
+test_candidate_rejects_sharing_and_scope() {
+    local mode
+    for mode in alternate hardlink symlink scope head; do
+        setup_replacement "candidate-$mode" || return 1
+        GM_REPLACE_TEST_STOP=candidate_verified
+        gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+        unset GM_REPLACE_TEST_STOP
+        local -A journal=()
+        gm_repo_replacement_read owner/repo journal || return 1
+        local dir=$RUN_ROOT/staging/${journal[operation]}/repo.git
+        case $mode in
+            alternate) printf '%s\n' "$UPSTREAM/objects" > "$dir/objects/info/alternates" ;;
+            hardlink) ln "$dir/HEAD" "$RUN_ROOT/shared-head" ;;
+            symlink) mv "$dir/objects" "$RUN_ROOT/shared-objects"; ln -s "$RUN_ROOT/shared-objects" "$dir/objects" ;;
+            scope) git --git-dir="$dir" config remote.origin.fetch '+refs/heads/other:refs/heads/other' ;;
+            head) git --git-dir="$dir" symbolic-ref HEAD refs/heads/absent ;;
+        esac
+        if gm_repo_rebuild_locked owner/repo '' RESULT; then return 1; fi
+        [[ -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git && ! -e $DIR ]] || return 1
+    done
+}
+
+test_replacement_rename_windows() {
+    local phase
+    for phase in unpublished candidate_verified; do
+        setup_replacement "rename-$phase" || return 1
+        GM_REPLACE_TEST_STOP=$phase
+        gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+        local -A journal=()
+        gm_repo_replacement_read owner/repo journal || return 1
+        if [[ $phase == unpublished ]]; then
+            mkdir -p "$RUN_ROOT/quarantine/${journal[operation]}"
+            mv "$DIR" "$RUN_ROOT/quarantine/${journal[operation]}/repo.git"
+        else
+            mv "$RUN_ROOT/staging/${journal[operation]}/repo.git" "$DIR"
+        fi
+        restart_replacement || return 1
+        gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+        [[ -f $DIR/git-daemon-export-ok ]] || return 1
+    done
+}
+
+test_candidate_empty_and_selected() {
+    local mode branches
+    for mode in empty selected; do
+        setup_replacement "valid-$mode" || return 1
+        branches=
+        if [[ $mode == empty ]]; then
+            git --git-dir="$UPSTREAM" update-ref -d refs/heads/main || return 1
+        else
+            branches=main
+            gm_parse_repos 'owner/repo main' '' || return 1
+            git --git-dir="$UPSTREAM" update-ref refs/heads/extra HEAD || return 1
+        fi
+        gm_repo_rebuild_locked owner/repo "$branches" RESULT || return 1
+        [[ -f $DIR/git-daemon-export-ok ]] || return 1
+        if [[ $mode == selected ]]; then
+            [[ $(git --git-dir="$DIR" for-each-ref --format='%(refname)') == refs/heads/main ]] || return 1
+        fi
+    done
+}
+
+test_candidate_creation_window() {
+    setup_replacement creation-window || return 1
+    GM_REPLACE_TEST_STOP=old_isolated
+    gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+    local -A journal=()
+    gm_repo_replacement_read owner/repo journal || return 1
+    mkdir -p "$RUN_ROOT/staging/${journal[operation]}/repo.git"
+    restart_replacement || return 1
+    gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+}
+
+test_second_replacement_after_completion() {
+    setup_replacement second-replacement || return 1
+    gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+    restart_replacement || return 1
+    local oid old
+    oid=$(git --git-dir="$DIR" rev-parse HEAD)
+    old=$(stat -c '%d-%i' "$DIR")
+    rm -- "$DIR/objects/${oid:0:2}/${oid:2}"
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+    [[ -f $DIR/git-daemon-export-ok && $(stat -c '%d-%i' "$DIR") != "$old" ]]
+}
+
+for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion}; do
     CHECKS=$((CHECKS+1))
     if (declare -A STATE=() RESULT=(); declare -F gm_repo_check_locked >/dev/null && "$test"); then
         printf '[PASS] %s\n' "$test"
