@@ -91,7 +91,9 @@ filter_fetch_output() {
 
 # 先追加完整日志，再筛选终端展示；保留 Git 原命令的退出状态。
 run_cmd() {
-    "$@" 2>&1 | tee -a "$LOG_FILE" | filter_fetch_output
+    local -a outputs=("$LOG_FILE")
+    if [[ -n ${GM_SYNC_DIAGNOSTIC-} ]]; then outputs+=("$GM_SYNC_DIAGNOSTIC"); fi
+    LC_ALL=C "$@" 2>&1 | tee -a "${outputs[@]}" | filter_fetch_output
     return "${PIPESTATUS[0]}"
 }
 
@@ -120,6 +122,7 @@ prune_unselected_refs() {
             git --git-dir="$dir" update-ref -d "$ref" || return 1
         fi
     done <<< "$refs"
+    GM_SYNC_STAGE=head
     git --git-dir="$dir" symbolic-ref HEAD "refs/heads/${selected[0]}" || return 1
     return 0
 }
@@ -218,40 +221,123 @@ transport_label() {
 # 拉取单个仓库，成功后缩减范围并跟随默认 HEAD，不改变发布入口。
 update_repo() {
     local repo=$1 dir=$2 branches=$3 remote_head line attempt label remote_url
+    local GM_SYNC_DIAGNOSTIC
+    local -A classification=()
     local -a chosen=()
-    configure_fetch "$dir" "$branches" || return 1
-    remote_url=$(git --git-dir="$dir" remote get-url origin) || return 1
+    GM_SYNC_STAGE=config GM_SYNC_TRANSPORT_ONLY=no GM_SYNC_CONVERGED=no
+    GM_SYNC_DIAGNOSTIC=$(mktemp "${LOG_FILE%/*}/sync-diagnostic.XXXXXXXX") || return 1
+    GM_SYNC_LAST_LOG=$GM_SYNC_DIAGNOSTIC
+    LC_ALL=C configure_fetch "$dir" "$branches" 2>>"$GM_SYNC_DIAGNOSTIC" || return 1
+    remote_url=$(LC_ALL=C git --git-dir="$dir" remote get-url origin 2>>"$GM_SYNC_DIAGNOSTIC") || return 1
+    GM_SYNC_STAGE=fetch
     log "同步 $repo；分支：${branches:-全部 refs}"
     for attempt in "${GM_TRANSPORT_SEQUENCE[@]}"; do
         transport_args "$attempt" "$remote_url" || return 1
         label=$(transport_label "$attempt")
-        if run_cmd git "${GM_TRANSPORT_ARGS[@]}" --git-dir="$dir" fetch --progress --atomic --prune origin; then
+        GM_SYNC_DIAGNOSTIC=$(mktemp "${LOG_FILE%/*}/sync-fetch.XXXXXXXX") || return 1
+        GM_SYNC_LAST_LOG=$GM_SYNC_DIAGNOSTIC
+        if run_cmd git "${GM_TRANSPORT_ARGS[@]}" -c gc.autoDetach=false -c maintenance.autoDetach=false --git-dir="$dir" fetch --progress --atomic --prune origin; then
             chosen=("${GM_TRANSPORT_ARGS[@]}")
             log "同步传输路径：$label"
             break
         fi
+        gm_sync_classify_failure fetch "$(<"$GM_SYNC_DIAGNOSTIC")" classification
+        GM_SYNC_TRANSPORT_ONLY=${classification[transport_only]}
+        if [[ $GM_SYNC_TRANSPORT_ONLY != yes ]]; then return 1; fi
         log "传输失败：$label；尝试下一路径"
     done
     if [[ ${#chosen[@]} -eq 0 ]]; then
         log "同步失败：全部传输路径均不可用：$repo"
         return 1
     fi
-    prune_unselected_refs "$dir" "$branches" || return 1
+    GM_SYNC_TRANSPORT_ONLY=no
+    if grep -Eiq 'error:|fatal:|failed|warning:.*(gc|maintenance)' "$GM_SYNC_DIAGNOSTIC"; then
+        GM_SYNC_STAGE=maintenance
+        return 1
+    fi
+    GM_SYNC_STAGE=refs
+    LC_ALL=C prune_unselected_refs "$dir" "$branches" 2>>"$GM_SYNC_DIAGNOSTIC" || return 1
+    GM_SYNC_STAGE=head
     if [ -z "$branches" ]; then
-        if remote_head=$(git "${chosen[@]}" --git-dir="$dir" ls-remote --symref origin HEAD 2>>"$LOG_FILE"); then
+        if remote_head=$(LC_ALL=C git "${chosen[@]}" --git-dir="$dir" ls-remote --symref origin HEAD 2>>"$GM_SYNC_DIAGNOSTIC"); then
             while IFS= read -r line; do
                 if [[ $line == 'ref: refs/heads/'* ]]; then
                     remote_head=${line#ref: }
                     remote_head=${remote_head%%[[:space:]]*}
-                    git --git-dir="$dir" symbolic-ref HEAD "$remote_head" || return 1
+                    LC_ALL=C git --git-dir="$dir" symbolic-ref HEAD "$remote_head" 2>>"$GM_SYNC_DIAGNOSTIC" || return 1
                     break
                 fi
             done <<< "$remote_head"
         else
             log "无法查询上游默认分支，保留当前 HEAD：$repo"
+            return 1
         fi
     fi
+    GM_SYNC_CONVERGED=yes
     return 0
+}
+
+gm_sync_classify_failure() {
+    local stage=$1 diagnostics=$2 line seen=no unknown=no
+    local -n failure=$3
+    failure=([stage]="$stage" [transport_only]=no [configuration_converged]=no)
+    [[ $stage == fetch ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        case "$line" in
+            '') ;;
+            "fatal: unable to access "*': Could not resolve host: '*|"fatal: unable to access "*': Could not resolve proxy: '*|"fatal: unable to access "*': Failed to connect to '*|"fatal: unable to access "*': Connection timed out'*) seen=yes ;;
+            *) unknown=yes ;;
+        esac
+    done <<< "$diagnostics"
+    if [[ $seen == yes && $unknown == no ]]; then failure[transport_only]=yes; fi
+    return 0
+}
+
+gm_sync_one_locked() {
+    local repo=$1 branches=$2 output=$3 dir=$RUN_ROOT/repos/$1.git index found=no status=0 publish_status=0
+    local -n sync_result=$output
+    local -A sync_state=() checked=() convergence=()
+    sync_result=([transport_only]=no [configuration_converged]=no [stage]=config)
+    gm_validate_repo_name "$repo" || return 1
+    for index in "${!GM_REPOS[@]}"; do
+        if [[ ${GM_REPOS[$index]} == "$repo" && ${GM_BRANCHES[$index]} == "$branches" ]]; then found=yes; break; fi
+    done
+    [[ $found == yes && -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
+    [[ ${GM_LOCAL_FROZEN-} != yes && -z ${GM_STOP_SCOPE-} && ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
+    gm_repo_state_read "$repo" sync_state || return 1
+    [[ ${sync_state[health]-} == healthy && ${sync_state[message]} != recovery_required ]] || return 1
+    gm_validate_path "$dir" || return 1
+    update_repo "$repo" "$dir" "$branches" || status=$?
+    sync_result[stage]=$GM_SYNC_STAGE
+    sync_result[transport_only]=$GM_SYNC_TRANSPORT_ONLY
+    sync_result[configuration_converged]=$GM_SYNC_CONVERGED
+    convergence=([schema]=1 [repo]="$repo" [generation]="${sync_state[generation]}" [desired]=present [observed]=error [published]=no [message]=configuration_pending)
+    if (( status == 0 )); then convergence[observed]=ready; convergence[message]=configuration_converged; fi
+    if ! gm_state_directory_prepare "$RUN_ROOT/state/sync/${repo%/*}" ||
+        ! gm_state_write_array_locked "$RUN_ROOT/state/sync/$repo.state" convergence; then
+        gm_repo_export_remove_locked "$repo" || return 2
+        gm_task_freeze || true
+        return 2
+    fi
+    if (( status != 0 )) && [[ $GM_SYNC_TRANSPORT_ONLY != yes ]]; then
+        gm_repo_unpublish_locked "$repo" || return 2
+        sync_state[published]=no sync_state[health]=recovery_required sync_state[message]=recovery_required sync_state[observed]=error
+        gm_repo_state_commit_locked "$repo" sync_state || { gm_task_freeze; return 2; }
+        return 1
+    fi
+    gm_repo_check_locked "$repo" "$dir" checked || return 1
+    [[ ${checked[health]} == healthy ]] || { sync_result[transport_only]=no; return 1; }
+    sync_result[stage]=publish
+    gm_repo_publish_locked "$repo" "${sync_state[generation]}" || publish_status=$?
+    if (( publish_status == 0 )); then gm_publish_short_links "$RUN_ROOT" "$repo" || publish_status=$?; fi
+    if (( publish_status != 0 )); then
+        gm_repo_unpublish_locked "$repo" || return 2
+        gm_repo_state_read "$repo" sync_state || return 1
+        sync_state[health]=recovery_required sync_state[message]=recovery_required
+        gm_repo_state_commit_locked "$repo" sync_state || return 2
+        return "$publish_status"
+    fi
+    return "$status"
 }
 
 # 报告每个同步分支的提交头；无本地分支或枚举失败时明确提示。
@@ -296,6 +382,11 @@ report_branches() {
 # 同步单个仓库，失败时保留已有缓存且不发布新仓库。
 sync_repo() {
     local repo=$1 branches=$2 dir url status
+    local -A sync_output=()
+    if [[ -n ${RUN_ROOT-} ]]; then
+        gm_sync_one_locked "$repo" "$branches" sync_output
+        return $?
+    fi
     dir="$MIRROR_ROOT/$repo.git"
     url="https://github.com/$repo.git"
     mkdir -p "$(dirname "$dir")" || return 1
@@ -466,15 +557,25 @@ gm_prune_short_links() {
 
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
 gm_sync_main() (
-    local index failed=0 install snapshot status
+    local index failed=0 install snapshot status selected= found=no
     if [[ ${1-} == --help || ${1-} == -h ]]; then
-        printf '%s\n' '用法：git-mirror-sync.sh；REPOS/SHORT_LINKS 仅来自当前环境'
+        printf '%s\n' '用法：git-mirror-sync.sh [--repo owner/repo]'
         return 0
     fi
-    [[ $# == 0 ]] || { gm_error '同步入口不接受此参数'; return 2; }
+    if [[ $# == 2 && $1 == --repo ]]; then
+        gm_validate_repo_name "$2" || return 2
+        selected=$2
+    elif [[ $# != 0 ]]; then gm_error '同步入口不接受此参数'; return 2; fi
     install=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
     gm_check_identity || return 1
     gm_prepare_runtime "${RUN_ROOT-/var/lib/git-daemon}" "$install" || return 1
+    if [[ -n $selected ]]; then
+        for index in "${!GM_REPOS[@]}"; do
+            if [[ ${GM_REPOS[$index]} == "$selected" ]]; then found=yes; break; fi
+        done
+        [[ $found == yes ]] || { gm_error '仓库未配置'; return 2; }
+    fi
+    source "$install/lib/repository-recovery.sh" || return 1
     gm_load_sync_credentials "${RUN_ROOT-/var/lib/git-daemon}" || return 1
     gm_begin_operation sync || return $?
     CONFIG_DIR=$RUN_ROOT/config
@@ -490,6 +591,7 @@ gm_sync_main() (
     load_resolve_args "$snapshot" || return 1
     build_transport_sequence || return 1
     for index in "${!GM_REPOS[@]}"; do
+        if [[ -n $selected && ${GM_REPOS[$index]} != "$selected" ]]; then continue; fi
         if sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}"; then
             if gm_publish_short_links "$RUN_ROOT" "${GM_REPOS[$index]}"; then
                 :
@@ -502,7 +604,7 @@ gm_sync_main() (
             failed=1
         fi
     done
-    gm_prune_short_links "$RUN_ROOT" || failed=1
+    if [[ -z $selected ]]; then gm_prune_short_links "$RUN_ROOT" || failed=1; fi
     return "$failed"
 )
 

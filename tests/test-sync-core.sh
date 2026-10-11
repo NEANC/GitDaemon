@@ -755,13 +755,13 @@ short_link_publish_matches_target() {
 
 sync_repo_preserves_indeterminate_result() {
     require_function sync_repo || return 1
-    local MIRROR_ROOT=$TEST_ROOT/indeterminate-mirror LOG_FILE=$TEST_ROOT/indeterminate.log
+    local RUN_ROOT=$TEST_ROOT/indeterminate MIRROR_ROOT=$TEST_ROOT/indeterminate-mirror LOG_FILE=$TEST_ROOT/indeterminate.log
     mkdir -p -- "$MIRROR_ROOT/owner/repo.git" || return 1
     : > "$LOG_FILE"
-    update_repo() { return 2; }
+    gm_sync_one_locked() { return 2; }
     sync_repo owner/repo '' >/dev/null 2>&1
     local status=$?
-    unset -f update_repo
+    unset -f gm_sync_one_locked
     [[ $status == 2 ]]
 }
 
