@@ -819,16 +819,43 @@ test_transport_failure_keeps_healthy_cache() {
     require_function gm_sync_one_locked || return 1
     setup_sync_failure transport || return 1
     local -A result=() saved=()
+    local probe=$RUN_ROOT/fsck-export
     git() {
         if [[ " $* " == *' fetch '* ]]; then
             printf "fatal: unable to access 'https://github.com/owner/repo.git/': Could not resolve host: github.com\n" >&2
             return 128
         fi
+        if [[ " $* " == *' fsck '* ]]; then
+            if [[ -f $DIR/git-daemon-export-ok ]]; then printf 'present\n' > "$probe"; else printf 'missing\n' > "$probe"; fi
+        fi
         command git "$@"
     }
     if gm_sync_one_locked owner/repo '' result; then return 1; fi
     gm_repo_state_read owner/repo saved || return 1
+    [[ -f $probe && $(<"$probe") == present ]] || { printf '纯网络失败的 fsck 期间 export 被撤销\n'; return 1; }
     [[ ${result[transport_only]} == yes && ${saved[health]} == healthy && -f $DIR/git-daemon-export-ok ]]
+}
+
+# 纯网络失败后的复核若发现本地异常，必须撤销发布且不能保留网络分类。
+test_transport_check_failure_closes_export() {
+    setup_sync_failure "check-failure-$RANDOM" || return 1
+    local injected=$1 probe=$RUN_ROOT/fsck-export
+    local -A result=() saved=()
+    git() {
+        if [[ " $* " == *' fetch '* ]]; then
+            printf "fatal: unable to access upstream: Could not resolve host: github.com\n" >&2
+            return 128
+        fi
+        if [[ " $* " == *' fsck '* ]]; then
+            if [[ -f $DIR/git-daemon-export-ok ]]; then printf 'present\n' > "$probe"; fi
+            printf '%s\n' "$injected" >&2
+            return 1
+        fi
+        command git "$@"
+    }
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    gm_repo_state_read owner/repo saved || return 1
+    [[ -f $probe && ${result[transport_only]} == no && ${saved[health]} != healthy && ${saved[published]} == no && ! -e $DIR/git-daemon-export-ok ]]
 }
 
 test_local_write_failure_requires_recovery() {
@@ -1009,6 +1036,9 @@ check 'test_classified_fallback_can_succeed' test_classified_fallback_can_succee
 check 'test_publish_failure_requires_recovery' test_publish_failure_requires_recovery
 check 'test_convergence_record_survives_recovery' test_convergence_record_survives_recovery
 check 'test_transport_failure_keeps_healthy_cache' test_transport_failure_keeps_healthy_cache
+check 'test_transport_check_damage_closes_export' test_transport_check_failure_closes_export 'missing blob 1234'
+check 'test_transport_check_unknown_closes_export' test_transport_check_failure_closes_export 'unrecognized diagnostic'
+check 'test_transport_check_environment_closes_export' test_transport_check_failure_closes_export 'error: Permission denied'
 check 'test_local_write_failure_requires_recovery' test_local_write_failure_requires_recovery
 check 'test_unknown_failure_is_not_network' test_unknown_failure_is_not_network
 check 'test_partial_ref_change_not_rolled_back' test_partial_ref_change_not_rolled_back

@@ -41,6 +41,7 @@ gm_repo_check_locked() {
     local repo=$1 dir=$2 output=$3 diagnostic status=0 line unknown=no damage=no environment=no bare config identity boot
     local -n check_result=$output
     local -A check_state=()
+    local preserve=${4-no}
     check_result=([health]=recovery_required [reason]=check_failed [raw_status]=128)
     gm_state_repo_path "$RUN_ROOT" "$repo" repos >/dev/null || return 1
     [[ $dir == "$RUN_ROOT/repos/$repo.git" ]] || return 1
@@ -51,11 +52,16 @@ gm_repo_check_locked() {
     [[ $boot == "${GM_BOOT_GENERATION-}" && $boot =~ ^[a-f0-9-]{36}$ ]] || return 1
     config=$(gm_repo_config_identity "$repo") || return 1
     identity=$(stat -c '%d-%i' -- "$dir") || return 1
-    gm_repo_export_remove_locked "$repo" || return $?
-    check_state[published]=no
-    check_state[message]=recovery_required
-    if [[ ${check_state[schema]} == 2 ]]; then check_state[health]=recovery_required; fi
-    gm_repo_state_commit_locked "$repo" check_state || return 1
+    if [[ $preserve == yes ]]; then
+        [[ ${check_state[health]-} == healthy && ${check_state[message]} != recovery_required && ${check_state[desired]} == present ]] || return 1
+        [[ ${check_state[checked_boot]-} == "$boot" && ${check_state[checked_generation]-} == "${check_state[generation]}" && ${check_state[checked_identity]-} == "$identity" ]] || return 1
+    else
+        gm_repo_export_remove_locked "$repo" || return $?
+        check_state[published]=no
+        check_state[message]=recovery_required
+        if [[ ${check_state[schema]} == 2 ]]; then check_state[health]=recovery_required; fi
+        gm_repo_state_commit_locked "$repo" check_state || return 1
+    fi
     gm_state_directory_prepare "$RUN_ROOT/logs" || return 1
     diagnostic=$(mktemp "$RUN_ROOT/logs/fsck.XXXXXXXX") || return 1
     bare=$(LC_ALL=C git --git-dir="$dir" rev-parse --is-bare-repository 2>"$diagnostic") || status=$?
@@ -82,9 +88,12 @@ gm_repo_check_locked() {
     fi
     check_result[raw_status]=$status
     check_result[log]=$diagnostic
+    if [[ ${check_result[health]} != healthy ]]; then
+        gm_repo_export_remove_locked "$repo" || return $?
+        check_state[published]=no
+    fi
     gm_state_flush "$diagnostic" || return 1
     check_state[schema]=2
-    check_state[published]=no
     check_state[health]=${check_result[health]}
     check_state[reason]=${check_result[reason]}
     check_state[raw_status]=$status
