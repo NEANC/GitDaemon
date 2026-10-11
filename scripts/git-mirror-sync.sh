@@ -331,8 +331,10 @@ gm_sync_one_locked() {
         return 1
     fi
     if ! gm_repo_check_locked "$repo" "$dir" checked "$GM_SYNC_TRANSPORT_ONLY"; then
-        gm_repo_unpublish_locked "$repo" || return 2
         sync_result[transport_only]=no
+        gm_repo_export_remove_locked "$repo" || return 2
+        sync_state[published]=no sync_state[health]=recovery_required sync_state[message]=recovery_required sync_state[observed]=error
+        gm_repo_state_commit_locked "$repo" sync_state || { gm_task_freeze; return 2; }
         return 1
     fi
     [[ ${checked[health]} == healthy ]] || { sync_result[transport_only]=no; return 1; }
