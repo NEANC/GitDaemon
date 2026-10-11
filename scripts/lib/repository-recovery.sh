@@ -262,6 +262,7 @@ gm_repo_validate_aliases_locked() {
         [[ $name =~ ^[A-Za-z0-9._-]+$ && $name != . && $name != *..* ]] || return 1
         link=$RUN_ROOT/repos/$name.git
         record=$RUN_ROOT/config/managed-links/$name.git
+        gm_recover_short_link "$RUN_ROOT" "$name" || return 1
         if [[ ! -e $link && ! -L $link ]]; then
             [[ ! -e $record && ! -L $record ]] || return 1
             continue

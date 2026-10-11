@@ -429,6 +429,38 @@ test_missing_old_requires_journal_without_aliases() {
     done
 }
 
+# 在真实短链接创建后中断，重放先回滚意图，再验证完成记录。
+test_alias_pending_before_record() {
+    local mode status
+    for mode in valid tampered; do
+        setup_replacement "pending-record-$mode" || return 1
+        gm_parse_repos 'owner/repo' 'owner/repo short' || return 1
+        status=0
+        (
+            gm_write_link_record() { exit 77; }
+            gm_repo_rebuild_locked owner/repo '' RESULT
+        ) || status=$?
+        [[ $status == 77 && -L $RUN_ROOT/repos/short.git && ! -e $RUN_ROOT/config/managed-links/short.git ]] || return 1
+        [[ -f $RUN_ROOT/runtime/shortlink-short.pending ]] || return 1
+        local -A journal=()
+        gm_repo_replacement_read owner/repo journal || return 1
+        [[ ${journal[phase]} == installed ]] || return 1
+        if [[ $mode == tampered ]]; then
+            rm "$RUN_ROOT/repos/short.git" || return 1
+            ln -s ../outside "$RUN_ROOT/repos/short.git" || return 1
+            if restart_replacement; then return 1; fi
+            [[ $(readlink "$RUN_ROOT/repos/short.git") == ../outside && -f $RUN_ROOT/runtime/shortlink-short.pending ]] || return 1
+            [[ -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]] || return 1
+            continue
+        fi
+        restart_replacement || return 1
+        [[ ! -L $RUN_ROOT/repos/short.git && ! -e $RUN_ROOT/runtime/shortlink-short.pending ]] || return 1
+        gm_repo_rebuild_locked owner/repo '' RESULT || return 1
+        gm_validate_managed_link "$RUN_ROOT" "$RUN_ROOT/repos/short.git" || return 1
+        [[ -f $DIR/git-daemon-export-ok && ! -e $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]] || return 1
+    done
+}
+
 test_second_replacement_after_completion() {
     setup_replacement second-replacement || return 1
     gm_repo_rebuild_locked owner/repo '' RESULT || return 1
@@ -442,7 +474,7 @@ test_second_replacement_after_completion() {
     [[ -f $DIR/git-daemon-export-ok && $(stat -c '%d-%i' "$DIR") != "$old" ]]
 }
 
-for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion test_missing_old_requires_journal_without_aliases}; do
+for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion test_missing_old_requires_journal_without_aliases test_alias_pending_before_record}; do
     CHECKS=$((CHECKS+1))
     if (declare -A STATE=() RESULT=(); declare -F gm_repo_check_locked >/dev/null && "$test"); then
         printf '[PASS] %s\n' "$test"
