@@ -26,14 +26,25 @@ gm_state_validate_repo_array() {
     local array_name=$1 key value
     declare -n values=$array_name
     for key in "${!values[@]}"; do
-        case "$key" in schema|repo|generation|desired|observed|published|message) ;; *) return 1 ;; esac
+        case "$key" in schema|repo|generation|desired|observed|published|message|health|checked_boot|checked_generation|checked_config|checked_identity|reason|raw_status) ;; *) return 1 ;; esac
     done
     for key in schema repo generation desired observed published message; do
         [[ ${values[$key]+present} ]] || return 1
         value=${values[$key]}
         gm_state_validate_value "$value" || return 1
     done
-    [[ ${values[schema]} == 1 ]] || return 1
+    case ${values[schema]} in
+        1) [[ ${#values[@]} == 7 ]] || return 1 ;;
+        2)
+            for key in health checked_boot checked_generation checked_config checked_identity reason raw_status; do
+                gm_state_validate_value "${values[$key]-}" || return 1
+            done
+            case ${values[health]} in unchecked|healthy|recovery_required|corrupt) ;; *) return 1 ;; esac
+            [[ ${values[checked_boot]} =~ ^[a-f0-9-]{36}$ && ${values[checked_generation]} =~ ^[0-9]+$ ]] || return 1
+            [[ ${values[checked_config]} =~ ^[a-f0-9]{64}$ && ${values[checked_identity]} =~ ^[0-9]+-[0-9]+$ ]] || return 1
+            [[ ${values[raw_status]} =~ ^[0-9]+$ ]] || return 1 ;;
+        *) return 1 ;;
+    esac
     [[ ${values[repo]} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
     [[ ${values[generation]} =~ ^[0-9]+$ ]] || return 1
     [[ ${values[desired]} == present || ${values[desired]} == absent ]] || return 1
@@ -102,6 +113,11 @@ gm_state_write_array_locked() {
         printf 'schema=%s\nrepo=%s\ngeneration=%s\ndesired=%s\nobserved=%s\npublished=%s\nmessage=%s\n' \
             "${values[schema]}" "${values[repo]}" "${values[generation]}" "${values[desired]}" \
             "${values[observed]}" "${values[published]}" "${values[message]}" > "$temporary" || exit 1
+        if [[ ${values[schema]} == 2 ]]; then
+            for key in health checked_boot checked_generation checked_config checked_identity reason raw_status; do
+                printf '%s=%s\n' "$key" "${values[$key]}" >> "$temporary" || exit 1
+            done
+        fi
         gm_state_flush "$temporary" || exit 1
         if [[ ${GM_STATE_TEST_FAULT-} == rename ]]; then exit 1; fi
         mv -f -- "$temporary" "$file" || exit 1
