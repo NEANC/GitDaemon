@@ -80,12 +80,13 @@ gm_task_group_alive() {
     return 1
 }
 
+# 跨读取超时保留放行令牌片段，完整校验后才启动受监督命令。
 gm_task_worker() {
     local directory=$1 parent=$2 parent_start=$3 lease=$4 dispatch=$5
     shift 5
     if [[ -n $lease ]]; then exec {lease}<&-; fi
     exec {dispatch}<&-
-    local self=$BASHPID token= elapsed start now status child worker_cancel=no
+    local self=$BASHPID token= partial= elapsed start now status child worker_cancel=no
     local -A me=() supervisor=()
     gm_process_identity "$self" me || return 1
     [[ ${me[pgid]} == "$self" && ${me[session]} == "$self" ]] || return 1
@@ -94,6 +95,7 @@ gm_task_worker() {
     printf '%s %s %s %s\n' "$self" "${me[start]}" "${me[pgid]}" "${me[session]}" > "$directory/ready" || return 1
     gm_monotonic_ms start || return 1
     while ! IFS= read -r -t 0.05 token <&8; do
+        partial+=$token
         if [[ $worker_cancel == yes ]]; then printf '143\n' > "$directory/status"; return 0; fi
         gm_process_identity "$parent" supervisor || return 1
         [[ ${supervisor[start]} == "$parent_start" && ${supervisor[state]} != Z ]] || return 1
@@ -101,7 +103,7 @@ gm_task_worker() {
         (( now - start < 10000 )) || return 1
     done
     exec 8>&-
-    [[ $token == "$GM_BOOT_GENERATION" ]] || return 1
+    [[ $partial$token == "$GM_BOOT_GENERATION" ]] || return 1
     if [[ $worker_cancel == yes ]]; then printf '143\n' > "$directory/status"; return 0; fi
     trap ':' TERM INT
     "$@" & child=$!
