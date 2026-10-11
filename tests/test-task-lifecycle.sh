@@ -282,6 +282,32 @@ test_operation_ids_are_unique() {
     done
 }
 
+# 验证读取超时后仍保留已消费的 UUID 前缀，且完整放行前不运行命令。
+test_partial_gate_survives_timeout() {
+    setup partialgate || return 1
+    local -A parent=()
+    local directory=$RUN_ROOT/runtime/partial child gate status=0 before now
+    mkdir -m 700 "$directory" && mkfifo -m 600 "$directory/gate" || return 1
+    gm_lock_acquire dispatch exclusive || return 1
+    gm_process_identity "$BASHPID" parent || return 1
+    exec {gate}<> "$directory/gate" || return 1
+    setsid bash "$GM_LIFECYCLE_SOURCE" --worker "$directory" "${parent[pid]}" "${parent[start]}" "${GM_LOCK_FDS[container]}" "${GM_LOCK_FDS[dispatch]}" touch "$RUN_ROOT/written" & child=$!
+    gm_monotonic_ms before
+    until [[ -s $directory/ready ]]; do
+        gm_monotonic_ms now
+        if (( now-before >= 2000 )); then kill -KILL "$child"; wait "$child" 2>/dev/null; return 1; fi
+        sleep 0.01
+    done
+    printf '%s' "${GM_BOOT_GENERATION:0:18}" >&"$gate"
+    sleep 0.15
+    [[ ! -e $RUN_ROOT/written ]] || status=1
+    printf '%s\n' "${GM_BOOT_GENERATION:18}" >&"$gate"
+    wait "$child" || status=$?
+    exec {gate}>&-
+    printf 'partial gate: worker=%s written=%s\n' "$status" "$([[ -f $RUN_ROOT/written ]] && printf yes || printf no)"
+    [[ $status == 0 && -f $RUN_ROOT/written && $(< "$directory/status") == 0 ]]
+}
+
 test_unready_immediate_exit() {
     setup immediate || return 1
     local -A result=()
@@ -296,5 +322,6 @@ for test in test_second_container_refused test_stop_before_release_never_writes 
 done
 if ( test_unsafe_blocks_local_entries ); then printf '[PASS] test_unsafe_blocks_local_entries\n'; else printf '[FAIL] test_unsafe_blocks_local_entries\n'; FAILURES=$((FAILURES+1)); fi
 if ( test_operation_ids_are_unique ); then printf '[PASS] test_operation_ids_are_unique\n'; else printf '[FAIL] test_operation_ids_are_unique\n'; FAILURES=$((FAILURES+1)); fi
+if ( test_partial_gate_survives_timeout ); then printf '[PASS] test_partial_gate_survives_timeout\n'; else printf '[FAIL] test_partial_gate_survives_timeout\n'; FAILURES=$((FAILURES+1)); fi
 printf 'FAILURES=%s\n' "$FAILURES"
 exit "$FAILURES"
