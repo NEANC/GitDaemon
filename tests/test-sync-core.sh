@@ -1030,6 +1030,33 @@ test_unchecked_cli_cache_cannot_write() {
     return 0
 }
 
+# 历史健康记录必须在任何配置或仓库写入前被拒绝。
+test_stale_health_cannot_write() {
+    local variant=$1
+    setup_sync_failure "stale-$variant" || return 1
+    local -A saved=() result=()
+    gm_repo_state_read owner/repo saved || return 1
+    case $variant in
+        boot) saved[checked_boot]=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa ;;
+        generation) saved[generation]=2 ;;
+        identity) mv "$DIR" "$DIR.old" || return 1; cp -a "$DIR.old" "$DIR" || return 1 ;;
+        runtime) printf '%s\n' aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa > "$RUN_ROOT/runtime/generation" ;;
+    esac
+    gm_repo_state_commit_locked owner/repo saved || return 1
+    local before after
+    before=$(sha256sum "$DIR/config" "$DIR/HEAD" "$RUN_ROOT/state/repos/owner/repo.state") || return 1
+    local calls=$RUN_ROOT/write-calls
+    update_repo() { printf 'write\n' > "$calls"; return 1; }
+    if gm_sync_one_locked owner/repo '' result; then return 1; fi
+    [[ ! -e $calls ]] || { printf '历史 healthy 仍进入写入阶段：%s\n' "$variant"; return 1; }
+    after=$(sha256sum "$DIR/config" "$DIR/HEAD" "$RUN_ROOT/state/repos/owner/repo.state") || return 1
+    [[ $before == "$after" && ! -e $RUN_ROOT/state/sync/owner/repo.state ]]
+}
+
+check 'test_stale_health_boot' test_stale_health_cannot_write boot
+check 'test_stale_health_generation' test_stale_health_cannot_write generation
+check 'test_stale_health_identity' test_stale_health_cannot_write identity
+check 'test_stale_health_runtime' test_stale_health_cannot_write runtime
 check 'test_unknown_fetch_stops_fallback' test_unknown_fetch_stops_fallback
 check 'test_unchecked_cli_cache_cannot_write' test_unchecked_cli_cache_cannot_write
 check 'test_classified_fallback_can_succeed' test_classified_fallback_can_succeed

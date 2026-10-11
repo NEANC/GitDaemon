@@ -294,7 +294,7 @@ gm_sync_classify_failure() {
 }
 
 gm_sync_one_locked() {
-    local repo=$1 branches=$2 output=$3 dir=$RUN_ROOT/repos/$1.git index found=no status=0 publish_status=0
+    local repo=$1 branches=$2 output=$3 dir=$RUN_ROOT/repos/$1.git index found=no status=0 publish_status=0 boot identity
     local -n sync_result=$output
     local -A sync_state=() checked=() convergence=()
     sync_result=([transport_only]=no [configuration_converged]=no [stage]=config)
@@ -305,8 +305,13 @@ gm_sync_one_locked() {
     [[ $found == yes && -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
     [[ ${GM_LOCAL_FROZEN-} != yes && -z ${GM_STOP_SCOPE-} && ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
     gm_repo_state_read "$repo" sync_state || return 1
-    [[ ${sync_state[health]-} == healthy && ${sync_state[message]} != recovery_required ]] || return 1
+    [[ ${sync_state[health]-} == healthy && ${sync_state[message]} != recovery_required && ${sync_state[desired]} == present ]] || return 1
     gm_validate_path "$dir" || return 1
+    gm_validate_file "$RUN_ROOT/runtime/generation" read || return 1
+    IFS= read -r boot < "$RUN_ROOT/runtime/generation" || return 1
+    identity=$(stat -c '%d-%i' -- "$dir") || return 1
+    [[ ${sync_state[checked_boot]-} == "$boot" && $boot == "${GM_BOOT_GENERATION-}" ]] || return 1
+    [[ ${sync_state[checked_generation]-} == "${sync_state[generation]}" && ${sync_state[checked_identity]-} == "$identity" ]] || return 1
     update_repo "$repo" "$dir" "$branches" || status=$?
     sync_result[stage]=$GM_SYNC_STAGE
     sync_result[transport_only]=$GM_SYNC_TRANSPORT_ONLY
