@@ -120,6 +120,7 @@ gm_state_write_array_locked() {
 gm_repo_state_commit_locked() {
     local repo=$1 array_name=$2 file directory owner
     declare -n values=$array_name
+    GM_STATE_COMMIT_RESULT=failed
     gm_state_validate_repo_array "$array_name" || return 1
     [[ ${values[repo]} == "$repo" ]] || return 1
     file=$(gm_state_repo_path "${RUN_ROOT:?}" "$repo" repos) || return 1
@@ -140,6 +141,7 @@ gm_repo_state_commit_locked() {
 gm_operation_commit_locked() {
     local repo=$1 array_name=$2 file directory owner
     declare -n values=$array_name
+    GM_STATE_COMMIT_RESULT=failed
     gm_state_validate_repo_array "$array_name" || return 1
     [[ ${values[repo]} == "$repo" ]] || return 1
     file=$(gm_state_repo_path "${RUN_ROOT:?}" "$repo" operations) || return 1
