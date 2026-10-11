@@ -101,6 +101,30 @@ reject_unknown_fields() {
     return 0
 }
 
+commit_result_resets_before_validation() {
+    local root=$TEST_ROOT/result-reset repo=owner/repo
+    local -A state=()
+    mkdir -p -- "$root" || return 1
+    state[schema]=1 state[repo]=$repo state[generation]=1 state[desired]=present state[observed]=ready state[published]=yes state[message]=x
+    RUN_ROOT=$root
+    gm_repo_state_commit_locked "$repo" state || return 1
+    [[ $GM_STATE_COMMIT_RESULT == committed ]] || return 1
+    state[extra]=value
+    gm_repo_state_commit_locked "$repo" state >/dev/null 2>&1 && return 1
+    [[ $GM_STATE_COMMIT_RESULT == failed ]] || return 1
+    unset 'state[extra]'
+    gm_repo_state_commit_locked ../escape state >/dev/null 2>&1 && return 1
+    [[ $GM_STATE_COMMIT_RESULT == failed ]] || return 1
+    gm_operation_commit_locked "$repo" state || return 1
+    [[ $GM_STATE_COMMIT_RESULT == committed ]] || return 1
+    state[extra]=value
+    gm_operation_commit_locked "$repo" state >/dev/null 2>&1 && return 1
+    [[ $GM_STATE_COMMIT_RESULT == failed ]] || return 1
+    unset 'state[extra]'
+    gm_operation_commit_locked ../escape state >/dev/null 2>&1 && return 1
+    [[ $GM_STATE_COMMIT_RESULT == failed ]]
+}
+
 commit_fault_keeps_old_record() {
     local root=$TEST_ROOT/fault repo=owner/repo before after fault
     local -A state=()
@@ -213,6 +237,7 @@ reject_invalid_repo_and_create_directories() {
 check roundtrip roundtrip
 check reject_symlink_and_duplicate_key reject_symlink_and_duplicate_key
 check reject_unknown_fields reject_unknown_fields
+check commit_result_resets_before_validation commit_result_resets_before_validation
 check commit_fault_keeps_old_record commit_fault_keeps_old_record
 check directory_sync_is_indeterminate directory_sync_is_indeterminate
 check repository_and_operation_directories_are_independent repository_and_operation_directories_are_independent
