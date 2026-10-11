@@ -84,8 +84,35 @@ test_publish_commit_failure_revokes_export() {
     setup_repo failure || return 1
     gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
     GM_STATE_TEST_FAULT=rename
+    local status=0
+    gm_repo_publish_locked owner/repo 1 || status=$?
+    [[ $status == 1 && ${GM_STATE_COMMIT_RESULT-} == failed && ! -e $DIR/git-daemon-export-ok && ! -e $RUN_ROOT/runtime/frozen && ${GM_LOCAL_FROZEN-} != yes ]]
+}
+
+# 仅状态目录同步失败时确认 rename 已完成，撤销成功仍必须保留不确定结果并冻结。
+test_publish_directory_sync_is_unsafe() {
+    setup_repo directory-sync || return 1
+    gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+    gm_begin_operation sync || return 1
+    local status=0
+    sync() {
+        if [[ $* == "-- $RUN_ROOT/state/repos/owner" ]]; then
+            printf 'injected\n' > "$RUN_ROOT/directory-sync-hit"
+            return 1
+        fi
+        command sync "$@"
+    }
+    gm_repo_publish_locked owner/repo 1 || status=$?
+    printf 'directory-sync status=%s commit=%s result=%s frozen=%s\n' "$status" "${GM_STATE_COMMIT_RESULT-}" "${GM_REPO_RESULT-}" "${GM_LOCAL_FROZEN-}"
+    gm_repo_state_read owner/repo STATE || return 1
+    [[ -f $RUN_ROOT/directory-sync-hit && ${STATE[published]} == yes && ! -e $DIR/git-daemon-export-ok ]] || return 1
+    [[ $status == 2 && ${GM_STATE_COMMIT_RESULT-} == indeterminate && ${GM_REPO_RESULT-} == UNSAFE ]] || return 1
+    [[ ${GM_LOCAL_FROZEN-} == yes && ${GM_STOP_SCOPE-} == instance && -f $RUN_ROOT/runtime/frozen ]] || return 1
+    [[ -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
     if gm_repo_publish_locked owner/repo 1; then return 1; fi
-    [[ ! -e $DIR/git-daemon-export-ok ]]
+    local -A task_result=()
+    if gm_task_run_locked owner/repo sync task_result touch "$RUN_ROOT/written"; then return 1; fi
+    [[ ! -e $RUN_ROOT/written && ! -e $DIR/git-daemon-export-ok ]]
 }
 
 # 不完整目录不可发布，合法空裸库可通过完整性检查。
@@ -143,7 +170,7 @@ test_replica_replaced() {
     if gm_repo_publish_locked owner/repo 1; then return 1; fi
 }
 
-for test in test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced; do
+for test in test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced; do
     CHECKS=$((CHECKS+1))
     if (declare -A STATE=() RESULT=(); declare -F gm_repo_check_locked >/dev/null && "$test"); then
         printf '[PASS] %s\n' "$test"

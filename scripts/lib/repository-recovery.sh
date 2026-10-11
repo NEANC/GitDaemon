@@ -98,7 +98,7 @@ gm_repo_check_locked() {
 
 # 核对本轮检查身份后开放入口，发布记录失败即撤销入口。
 gm_repo_publish_locked() {
-    local repo=$1 generation=$2 dir=$RUN_ROOT/repos/$1.git boot config identity marker
+    local repo=$1 generation=$2 dir=$RUN_ROOT/repos/$1.git boot config identity marker status=0
     local -A publish_state=()
     GM_REPO_RESULT=BLOCKED
     [[ ${GM_LOCAL_FROZEN-} != yes && ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
@@ -119,9 +119,15 @@ gm_repo_publish_locked() {
         return 1
     fi
     publish_state[published]=yes
-    if ! gm_repo_state_commit_locked "$repo" publish_state; then
+    gm_repo_state_commit_locked "$repo" publish_state || status=$?
+    if (( status != 0 )); then
         gm_repo_export_remove_locked "$repo" || return $?
-        return 1
+        if (( status == 2 )); then
+            GM_REPO_RESULT=UNSAFE
+            gm_request_stop instance publish_indeterminate
+            gm_task_freeze || true
+        fi
+        return "$status"
     fi
     GM_REPO_RESULT=SUCCESS
     return 0
