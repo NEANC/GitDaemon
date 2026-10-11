@@ -858,6 +858,46 @@ test_transport_check_failure_closes_export() {
     [[ -f $probe && ${result[transport_only]} == no && ${saved[health]} != healthy && ${saved[published]} == no && ! -e $DIR/git-daemon-export-ok ]]
 }
 
+# 复核诊断持久化异常后阻止再次写入，恢复状态保存失败时冻结实例。
+test_transport_check_flush_failure_blocks_writes() {
+    local fault=$1 status=0 next_status=0
+    setup_sync_failure "check-flush-$fault" || return 1
+    local probe=$RUN_ROOT/fsck-export writes=$RUN_ROOT/unexpected-write
+    local -A result=() saved=()
+    git() {
+        if [[ " $* " == *' fetch '* ]]; then
+            printf 'fatal: unable to access upstream: Could not resolve host: github.com\n' >&2
+            return 128
+        fi
+        if [[ " $* " == *' fsck '* ]]; then
+            if [[ -f $DIR/git-daemon-export-ok ]]; then printf 'present\n' > "$probe"; fi
+            printf 'missing blob 1234\n' >&2
+            return 1
+        fi
+        command git "$@"
+    }
+    gm_state_flush() {
+        if [[ $1 == "$RUN_ROOT/logs/fsck."* ]]; then return 1; fi
+        if [[ $fault == save && $1 == "$RUN_ROOT/state/repos/owner/.state."* ]] &&
+            grep -q '^health=recovery_required$' "$1"; then return 1; fi
+        if [[ $fault == directory && $1 == "$RUN_ROOT/state/repos/owner" ]] &&
+            grep -q '^health=recovery_required$' "$1/repo.state"; then return 1; fi
+        sync -- "$1"
+    }
+    gm_sync_one_locked owner/repo '' result || status=$?
+    gm_repo_state_read owner/repo saved || return 1
+    printf 'fault=%s status=%s health=%s message=%s published=%s frozen=%s transport_only=%s\n' \
+        "$fault" "$status" "${saved[health]}" "${saved[message]}" "${saved[published]}" "${GM_LOCAL_FROZEN-no}" "${result[transport_only]}"
+    update_repo() { : > "$writes"; return 1; }
+    gm_sync_one_locked owner/repo '' result || next_status=$?
+    [[ -f $probe && ! -e $DIR/git-daemon-export-ok && ! -e $writes && $next_status != 0 ]] || return 1
+    if [[ $fault == none ]]; then
+        [[ $status == 1 && ${saved[health]} == recovery_required && ${saved[message]} == recovery_required && ${saved[observed]} == error && ${saved[published]} == no ]]
+    else
+        [[ $status == 2 && ${GM_LOCAL_FROZEN-} == yes && -f $RUN_ROOT/runtime/frozen ]]
+    fi
+}
+
 test_local_write_failure_requires_recovery() {
     require_function gm_sync_one_locked || return 1
     setup_sync_failure local || return 1
@@ -1100,6 +1140,9 @@ check 'test_transport_failure_keeps_healthy_cache' test_transport_failure_keeps_
 check 'test_transport_check_damage_closes_export' test_transport_check_failure_closes_export 'missing blob 1234'
 check 'test_transport_check_unknown_closes_export' test_transport_check_failure_closes_export 'unrecognized diagnostic'
 check 'test_transport_check_environment_closes_export' test_transport_check_failure_closes_export 'error: Permission denied'
+check 'test_transport_check_flush_failure_blocks_writes' test_transport_check_flush_failure_blocks_writes none
+check 'test_transport_check_flush_save_failure_freezes' test_transport_check_flush_failure_blocks_writes save
+check 'test_transport_check_flush_directory_failure_freezes' test_transport_check_flush_failure_blocks_writes directory
 check 'test_local_write_failure_requires_recovery' test_local_write_failure_requires_recovery
 check 'test_unknown_failure_is_not_network' test_unknown_failure_is_not_network
 check 'test_partial_ref_change_not_rolled_back' test_partial_ref_change_not_rolled_back
