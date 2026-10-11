@@ -319,6 +319,17 @@ sync_repo() {
 }
 
 # 以固定纯数据格式刷新受管理链接记录：先写同目录临时文件，再原子改名到位。
+gm_repo_build_candidate_locked() {
+    local repo=$1 branches=$2 dir=$3
+    local -A build_record=()
+    gm_repo_replacement_read "$repo" build_record || return 1
+    [[ $dir == "$RUN_ROOT/staging/${build_record[operation]}/repo.git" && ${build_record[phase]} == candidate_building ]] || return 1
+    gm_repo_copy_validate "$dir" "${build_record[new_identity]}" || return 1
+    git init --bare --quiet "$dir" || return 1
+    git --git-dir="$dir" config remote.origin.url "https://github.com/$repo.git" || return 1
+    update_repo "$repo" "$dir" "$branches"
+}
+
 gm_write_link_record() {
     local record=$1 target=$2 tmp=$1.tmp
     gm_validate_file "$record" || return 1
@@ -334,6 +345,8 @@ gm_write_link_record() {
 gm_recover_short_link() {
     local run=$1 name=$2 link=$1/repos/$2.git record=$1/config/managed-links/$2.git
     local journal=$1/runtime/shortlink-$2.pending content old new actual=
+    [[ $name =~ ^[A-Za-z0-9._-]+$ && $name != . && $name != *..* ]] || return 1
+    gm_validate_path "$run/repos" read || return 1
     [[ -e $journal || -L $journal ]] || return 0
     gm_validate_file "$journal" || return 1
     content=$(<"$journal")
@@ -341,8 +354,14 @@ gm_recover_short_link() {
     old=${content#*$'\nOLD='}; old=${old%%$'\nNEW='*}
     new=${content##*$'\nNEW='}
     [[ $new == *.git ]] && gm_validate_repo_name "${new%.git}" || return 1
+    gm_validate_path "$run/repos/$new" || return 1
     if [[ -n $old ]]; then
         [[ $old == *.git ]] && gm_validate_repo_name "${old%.git}" || return 1
+        gm_validate_path "$run/repos/$old" || return 1
+        if [[ ! -d $run/repos/$old ]]; then
+            [[ $run == "$RUN_ROOT" ]] || return 1
+            gm_repo_validate_aliases_locked "${old%.git}" || return 1
+        fi
     fi
     if [[ -L $link ]]; then
         [[ $(stat -c %u -- "$link") == "$EUID" ]] || return 1
