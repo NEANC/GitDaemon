@@ -257,6 +257,31 @@ test_unsafe_blocks_local_entries() {
     done
 }
 
+test_operation_ids_are_unique() {
+    setup operationids || return 1
+    local -A result=()
+    local first= current record_definition round registered
+    record_definition=$(declare -f gm_lifecycle_record)
+    eval "${record_definition/gm_lifecycle_record/original_record}"
+    gm_lifecycle_record() {
+        original_record "$@" || return 1
+        if [[ $1 == "$RUN_ROOT/runtime/task" ]]; then
+            [[ ! -e $RUN_ROOT/written ]] || return 1
+            registered=$2
+        fi
+        return 0
+    }
+    for round in 1 2; do
+        registered=
+        start touch "$RUN_ROOT/written" || return 1
+        current=${result[operation_id]-}
+        gm_task_finish_locked result || return 1
+        [[ $current =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ && $registered == *" $current" && $current != "$first" ]] || return 1
+        first=$current
+        rm -f "$RUN_ROOT/written"
+    done
+}
+
 test_unready_immediate_exit() {
     setup immediate || return 1
     local -A result=()
@@ -270,5 +295,6 @@ for test in test_second_container_refused test_stop_before_release_never_writes 
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
 if ( test_unsafe_blocks_local_entries ); then printf '[PASS] test_unsafe_blocks_local_entries\n'; else printf '[FAIL] test_unsafe_blocks_local_entries\n'; FAILURES=$((FAILURES+1)); fi
+if ( test_operation_ids_are_unique ); then printf '[PASS] test_operation_ids_are_unique\n'; else printf '[FAIL] test_operation_ids_are_unique\n'; FAILURES=$((FAILURES+1)); fi
 printf 'FAILURES=%s\n' "$FAILURES"
 exit "$FAILURES"

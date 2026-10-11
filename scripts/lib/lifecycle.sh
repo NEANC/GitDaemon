@@ -153,6 +153,7 @@ gm_task_run_locked() {
             return 1
         fi
     fi
+    IFS= read -r 'task[operation_id]' < /proc/sys/kernel/random/uuid || status=1
     gm_task_journal "$repo" "$operation" starting || status=1
     if (( status != 0 )); then gm_lock_release dispatch; return 1; fi
     directory=$(mktemp -d "$RUN_ROOT/runtime/task.XXXXXXXX") || { gm_lock_release dispatch; return 1; }
@@ -179,7 +180,7 @@ gm_task_run_locked() {
     fi
     if (( status == 0 )); then
         task[boot]=$GM_BOOT_GENERATION
-        gm_lifecycle_record "$RUN_ROOT/runtime/task" "$repo $operation $GM_BOOT_GENERATION $pid ${task[start]} ${task[pgid]} ${task[session]}" || status=1
+        gm_lifecycle_record "$RUN_ROOT/runtime/task" "$repo $operation $GM_BOOT_GENERATION $pid ${task[start]} ${task[pgid]} ${task[session]} ${task[operation_id]}" || status=1
     fi
     if (( status == 0 )) && [[ -z ${GM_STOP_SCOPE-} ]]; then
         exec {gate}<> "$directory/gate" || status=1
