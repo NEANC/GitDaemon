@@ -997,12 +997,8 @@ gm_resume_instance() (
     for service in "${services[@]}"; do
         gm_confirm_service_stopped "$run" "$service" || return 1
     done
-    if [[ -e $run/runtime/stopped ]]; then
-        gm_match_record "$run/runtime/stopped" 'STOPPED=1' || return 1
-        rm -- "$run/runtime/stopped" || return 1
-    fi
-    printf '%s\n' '实例已解除停止标记；服务启动由调用方显式执行。'
-    return 0
+    gm_error '普通恢复没有容器启动上下文；请重启容器完成检查后解除停止'
+    return 1
 )
 
 # 在独立环境中将有效配置传给消费者，不改变调用方环境或回写配置文件。

@@ -266,6 +266,12 @@ gm_scheduler_run_task() {
 
 # 调度入口：校验实例配置后按 cron 计划运行既有同步与刷新入口；--check 只做启动前校验。
 # 使用普通函数体而非子 Shell，确保信号处理与循环运行在服务跟踪的主进程内。
+gm_scheduler_freeze() {
+    source "$INSTALL_ROOT/lib/lifecycle.sh" || return 1
+    gm_request_stop instance scheduler_stopped
+    gm_task_freeze
+}
+
 gm_scheduler_main() {
     local mode=run install now next next_sync next_hosts
     case "${1-}" in
@@ -297,6 +303,8 @@ gm_scheduler_main() {
         return 0
     fi
     gm_validate_cron "${GM_CONFIG[CRON_SCHEDULE]}" || { gm_error '配置值非法：CRON_SCHEDULE'; return 1; }
+    [[ ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
+    trap gm_scheduler_freeze EXIT
     if [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]} == yes ]]; then
         gm_validate_cron "${GM_CONFIG[HOSTS_CRON]}" || { gm_error '配置值非法：HOSTS_CRON'; return 1; }
     fi
@@ -321,6 +329,7 @@ gm_scheduler_main() {
             gm_scheduler_run_task '仓库同步' "$INSTALL_ROOT/git-mirror-sync.sh"
         fi
     done
+    gm_scheduler_freeze || return 1
     gm_scheduler_log '调度器收到停止信号，退出'
     return 0
 }

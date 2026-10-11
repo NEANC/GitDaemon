@@ -17,7 +17,9 @@ gm_daemon_config_main() {
         *) gm_error 'daemon 配置入口不接受此参数'; return 2 ;;
     esac
     install=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
+    source "$install/git-mirror-recover.sh" || return 1
     gm_prepare_runtime "${RUN_ROOT-/var/lib/git-daemon}" "$install" || return 1
+    gm_startup_gate_validate || { gm_error '发布门未由有效容器启动初始化'; return 1; }
     printf '%s\n' "${GM_CONFIG[GIT_PORT]}" "${GM_CONFIG[LISTEN_ADDRESS]}" "${GM_CONFIG[TZ]}"
 }
 

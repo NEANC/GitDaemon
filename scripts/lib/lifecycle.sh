@@ -312,7 +312,9 @@ gm_task_finish_locked() {
         if (( status != 0 )); then finished[result]=UNSAFE; gm_task_freeze; return 1; fi
     fi
     if [[ ${GM_STOP_SCOPE-} == instance ]]; then gm_task_freeze || { finished[result]=UNSAFE; return 1; }; fi
-    gm_lock_release sync && gm_lock_release instance || return 1
+    if [[ ${2-release} != retain ]]; then
+        gm_lock_release sync && gm_lock_release instance || return 1
+    fi
     if [[ ${GM_STOP_SCOPE-} == task ]]; then unset GM_STOP_SCOPE GM_STOP_REASON; fi
     return 0
 }

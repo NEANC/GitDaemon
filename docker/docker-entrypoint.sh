@@ -111,20 +111,10 @@ wait_process_group_gone() {
     return 1
 }
 
-# 收到停止信号时置位标志，按已确认的进程组定向终止首次任务整棵进程树与休眠子进程；
-# 尚未确认独立进程组时只终止直接子进程，绝不按未经校验的 PID 推断进程组。
+# 信号回调仅登记停止意图，由主控制流执行冻结和回收。
 on_stop_signal() {
     GM_ENTRYPOINT_STOP=1
-    if [[ -n ${GM_ENTRYPOINT_TASK-} ]]; then
-        if [[ -n ${GM_ENTRYPOINT_TASK_PGID-} ]]; then
-            kill -TERM -"$GM_ENTRYPOINT_TASK_PGID" 2>/dev/null || kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
-        else
-            kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
-        fi
-    fi
-    if [[ -n ${GM_ENTRYPOINT_SLEEP-} ]]; then
-        kill -TERM "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
-    fi
+    if declare -F gm_request_stop >/dev/null; then gm_request_stop instance container_signal; fi
     return 0
 }
 
@@ -134,7 +124,7 @@ on_stop_signal() {
 run_task_best_effort() {
     local label=$1 status=0 pgid=
     shift
-    setsid "$@" &
+    (if declare -F gm_lock_release >/dev/null; then gm_lock_release container; fi; exec setsid "$@") &
     GM_ENTRYPOINT_TASK=$!
     if pgid=$(task_process_group "$GM_ENTRYPOINT_TASK"); then
         GM_ENTRYPOINT_TASK_PGID=$pgid
@@ -145,6 +135,12 @@ run_task_best_effort() {
     fi
     wait "$GM_ENTRYPOINT_TASK" || status=$?
     if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
+        gm_task_freeze || return 1
+        if [[ -n $pgid ]]; then
+            kill -TERM -"$pgid" 2>/dev/null || true
+        else
+            kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        fi
         if [[ -n $pgid ]] && wait_process_group_gone "$pgid"; then
             log "$label 已回收进程组全部子孙"
         elif [[ -n $pgid ]]; then
@@ -169,8 +165,9 @@ run_task_best_effort() {
 
 # 停止调度与读取服务并回收子进程；未运行的服务停止失败被忽略。
 shutdown_services() {
-    rc-service --user git-mirror-scheduler stop >/dev/null 2>&1 || true
-    rc-service --user git-daemon stop >/dev/null 2>&1 || true
+    if declare -F gm_task_freeze >/dev/null; then gm_task_freeze || true; fi
+    gm_without_container_lease rc-service --user git-mirror-scheduler stop >/dev/null 2>&1 || true
+    gm_without_container_lease rc-service --user git-daemon stop >/dev/null 2>&1 || true
     wait 2>/dev/null || true
     return 0
 }
@@ -231,6 +228,10 @@ supervise_loop() {
         sleep 5 &
         GM_ENTRYPOINT_SLEEP=$!
         wait "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
+        if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
+            kill -TERM "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
+            wait "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
+        fi
         GM_ENTRYPOINT_SLEEP=
         if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
             break
@@ -255,34 +256,32 @@ main() {
     require_non_root
     prepare_environment
     [[ -x $INSTALL_ROOT/deploy-git-mirror.sh ]] || die "缺少交付安装入口：$INSTALL_ROOT/deploy-git-mirror.sh"
+    source "$INSTALL_ROOT/git-mirror-recover.sh" || die '缺少启动恢复入口'
+    log() { printf '[git-daemon] %s\n' "$*"; }
+    unset GM_BOOT_GENERATION GM_CONTAINER_OWNER GM_STOP_SCOPE GM_LOCAL_FROZEN
+    gm_validate_path "$RUN_ROOT" || return 1
+    (umask 077; mkdir -p "$RUN_ROOT/runtime") || return 1
+    gm_container_lease_acquire || return $?
+    trap shutdown_services EXIT
     trap on_stop_signal TERM INT
     # 程序层已于构建期由交付安装器烘焙为只读；运行期只做实例初始化与恢复，避免只读根下写模式校验失败。
     log '初始化命名卷内实例'
-    "$INSTALL_ROOT/deploy-git-mirror.sh" --init --install-root "$INSTALL_ROOT" --run-root "$RUN_ROOT" || die '实例初始化失败'
-    if [[ -e $RUN_ROOT/runtime/stopped ]]; then
-        log '检测到停止标记，按交付 CLI 解除'
-        "$INSTALL_ROOT/deploy-git-mirror.sh" --resume --install-root "$INSTALL_ROOT" --run-root "$RUN_ROOT" || die '解除停止标记失败'
-    fi
-    if run_task_best_effort '首次地址刷新' "$INSTALL_ROOT/update-github-hosts.sh"; then
-        :
-    else
-        shutdown_services
-        return 0
-    fi
+    gm_without_container_lease "$INSTALL_ROOT/deploy-git-mirror.sh" --init --install-root "$INSTALL_ROOT" --run-root "$RUN_ROOT" || die '实例初始化失败'
+    gm_prepare_runtime "$RUN_ROOT" "$INSTALL_ROOT" || return 1
+    [[ $GM_ENTRYPOINT_STOP == 0 ]] || return 0
+    gm_startup_prepare || die '关闭旧发布或重放失败'
     log '启动 git-daemon'
     reset_stale_service_state git-daemon
-    rc-service --user git-daemon start || die 'git-daemon 启动失败'
+    gm_without_container_lease rc-service --user git-daemon start || die 'git-daemon 启动失败'
     confirm_daemon_listening || die 'git-daemon 启动后未真实监听，容器退出'
-    if run_task_best_effort '首次仓库同步' "$INSTALL_ROOT/git-mirror-sync.sh"; then
-        :
-    else
-        shutdown_services
-        return 0
-    fi
+    gm_recover_main --startup || return 1
+    if ! run_task_best_effort '首次地址刷新' "$INSTALL_ROOT/update-github-hosts.sh"; then return 0; fi
+    gm_startup_network || return 1
+    [[ $GM_ENTRYPOINT_STOP == 0 ]] || return 0
     if scheduler_enabled; then
         log '启动调度服务'
         reset_stale_service_state git-mirror-scheduler
-        rc-service --user git-mirror-scheduler start || die '调度服务启动失败'
+        gm_without_container_lease rc-service --user git-mirror-scheduler start || die '调度服务启动失败'
         scheduler_supervised=yes
     else
         log 'ENABLE_CRON=no，按配置不启动调度服务；首次刷新与首次同步已执行'
@@ -290,7 +289,6 @@ main() {
     log '容器前台就绪'
     supervise_loop "$scheduler_supervised" || status=$?
     log '收到停止信号，停止服务并回收子进程'
-    shutdown_services
     return "$status"
 }
 
