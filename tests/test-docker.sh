@@ -162,7 +162,8 @@ entrypoint_no_runtime_program_write() {
     local file=$ROOT/docker/docker-entrypoint.sh
     ! grep -Eq -- '(^|[[:space:]])--install([[:space:]]|$)' "$file" || return 1
     grep -Fq -- '--init --install-root' "$file" || return 1
-    grep -Fq -- '--resume --install-root' "$file" || return 1
+    ! grep -Fq -- '--resume --install-root' "$file" || return 1
+    grep -Fq 'gm_startup_prepare' "$file" || return 1
     return 0
 }
 
@@ -296,6 +297,11 @@ docker_available() {
 # docker 可用而 compose 缺失时，docker-only 覆盖照常执行，Compose 编排段单列 SKIP 并单独计数。
 docker_integration_check() {
     local status=0
+    if [[ ${IT_NETWORK_GUARD_READY-} != 1 ]]; then
+        SKIPPED=$((SKIPPED + 1))
+        printf '[SKIP] 容器实机集成检查（未进入网络 guard）\n'
+        return 0
+    fi
     if ! docker_available; then
         SKIPPED=$((SKIPPED + 1))
         printf '[SKIP] 容器实机集成检查（docker 不可用）\n'
@@ -324,6 +330,14 @@ docker_integration_check() {
     return 0
 }
 
+test_startup_no_network_before_checks() {
+    local text
+    text=$(<"$ROOT/docker/docker-entrypoint.sh")
+    [[ $text == *'gm_startup_prepare'*'git-daemon start'*'gm_recover_main --startup'*"run_task_best_effort '首次地址刷新'"* ]] || return 1
+    [[ $text == *'gm_startup_network'* ]]
+}
+
+check 'test_startup_no_network_before_checks' test_startup_no_network_before_checks
 check '容器脚本通过 Bash 语法检查' docker_scripts_syntax
 check '每个执行阶段的 RUN 之前已设置 USER' dockerfile_user_before_run
 check 'Dockerfile 无 root 执行、提权与不安全校验开关' dockerfile_no_root_or_unsafe

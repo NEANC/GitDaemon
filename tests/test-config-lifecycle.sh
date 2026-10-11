@@ -991,13 +991,11 @@ resume_lifecycle() {
     case "$scenario" in
         success)
             expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler\nstatus git-mirror-sync\nstatus git-mirror-hosts\nstatus git-daemon'
-            [[ $status == 0 && ! -e $work/instance/runtime/stopped && $(<"$work/calls") == "$expected" ]] || {
+            [[ $status == 1 && -e $work/instance/runtime/stopped && $output == *'容器启动上下文'* && $(<"$work/calls") == "$expected" ]] || {
                 printf '恢复必须在三把排他锁内确认全部服务已停止\n实际调用：\n%s\n%s\n' "$(<"$work/calls")" "$output"
                 return 1
             }
-            : > "$work/calls"
-            gm_begin_operation sync || return 1
-            [[ $(<"$work/calls") == $'lock instance shared\nlock sync exclusive' ]] || return 1
+            gm_begin_operation sync >/dev/null 2>&1 && return 1
             ;;
         busy)
             [[ $status == 75 && $output == *'实例锁忙：instance'* ]] || return 1
@@ -1024,9 +1022,7 @@ resume_lifecycle() {
             [[ $status == 1 && $output == *'安装记录缺失字段、路径冲突或身份不匹配'* && ! -e $work/calls ]] || return 1
             ;;
     esac
-    if [[ $scenario != success ]]; then
-        [[ $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
-    fi
+    [[ $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
     return 0
 }
 
