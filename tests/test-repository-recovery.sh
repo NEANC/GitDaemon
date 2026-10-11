@@ -474,7 +474,37 @@ test_second_replacement_after_completion() {
     [[ -f $DIR/git-daemon-export-ok && $(stat -c '%d-%i' "$DIR") != "$old" ]]
 }
 
-for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion test_missing_old_requires_journal_without_aliases test_alias_pending_before_record}; do
+# 完成日志可退休后按新配置重建，未完成日志仍禁止跨配置接续。
+test_replacement_after_config_change() {
+    local phase oid operation config
+    for phase in cleanup_complete installed; do
+        setup_replacement "config-change-$phase" || return 1
+        GM_REPLACE_TEST_STOP=$phase
+        gm_repo_rebuild_locked owner/repo '' RESULT && return 1
+        restart_replacement || return 1
+        local -A journal=()
+        gm_repo_replacement_read owner/repo journal || return 1
+        operation=${journal[operation]}
+        gm_parse_repos 'owner/repo main' '' || return 1
+        config=$(gm_repo_config_identity owner/repo) || return 1
+        oid=$(git --git-dir="$DIR" rev-parse HEAD) || return 1
+        rm -- "$DIR/objects/${oid:0:2}/${oid:2}" || return 1
+        gm_repo_check_locked owner/repo "$DIR" RESULT || return 1
+        [[ ${RESULT[health]} == corrupt ]] || return 1
+        if [[ $phase == installed ]]; then
+            if gm_repo_rebuild_locked owner/repo main RESULT; then return 1; fi
+            gm_repo_replacement_read owner/repo journal || return 1
+            [[ ${journal[operation]} == "$operation" && -d $RUN_ROOT/quarantine/$operation/repo.git ]] || return 1
+            continue
+        fi
+        gm_repo_rebuild_locked owner/repo main RESULT || return 1
+        gm_repo_replacement_read owner/repo journal || return 1
+        [[ ${journal[operation]} != "$operation" && ${journal[config]} == "$config" && ${journal[phase]} == cleanup_complete ]] || return 1
+        [[ -f $DIR/git-daemon-export-ok && $(git --git-dir="$DIR" config --get-all remote.origin.fetch) == '+refs/heads/main:refs/heads/main' ]] || return 1
+    done
+}
+
+for test in ${GM_RECOVERY_TESTS:-test_healthy_and_dangling test_missing_and_corrupt_object test_permission_is_not_corruption test_stale_generation_cannot_publish test_publish_commit_failure_revokes_export test_publish_directory_sync_is_unsafe test_incomplete_and_empty test_unknown_and_interrupted test_revoke_failure_is_unsafe test_replica_replaced test_restart_each_replace_phase test_alias_transition_requires_journal test_live_reader_defers_move test_failed_candidate_keeps_old test_cleanup_failure_keeps_new test_old_published_needs_current_fsck test_scan_failure_blocks_cleanup test_cleanup_checks_durable_boot test_candidate_rejects_sharing_and_scope test_replacement_rename_windows test_candidate_empty_and_selected test_candidate_creation_window test_second_replacement_after_completion test_missing_old_requires_journal_without_aliases test_alias_pending_before_record test_replacement_after_config_change}; do
     CHECKS=$((CHECKS+1))
     if (declare -A STATE=() RESULT=(); declare -F gm_repo_check_locked >/dev/null && "$test"); then
         printf '[PASS] %s\n' "$test"

@@ -318,10 +318,13 @@ gm_repo_replay_locked() {
     replay_result=([reason]=replay_blocked)
     [[ ${GM_LOCAL_FROZEN-} != yes && ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
     gm_repo_replacement_read "$repo" replay || return 1
-    [[ ${replay[config]} == "$(gm_repo_config_identity "$repo")" ]] || return 1
+    [[ ${replay[phase]} == cleanup_complete || ${replay[config]} == "$(gm_repo_config_identity "$repo")" ]] || return 1
     old=$RUN_ROOT/quarantine/${replay[operation]}/repo.git
     candidate=$RUN_ROOT/staging/${replay[operation]}/repo.git
     for identity in "$dir" "$old" "$candidate"; do gm_validate_path "$identity" || return 1; done
+    if [[ ${replay[phase]} == cleanup_complete ]]; then
+        [[ ! -e $old && ! -e $candidate ]] || return 1
+    fi
     if [[ -d $old ]]; then gm_repo_copy_validate "$old" "${replay[old_identity]}" || return 1; fi
     if [[ -d $candidate ]]; then
         if [[ ${replay[phase]} == old_isolated && ${replay[new_identity]} == none ]]; then
