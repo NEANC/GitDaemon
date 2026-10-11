@@ -60,6 +60,7 @@ gm_container_begin() {
 gm_request_stop() {
     case "$1" in instance|task) ;; *) return 1 ;; esac
     if [[ ${GM_STOP_SCOPE-} != instance ]]; then GM_STOP_SCOPE=$1; fi
+    if [[ $GM_STOP_SCOPE == instance ]]; then GM_LOCAL_FROZEN=yes; fi
     GM_STOP_REASON=$2
     return 0
 }
@@ -269,6 +270,7 @@ gm_task_finish_locked() {
         gm_lock_release dispatch || status=1
         if (( status != 0 )); then finished[result]=UNSAFE; gm_task_freeze; return 1; fi
     fi
+    if [[ ${GM_STOP_SCOPE-} == instance ]]; then gm_task_freeze || { finished[result]=UNSAFE; return 1; }; fi
     gm_lock_release sync && gm_lock_release instance || return 1
     if [[ ${GM_STOP_SCOPE-} == task ]]; then unset GM_STOP_SCOPE GM_STOP_REASON; fi
     return 0

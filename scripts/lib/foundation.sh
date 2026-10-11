@@ -1019,6 +1019,7 @@ gm_with_runtime_environment() (
 # 运行入口按实例共享锁、操作排他锁顺序进入，停止标记禁止新操作。
 gm_begin_operation() {
     local operation=$1 status
+    [[ ${GM_STOP_SCOPE-} != instance ]] || return 1
     gm_lock_acquire instance shared || return $?
     if [[ -e $RUN_ROOT/runtime/stopped || -e $RUN_ROOT/runtime/frozen || -L $RUN_ROOT/runtime/frozen ]]; then
         gm_lock_release instance || return 1

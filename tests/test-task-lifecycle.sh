@@ -173,7 +173,40 @@ test_recovery_required_blocks_write() {
     [[ ${result[result]} == RECOVERY_REQUIRED && ! -e $RUN_ROOT/written ]]
 }
 
-for test in test_second_container_refused test_stop_before_release_never_writes test_task_cancel_does_not_freeze test_instance_stop_blocks_resume test_delayed_grandchild_keeps_lock test_repeated_term_keeps_deadline test_nonzero_exit_is_known test_worker_does_not_inherit_lease test_registration_stop_never_releases test_unknown_wait_keeps_locks test_finish_state_failure_keeps_locks test_unreleased_worker_parent_disappears test_finished_channels_are_removed test_service_cannot_inherit_lease test_recovery_required_blocks_write; do
+test_late_term_at_journal() {
+    setup latejournal || return 1
+    local -A result=()
+    start true || return 1
+    trap 'gm_request_stop instance late_term' TERM
+    local journal_definition
+    journal_definition=$(declare -f gm_task_journal)
+    eval "${journal_definition/gm_task_journal/original_journal}"
+    gm_task_journal() {
+        original_journal "$@" || return 1
+        kill -TERM "$BASHPID"
+    }
+    gm_task_finish_locked result || return 1
+    [[ ${GM_STOP_SCOPE-} == instance && -f $RUN_ROOT/runtime/frozen ]] || return 1
+    gm_begin_operation sync && return 1
+    return 0
+}
+
+test_late_term_at_cleanup() {
+    setup latecleanup || return 1
+    local -A result=()
+    start true || return 1
+    trap 'gm_request_stop instance late_term' TERM
+    rmdir() {
+        command rmdir "$@" || return 1
+        kill -TERM "$BASHPID"
+    }
+    gm_task_finish_locked result || return 1
+    [[ ${GM_STOP_SCOPE-} == instance && -f $RUN_ROOT/runtime/frozen ]] || return 1
+    gm_begin_operation sync && return 1
+    return 0
+}
+
+for test in test_second_container_refused test_stop_before_release_never_writes test_task_cancel_does_not_freeze test_instance_stop_blocks_resume test_delayed_grandchild_keeps_lock test_repeated_term_keeps_deadline test_nonzero_exit_is_known test_worker_does_not_inherit_lease test_registration_stop_never_releases test_unknown_wait_keeps_locks test_finish_state_failure_keeps_locks test_unreleased_worker_parent_disappears test_finished_channels_are_removed test_service_cannot_inherit_lease test_recovery_required_blocks_write test_late_term_at_journal test_late_term_at_cleanup; do
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
 printf 'FAILURES=%s\n' "$FAILURES"
