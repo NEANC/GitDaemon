@@ -188,7 +188,22 @@ test_entry_signal_only_records_stop() {
     [[ $GM_ENTRYPOINT_STOP == 1 && ${GM_STOP_SCOPE-} == instance && ! -e $TEST_ROOT/signal-kill ]]
 }
 
-for test in test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop; do
+# 单库环境失败不阻止后续健康库检查，但实例安全故障必须中止。
+test_check_failure_scope() {
+    setup_startup failure-scope || return 1
+    gm_startup_prepare || return 1
+    gm_startup_run_repo() {
+        if [[ $1 == owner/first ]]; then return 1; fi
+        : > "$RUN_ROOT/second-checked"
+    }
+    gm_startup_checks || return 1
+    [[ -f $RUN_ROOT/second-checked ]] || return 1
+    gm_startup_run_repo() { return 2; }
+    gm_startup_checks && return 1
+    return 0
+}
+
+for test in test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop test_check_failure_scope; do
     CHECKS=$((CHECKS+1))
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
