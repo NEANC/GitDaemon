@@ -360,7 +360,7 @@ gm_recover_short_link() {
         gm_validate_path "$run/repos/$old" || return 1
         if [[ ! -d $run/repos/$old ]]; then
             [[ $run == "$RUN_ROOT" ]] || return 1
-            gm_repo_validate_aliases_locked "${old%.git}" || return 1
+            gm_repo_validate_alias_target_locked "${old%.git}" || return 1
         fi
     fi
     if [[ -L $link ]]; then

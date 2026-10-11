@@ -237,12 +237,25 @@ gm_repo_copy_validate() (
     [[ ! -e $dir/objects/info/alternates && ! -e $dir/objects/info/http-alternates ]]
 )
 
-gm_repo_validate_aliases_locked() {
-    local repo=$1 index name link record actual target=$1.git
+# 独立核对缺失目标的替换证据，避免空别名集合绕过日志。
+gm_repo_validate_alias_target_locked() {
+    local repo=$1 target=$RUN_ROOT/repos/$1.git
     local -A alias_journal=()
     gm_state_repo_path "$RUN_ROOT" "$repo" repos >/dev/null || return 1
     gm_validate_path "$RUN_ROOT/repos" read || return 1
     gm_validate_path "$RUN_ROOT/repos/${repo%/*}" read || return 1
+    gm_validate_path "$target" || return 1
+    if [[ ! -d $target ]]; then
+        gm_repo_replacement_read "$repo" alias_journal || return 1
+        case ${alias_journal[phase]} in unpublished|old_isolated|candidate_building|candidate_verified) ;; *) return 1 ;; esac
+        gm_repo_copy_validate "$RUN_ROOT/quarantine/${alias_journal[operation]}/repo.git" "${alias_journal[old_identity]}" || return 1
+    fi
+    return 0
+}
+
+gm_repo_validate_aliases_locked() {
+    local repo=$1 index name link record actual target=$1.git
+    gm_repo_validate_alias_target_locked "$repo" || return 1
     for index in "${!GM_LINK_TARGETS[@]}"; do
         [[ ${GM_LINK_TARGETS[$index]} == "$repo" ]] || continue
         name=${GM_LINK_NAMES[$index]}
@@ -260,11 +273,6 @@ gm_repo_validate_aliases_locked() {
         [[ $actual == "$target" ]] || return 1
         if [[ -d $RUN_ROOT/repos/$target ]]; then
             gm_validate_managed_link "$RUN_ROOT" "$link" || return 1
-        else
-            gm_validate_path "$RUN_ROOT/repos/$target" || return 1
-            gm_repo_replacement_read "$repo" alias_journal || return 1
-            case ${alias_journal[phase]} in unpublished|old_isolated|candidate_building|candidate_verified) ;; *) return 1 ;; esac
-            gm_repo_copy_validate "$RUN_ROOT/quarantine/${alias_journal[operation]}/repo.git" "${alias_journal[old_identity]}" || return 1
         fi
     done
     return 0
