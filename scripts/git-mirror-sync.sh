@@ -296,7 +296,7 @@ report_branches() {
 
 # 同步单个仓库，失败时保留已有缓存且不发布新仓库。
 sync_repo() {
-    local repo=$1 branches=$2 dir url
+    local repo=$1 branches=$2 dir url status
     dir="$MIRROR_ROOT/$repo.git"
     url="https://github.com/$repo.git"
     mkdir -p "$(dirname "$dir")" || return 1
@@ -307,6 +307,12 @@ sync_repo() {
     if update_repo "$repo" "$dir" "$branches"; then
         report_branches "$repo" "$dir" "$branches" success || log "分支报告失败，不改变同步结果：$repo"
         return 0
+    else
+        status=$?
+    fi
+    if (( status == 2 )); then
+        log "同步结果不确定，需重新读取持久状态：$repo"
+        return 2
     fi
     log "同步失败，保留已有缓存：$repo"
     report_branches "$repo" "$dir" "$branches" failed
@@ -467,7 +473,11 @@ gm_sync_main() (
     build_transport_sequence || return 1
     for index in "${!GM_REPOS[@]}"; do
         if sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}"; then
-            gm_publish_short_links "$RUN_ROOT" "${GM_REPOS[$index]}" || failed=1
+            if gm_publish_short_links "$RUN_ROOT" "${GM_REPOS[$index]}"; then
+                :
+            else
+                failed=1
+            fi
         else
             failed=1
         fi
