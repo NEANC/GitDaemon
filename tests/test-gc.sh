@@ -697,8 +697,61 @@ test_explicit_recovery_safety_gates() (
     [[ ${calendar[write_blocked]} == yes ]]
 )
 
-for test in test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
+test_old_cleanup_cannot_release_later_corruption() (
+    local dir now oid identity generation operation key
+    local -A calendar=() outcome=() replacement=() before=()
+    fixture || return 1
+    gm_repo_build_candidate_locked() {
+        git init -q --bare "$3" && git --git-dir="$3" config remote.origin.fetch '+refs/*:refs/*' && git --git-dir="$3" config remote.origin.mirror true
+    }
+    for key in first second; do
+        oid=$(printf '%s\n' "$key" | git --git-dir="$dir" hash-object -w --stdin) || return 1
+        git --git-dir="$dir" update-ref refs/tags/blob "$oid" || return 1
+        rm "$dir/objects/${oid:0:2}/${oid:2}" || return 1
+        gm_gc_recover_locked owner/repo outcome || return 1
+        gm_gc_state_read owner/repo calendar || return 1
+        [[ ${calendar[reason]} == rebuild_pending ]] || return 1
+        if [[ $key == second ]]; then break; fi
+        GM_BOOT_GENERATION=$(cat /proc/sys/kernel/random/uuid)
+        printf '%s\n' "$GM_BOOT_GENERATION" > "$RUN_ROOT/runtime/generation"
+        gm_repo_rebuild_locked owner/repo '' outcome || return 1
+        gm_gc_recover_locked owner/repo outcome || return 1
+        gm_gc_write_allowed owner/repo || return 1
+    done
+    identity=$(stat -c '%d-%i' "$dir")
+    generation=${calendar[generation]}
+    gm_repo_replacement_read owner/repo replacement || return 1
+    operation=${replacement[operation]}
+    [[ ${replacement[phase]} == cleanup_complete && ${replacement[new_identity]} == "$identity" ]] || return 1
+    for key in anchor_date next_due_date not_before last_attempt_at last_success_at operation_id; do before[$key]=${calendar[$key]}; done
+    printf 'second\n' | git --git-dir="$dir" hash-object -w --stdin >/dev/null || return 1
+    GM_BOOT_GENERATION=$(cat /proc/sys/kernel/random/uuid)
+    printf '%s\n' "$GM_BOOT_GENERATION" > "$RUN_ROOT/runtime/generation"
+    gm_gc_startup_resume_locked owner/repo "$now" || return 1
+    gm_gc_recover_locked owner/repo outcome || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    printf 'old_cleanup=%s failed_copy=%s generation=%s blocked=%s reason=%s\n' "$operation" "$identity" "$generation" "${calendar[write_blocked]}" "${calendar[reason]}"
+    [[ ${calendar[write_blocked]} == yes && ${calendar[reason]} == rebuild_pending && -f $dir/git-daemon-export-ok ]] || return 1
+    ! gm_gc_write_allowed owner/repo || return 1
+    [[ ${calendar[failed_identity]} == "$identity" && ${calendar[failed_generation]} == "$generation" ]] || return 1
+    gm_gc_recover_locked owner/repo outcome || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes ]] || return 1
+    rm "$dir/objects/${oid:0:2}/${oid:2}" || return 1
+    gm_gc_recover_locked owner/repo outcome || return 1
+    GM_BOOT_GENERATION=$(cat /proc/sys/kernel/random/uuid)
+    printf '%s\n' "$GM_BOOT_GENERATION" > "$RUN_ROOT/runtime/generation"
+    gm_repo_rebuild_locked owner/repo '' outcome || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[failed_identity]} == "$identity" && ${calendar[failed_generation]} == "$generation" && ${calendar[identity]} != "$identity" ]] || return 1
+    gm_gc_recover_locked owner/repo outcome || return 1
+    gm_gc_write_allowed owner/repo || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    for key in "${!before[@]}"; do [[ ${calendar[$key]} == "${before[$key]}" ]] || return 1; done
+)
+
+for test in test_old_cleanup_cannot_release_later_corruption test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=40 failures=%s\n' "$FAILURES"
+printf 'checks=41 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
