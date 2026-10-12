@@ -310,7 +310,7 @@ test_scan_failure_blocks_cleanup() {
     unset GM_REPLACE_TEST_STOP
     local -A journal=()
     gm_repo_replacement_read owner/repo journal || return 1
-    find() { return 1; }
+    busybox() { if [[ $1 == find ]]; then return 1; fi; command busybox "$@"; }
     if gm_repo_cleanup_old_locked owner/repo; then return 1; fi
     [[ -d $RUN_ROOT/quarantine/${journal[operation]}/repo.git ]]
 }
