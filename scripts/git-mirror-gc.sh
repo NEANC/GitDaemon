@@ -70,17 +70,17 @@ gm_gc_recover_locked() {
     ' _ "$INSTALL_ROOT" "$repo" "$config" || status=$?
     gm_task_finish_locked recovery_task retain || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     if (( status != 0 )) || [[ ${recovery_task[result]} != SUCCESS ]] || gm_gc_stopped; then
-        gm_gc_mark_recovery_locked "$repo" || gm_gc_unsafe_locked "$repo"
+        gm_gc_mark_recovery_locked "$repo" || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
         recovered[result]=RECOVERY_REQUIRED
         return 1
     fi
-    gm_repo_state_read "$repo" recovered_repo || { gm_gc_unsafe_locked "$repo"; return 1; }
+    gm_repo_state_read "$repo" recovered_repo || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     if [[ ${recovered_repo[health]} == corrupt ]]; then
         recovery_gc[reason]=rebuild_pending
         recovered[result]=RECOVERY_REQUIRED recovered[reason]=rebuild_pending
     elif [[ ${recovered_repo[health]} == healthy ]]; then
         if ! gm_gc_precheck "$RUN_ROOT/repos/$repo.git" conditions; then recovery_gc[reason]=${conditions[reason]}; fi
-        gm_repo_publish_locked "$repo" "${recovered_repo[generation]}" && gm_publish_short_links "$RUN_ROOT" "$repo" || { gm_gc_unsafe_locked "$repo"; return 1; }
+        gm_repo_publish_locked "$repo" "${recovered_repo[generation]}" && gm_publish_short_links "$RUN_ROOT" "$repo" || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
         recovered[result]=BLOCKED recovered[reason]=${recovery_gc[reason]}
     else
         recovery_gc[reason]=check_failed
@@ -93,7 +93,7 @@ gm_gc_recover_locked() {
 gm_gc_one_locked() {
     local repo=$1 now=$2 output=$3 dir=$RUN_ROOT/repos/$1.git boot identity config completed status=0 interrupted=0 diagnostic
     local -n gc_out=$output
-    local -A execution=() repo_state=() gc_task=() conditions=() recovery_out=() previous=()
+    local -A execution=() repo_state=() gc_task=() conditions=() previous=()
     gc_out=([result]=BLOCKED [reason]=check_failed)
     [[ -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
     gm_validate_repo_name "$repo" && gm_gc_valid_epoch "$now" || return 1
@@ -165,8 +165,7 @@ gm_gc_one_locked() {
     gm_gc_retry execution "$completed" && gm_gc_mark_recovery_locked "$repo" && gm_gc_state_commit_locked "$repo" execution && gm_state_flush "$diagnostic" || { gc_out[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     gc_out[result]=${execution[last_result]} gc_out[reason]=${execution[reason]}
     if ! gm_gc_stopped; then
-        gm_gc_recover_locked "$repo" recovery_out || return 1
-        gc_out[reason]=${recovery_out[reason]}
+        gm_gc_recover_locked "$repo" "$output" || return 1
     fi
     if (( interrupted != 0 )); then return "$interrupted"; fi
     return 1

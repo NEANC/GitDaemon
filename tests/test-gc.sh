@@ -415,8 +415,30 @@ test_state_rejects_duplicates_links_and_permissions() (
     return 0
 )
 
-for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due test_gc_state_fault_boundaries test_block_commit_failure_freezes test_offline_resume_once_online_due_only test_state_rejects_duplicates_links_and_permissions; do
+# 验证恢复监督收尾失败会传至外层，并继续持有真实业务锁。
+test_recovery_unsafe_retains_outer_locks() (
+    local dir now original rc=0 probe=0
+    local -A calendar=() outcome=()
+    fixture && install_failure unknown || return 1
+    original=$(declare -f gm_task_finish_locked)
+    eval "${original/gm_task_finish_locked/gc_original_finish}"
+    gm_task_finish_locked() {
+        local -n active=$1
+        gc_original_finish "$@" || return 1
+        [[ ${active[operation]} != check ]]
+    }
+    gm_lock_release sync && gm_lock_release instance || return 1
+    gm_gc_run_one owner/repo > "$RUN_ROOT/outer.log" || rc=$?
+    cat "$RUN_ROOT/outer.log"
+    [[ $rc == 1 && -e $RUN_ROOT/runtime/frozen && ! -e $dir/git-daemon-export-ok ]] || return 1
+    [[ -n ${GM_LOCK_FDS[sync]-} && -n ${GM_LOCK_FDS[instance]-} ]] || return 1
+    flock -n -E 75 "$RUN_ROOT/runtime/sync.lock" true || probe=$?
+    [[ $probe == 75 ]] || return 1
+    grep -q 'result=UNSAFE' "$RUN_ROOT/outer.log"
+)
+
+for test in test_recovery_unsafe_retains_outer_locks test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due test_gc_state_fault_boundaries test_block_commit_failure_freezes test_offline_resume_once_online_due_only test_state_rejects_duplicates_links_and_permissions; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=25 failures=%s\n' "$FAILURES"
+printf 'checks=26 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
