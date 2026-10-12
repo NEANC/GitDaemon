@@ -988,40 +988,7 @@ resume_lifecycle() {
     output=$(<"$work/output")
     [[ $(<"$work/instance/repos/sentinel") == repository ]] || return 1
     [[ $(<"$work/instance/runtime/git-daemon.pid") == 424242 ]] || return 1
-    case "$scenario" in
-        success)
-            expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler\nstatus git-mirror-sync\nstatus git-mirror-hosts\nstatus git-daemon'
-            [[ $status == 1 && -e $work/instance/runtime/stopped && $output == *'容器启动上下文'* && $(<"$work/calls") == "$expected" ]] || {
-                printf '恢复必须在三把排他锁内确认全部服务已停止\n实际调用：\n%s\n%s\n' "$(<"$work/calls")" "$output"
-                return 1
-            }
-            gm_begin_operation sync >/dev/null 2>&1 && return 1
-            ;;
-        busy)
-            [[ $status == 75 && $output == *'实例锁忙：instance'* ]] || return 1
-            [[ $(<"$work/calls") == $'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive' ]] || return 1
-            ;;
-        stop-failure)
-            [[ $status == 1 && $output == *'实例服务停止失败'* && $(<"$work/calls") == 'stop git-mirror-scheduler' ]] || return 1
-            ;;
-        still-running)
-            expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler'
-            [[ $status == 1 && $output == *'实例服务仍在运行：git-mirror-scheduler'* && $(<"$work/calls") == "$expected" ]] || {
-                printf '报告运行中的服务必须拒绝恢复：status=%s\n%s\n' "$status" "$output"
-                return 1
-            }
-            ;;
-        status-error)
-            expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon\nstatus git-mirror-scheduler'
-            [[ $status == 1 && $output == *'无法确认实例服务状态：git-mirror-scheduler'* && $(<"$work/calls") == "$expected" ]] || {
-                printf '不可靠状态必须失败关闭：status=%s\n%s\n' "$status" "$output"
-                return 1
-            }
-            ;;
-        forged-record)
-            [[ $status == 1 && $output == *'安装记录缺失字段、路径冲突或身份不匹配'* && ! -e $work/calls ]] || return 1
-            ;;
-    esac
+    [[ $status == 1 && $output == *'容器启动上下文'* && ! -e $work/calls && ! -e $work/checks ]] || return 1
     [[ $(<"$work/instance/runtime/stopped") == STOPPED=1 ]] || return 1
     return 0
 }
@@ -1172,7 +1139,7 @@ service_unregistered_rejected() {
             resume) output=$(gm_resume_instance "$work/instance" "$work/program" 2>&1) || status=$? ;;
             stop) output=$(gm_stop_instance_service git-daemon 2>&1) || status=$? ;;
         esac
-        [[ $status == 1 && $output == *'未登记或不可解析'* ]] || {
+        [[ $status == 1 && ( ( $kind == resume && $output == *'容器启动上下文'* ) || ( $kind != resume && $output == *'未登记或不可解析'* ) ) ]] || {
             printf '未登记服务必须失败关闭：kind=%s，status=%s，诊断=%s\n' "$kind" "$status" "$output"
             exit 1
         }

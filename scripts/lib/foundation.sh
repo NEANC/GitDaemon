@@ -968,35 +968,10 @@ gm_stop_instance_service() {
     return 0
 }
 
-# 显式恢复先停止旧服务，再按既有锁序核验实例；仅解除停止标记，不启动服务或删除 PID。
+# 普通恢复无启动上下文，拒绝时不准备环境、不控制服务、不获取锁。
 gm_resume_instance() (
-    local run=$1 install=$2 service
-    local -a services=(git-mirror-sync git-mirror-hosts git-daemon)
+    local run=$1
     [[ ! -e $run/runtime/frozen && ! -L $run/runtime/frozen ]] || { gm_error '冻结仅允许容器新启动解除'; return 1; }
-    gm_prepare_runtime "$run" "$install" || return $?
-    command -v rc-service >/dev/null 2>&1 || { gm_error '缺少必要依赖：rc-service'; return 1; }
-    gm_load_service_capabilities "$install" || return 1
-    for service in git-mirror-sync git-mirror-hosts git-daemon; do
-        gm_validate_file "$install/openrc/$service" read || return 1
-        [[ -x $install/openrc/$service ]] || { gm_error '实例服务定义不可执行'; return 1; }
-    done
-    if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
-        gm_stop_instance_service git-mirror-scheduler || return 1
-    fi
-    gm_stop_instance_service git-mirror-sync || return 1
-    gm_stop_instance_service git-mirror-hosts || return 1
-    gm_lock_acquire instance exclusive || return $?
-    gm_lock_acquire sync exclusive || return $?
-    gm_lock_acquire hosts exclusive || return $?
-    gm_stop_instance_service git-daemon || return 1
-    gm_prepare_runtime "$run" "$install" || return $?
-    gm_load_service_capabilities "$install" || return 1
-    if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
-        services=(git-mirror-scheduler "${services[@]}")
-    fi
-    for service in "${services[@]}"; do
-        gm_confirm_service_stopped "$run" "$service" || return 1
-    done
     gm_error '普通恢复没有容器启动上下文；请重启容器完成检查后解除停止'
     return 1
 )
