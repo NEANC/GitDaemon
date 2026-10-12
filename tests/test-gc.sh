@@ -296,8 +296,64 @@ test_gc_copy_identity_mismatch_blocks() (
     [[ $rc == 1 && ${outcome[result]} == BLOCKED && ${calendar[last_attempt_at]} == 0 ]]
 )
 
-for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks; do
+test_replacement_preserves_calendar_and_rebinds() (
+    local dir now old
+    local -A calendar=() outcome=() state=() checked=()
+    fixture || return 1
+    old=${calendar[next_due_date]}
+    gm_repo_unpublish_locked owner/repo || return 1
+    mv "$dir" "$RUN_ROOT/old.git" || return 1
+    git init -q --bare "$dir" || return 1
+    gm_repo_state_read owner/repo state || return 1
+    state[generation]=2
+    gm_repo_state_commit_locked owner/repo state || return 1
+    gm_repo_check_locked owner/repo "$dir" checked || return 1
+    gm_repo_publish_locked owner/repo 2 || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[generation]} == 2 && ${calendar[identity]} == "$(stat -c '%d-%i' "$dir")" && ${calendar[next_due_date]} == "$old" && ${calendar[last_success_at]} == 0 ]]
+)
+
+test_cli_signal_targets_supervisor() (
+    local dir now caller rc=0 i
+    local -A calendar=() outcome=()
+    fixture && install_failure unknown || return 1
+    cat > "$RUN_ROOT/bin/git" <<'SH'
+#!/usr/bin/env bash
+if [[ " $* " == *' gc --auto '* ]]; then
+    printf started > "$RUN_ROOT/started"
+    sleep 30
+    exit 0
+fi
+exec "$REAL_GIT" "$@"
+SH
+    gm_lock_release sync && gm_lock_release instance || return 1
+    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo' _ "$ROOT" > "$RUN_ROOT/cli.log" 2>&1 & caller=$!
+    for ((i=0;i<300;i++)); do [[ ! -e $RUN_ROOT/started ]] || break; sleep 0.02; done
+    [[ -e $RUN_ROOT/started ]] || { kill -TERM "$caller"; wait "$caller"; return 1; }
+    kill -TERM "$caller" || return 1
+    wait "$caller" || rc=$?
+    for ((i=0;i<500;i++)); do [[ -e $RUN_ROOT/runtime/task ]] || break; sleep 0.02; done
+    [[ $rc == 143 && ! -e $RUN_ROOT/runtime/task && ! -e $RUN_ROOT/runtime/frozen ]]
+)
+
+test_cli_selection_and_due() (
+    local dir now rc=0
+    local -A calendar=() outcome=()
+    fixture || return 1
+    calendar[not_before]=$((now+86400))
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    gm_lock_release sync && gm_lock_release instance || return 1
+    gm_prepare_runtime() { return 0; }
+    gm_gc_main --repo owner/repo || return 1
+    gm_gc_main || return 1
+    gm_gc_main --repo other/repo && return 1
+    gm_gc_main --force && return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[last_attempt_at]} == 0 ]]
+)
+
+for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=18 failures=%s\n' "$FAILURES"
+printf 'checks=21 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
