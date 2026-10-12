@@ -193,7 +193,7 @@ gm_recover_scheduled() {
     if [[ -e $RUN_ROOT/state/repos/$repo.state ]]; then
         gm_repo_state_read "$repo" current || return 1
     fi
-    if [[ -d $RUN_ROOT/repos/$repo.git && ${current[health]-} != healthy && ${current[health]-} != corrupt ]]; then
+    if [[ -d $RUN_ROOT/repos/$repo.git && ${current[health]-} != corrupt && ( ${current[health]-} != healthy || ${current[message]-} == recovery_required ) ]]; then
         gm_startup_run_repo "$repo" check || return $?
         gm_repo_state_read "$repo" current || return 1
     fi

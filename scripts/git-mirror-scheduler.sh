@@ -362,7 +362,7 @@ gm_scheduler_scan() {
             continue
         fi
         gm_repo_state_read "$repo" state || return 1
-        if [[ ${state[health]-} != healthy ]]; then gm_scheduler_enqueue recovery "$repo" 0; fi
+        if [[ ${state[health]-} != healthy || ${state[message]-} == recovery_required ]]; then gm_scheduler_enqueue recovery "$repo" 0; fi
         if [[ -e $RUN_ROOT/state/gc/$repo.state || -L $RUN_ROOT/state/gc/$repo.state ]]; then
             gm_gc_state_read "$repo" gc || return 1
             if [[ ${gc[write_blocked]} == yes || ${gc[status]} == running ]]; then
