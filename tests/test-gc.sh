@@ -133,7 +133,11 @@ test_gc_log_not_deleted() (
     gm_gc_state_read owner/repo calendar || return 1
     [[ $rc == 1 && ${outcome[result]} == BLOCKED && ${outcome[reason]} == manual_intervention && ${calendar[last_attempt_at]} == 0 ]] || return 1
     [[ $(cat "$dir/gc.log") == 'retained diagnosis' ]] || return 1
+    gm_repo_export_remove_locked() { printf 'unexpected unpublish\n' > "$RUN_ROOT/unpublished"; return 1; }
+    export GIT_TRACE2_EVENT=$RUN_ROOT/precheck-trace.json
     gm_gc_one_locked owner/repo "$now" outcome && return 1
+    [[ ! -e $RUN_ROOT/unpublished && -f $dir/git-daemon-export-ok ]] || return 1
+    if [[ -e $GIT_TRACE2_EVENT ]]; then ! grep -q 'fsck' "$GIT_TRACE2_EVENT" || return 1; fi
     [[ ! -e $RUN_ROOT/runtime/task && ${calendar[last_attempt_at]} == 0 ]]
 )
 

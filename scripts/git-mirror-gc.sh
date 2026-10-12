@@ -62,6 +62,12 @@ gm_gc_recover_locked() {
     gm_gc_state_read "$repo" recovery_gc || return 1
     if gm_gc_stopped; then recovered[result]=STOPPED; return 1; fi
     [[ ! -e $RUN_ROOT/runtime/task && ! -L $RUN_ROOT/runtime/task ]] || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
+    if [[ ${recovery_gc[last_result]} == BLOCKED && ${recovery_gc[reason]} == manual_intervention ]]; then
+        if ! gm_gc_precheck "$RUN_ROOT/repos/$repo.git" conditions; then
+            recovered[reason]=${recovery_gc[reason]}
+            return 0
+        fi
+    fi
     now=$(date +%s) || return 1
     if [[ ${recovery_gc[not_before]} == 0 && ( ${recovery_gc[status]} == running || ${recovery_gc[last_result]} == UNKNOWN || ${recovery_gc[last_result]} == INTERRUPTED ) ]]; then
         gm_gc_retry recovery_gc "$now" || return 1
