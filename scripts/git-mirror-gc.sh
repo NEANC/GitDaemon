@@ -53,15 +53,18 @@ gm_gc_environment_probe() {
 }
 
 gm_gc_recover_locked() {
-    local repo=$1 output=$2 verify_reason=${3:-yes} now status=0 index config=
+    local repo=$1 output=$2 verify_reason=${3:-yes} acknowledged=${4-} now status=0 index config= eligible=no
     local -n recovered=$output
-    local -A recovery_gc=() recovery_task=() recovered_repo=() conditions=()
+    local -A recovery_gc=() recovery_task=() recovered_repo=() conditions=() replacement=()
     recovered=([result]=BLOCKED [reason]=check_failed)
     [[ -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
     gm_repo_config_identity "$repo" >/dev/null || return 1
     gm_gc_state_read "$repo" recovery_gc || return 1
     if gm_gc_stopped; then recovered[result]=STOPPED; return 1; fi
     [[ ! -e $RUN_ROOT/runtime/task && ! -L $RUN_ROOT/runtime/task ]] || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
+    if [[ -n $acknowledged ]]; then
+        [[ $acknowledged =~ ^[a-f0-9-]{36}$ && $acknowledged == "${recovery_gc[operation_id]}" && ${recovery_gc[write_blocked]} == yes ]] || return 1
+    fi
     if [[ ${recovery_gc[last_result]} == BLOCKED && ${recovery_gc[reason]} == manual_intervention ]]; then
         if ! gm_gc_precheck "$RUN_ROOT/repos/$repo.git" conditions; then
             recovered[reason]=${recovery_gc[reason]}
@@ -99,12 +102,24 @@ gm_gc_recover_locked() {
         recovery_gc[reason]=rebuild_pending
         recovered[result]=RECOVERY_REQUIRED recovered[reason]=rebuild_pending
     elif [[ ${recovered_repo[health]} == healthy ]]; then
-        if [[ $verify_reason == yes && ( ${recovery_gc[reason]} == environment || ${recovery_gc[reason]} == manual_intervention ) ]]; then
+        case ${recovery_gc[reason]} in
+            environment|manual_intervention) eligible=yes ;;
+            interrupted|unknown|state_failed|check_failed)
+                if [[ -n $acknowledged ]]; then eligible=yes; fi ;;
+            rebuild_pending)
+                if gm_repo_replacement_read "$repo" replacement &&
+                    [[ ${replacement[phase]} == published || ${replacement[phase]} == cleanup_complete ]] &&
+                    [[ ${replacement[new_identity]} != "${replacement[old_identity]}" && ${replacement[new_identity]} == "${recovered_repo[checked_identity]}" && ${replacement[generation]} == "${recovered_repo[generation]}" && ${replacement[config]} == "${recovered_repo[checked_config]}" ]]; then
+                    eligible=yes
+                fi ;;
+        esac
+        if [[ $verify_reason == yes && $eligible == yes ]]; then
             if gm_gc_precheck "$RUN_ROOT/repos/$repo.git" conditions && gm_gc_environment_probe "$RUN_ROOT/repos/$repo.git" && ! gm_gc_stopped; then
                 recovery_gc[write_blocked]=no recovery_gc[reason]=none recovery_gc[status]=retry_wait
             fi
         fi
         gm_repo_publish_locked "$repo" "${recovered_repo[generation]}" && gm_publish_short_links "$RUN_ROOT" "$repo" || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
+        recovery_gc[generation]=${recovered_repo[generation]} recovery_gc[identity]=${recovered_repo[checked_identity]}
         recovered[result]=BLOCKED recovered[reason]=${recovery_gc[reason]}
         if [[ ${recovery_gc[write_blocked]} == no ]]; then recovered[result]=NOT_DUE; fi
     else
@@ -130,6 +145,11 @@ gm_gc_one_locked() {
     [[ ! -e $RUN_ROOT/runtime/task && ! -L $RUN_ROOT/runtime/task ]] || { gc_out[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     gm_repo_state_read "$repo" repo_state && gm_gc_state_read "$repo" execution || return 1
     execution[schedule_timezone]=${TZ:-UTC}
+    if [[ -n ${4-} ]]; then
+        gm_gc_recover_locked "$repo" "$output" yes "$4" || return 1
+        [[ ${gc_out[result]} == NOT_DUE ]]
+        return $?
+    fi
     if [[ ${execution[status]} == running || ${repo_state[health]-} == recovery_required || ${repo_state[message]} == recovery_required ]]; then
         gm_gc_recover_locked "$repo" "$output" || return 1
         return 1
@@ -207,7 +227,7 @@ gm_gc_run_one() {
     trap 'GM_GC_SIGNAL=INT; gm_request_stop task INT' INT
     gm_begin_operation sync || return $?
     now=$(date +%s) || return 1
-    gm_gc_one_locked "$repo" "$now" result || status=$?
+    gm_gc_one_locked "$repo" "$now" result "${2-}" || status=$?
     printf 'repo=%s result=%s reason=%s\n' "$repo" "${result[result]}" "${result[reason]}"
     [[ ${result[result]} != UNSAFE ]] || return 1
     gm_lock_release sync && gm_lock_release instance || return 1
@@ -215,10 +235,14 @@ gm_gc_run_one() {
 }
 
 gm_gc_main() {
-    local selected= repo result=0 status install
+    local selected= repo result=0 status install acknowledged=
     case $# in
         0) ;;
         2) [[ $1 == --repo ]] || return 1; selected=$2; gm_validate_repo_name "$selected" || return 1 ;;
+        4)
+            [[ $1 == --repo && $3 == --recover && $4 =~ ^[a-f0-9-]{36}$ ]] || return 1
+            selected=$2 acknowledged=$4
+            gm_validate_repo_name "$selected" || return 1 ;;
         *) return 1 ;;
     esac
     install=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
@@ -227,7 +251,7 @@ gm_gc_main() {
     for repo in "${GM_REPOS[@]}"; do
         [[ -z $selected || $selected == "$repo" ]] || continue
         status=0
-        gm_gc_run_one "$repo" || status=$?
+        gm_gc_run_one "$repo" "$acknowledged" || status=$?
         case $status in 0) ;; 75|130|143) return "$status" ;; *) result=1 ;; esac
         if gm_gc_stopped; then return 1; fi
     done

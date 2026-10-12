@@ -46,7 +46,7 @@ test_busy_keeps_attempt_time() (
     local dir now rc=0
     local -A calendar=() outcome=()
     fixture || return 1
-    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_gc_run_one owner/repo result' _ "$ROOT" >/dev/null 2>&1 || rc=$?
+    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_gc_run_one owner/repo' _ "$ROOT" >/dev/null 2>&1 || rc=$?
     gm_gc_state_read owner/repo calendar || return 1
     [[ $rc == 75 && ${calendar[last_attempt_at]} == 0 ]]
 )
@@ -56,8 +56,8 @@ test_two_callers_only_one_claim() (
     local -A calendar=() outcome=()
     fixture || return 1
     gm_lock_release sync && gm_lock_release instance || return 1
-    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo result' _ "$ROOT" >"$RUN_ROOT/one" 2>&1 & first=$!
-    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo result' _ "$ROOT" >"$RUN_ROOT/two" 2>&1 & second=$!
+    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo' _ "$ROOT" >"$RUN_ROOT/one" 2>&1 & first=$!
+    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo' _ "$ROOT" >"$RUN_ROOT/two" 2>&1 & second=$!
     wait "$first" || a=$?
     wait "$second" || b=$?
     [[ $a == 0 || $a == 75 ]] && [[ $b == 0 || $b == 75 ]] || return 1
@@ -576,5 +576,129 @@ test_unblock_commit_failure_freezes() (
 for test in test_unblock_due_waits_for_next_round test_unblock_commit_failure_freezes test_environment_recheck_preserves_schedule test_manual_recheck_requires_external_removal test_environment_probe_sync_failure_blocks test_environment_probe_real_permission_failure test_unknown_cannot_be_laundered_by_native_lock test_recheck_corruption_never_unblocks test_recovery_unsafe_retains_outer_locks test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due test_gc_state_fault_boundaries test_block_commit_failure_freezes test_offline_resume_once_online_due_only test_state_rejects_duplicates_links_and_permissions; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=34 failures=%s\n' "$FAILURES"
+test_explicit_recovery_preserves_cycle() (
+    local dir now reason key operation
+    local -A calendar=() outcome=() before=()
+    blocked_fixture unknown || return 1
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    calendar[operation_id]=$operation calendar[last_result]=UNKNOWN
+    for reason in interrupted unknown state_failed check_failed; do
+        calendar[reason]=$reason calendar[write_blocked]=yes calendar[status]=blocked
+        gm_gc_state_commit_locked owner/repo calendar || return 1
+        for key in "${!calendar[@]}"; do before[$key]=${calendar[$key]}; done
+        gm_gc_recover_locked owner/repo outcome yes "$operation" || return 1
+        gm_gc_state_read owner/repo calendar || return 1
+        [[ ${outcome[result]} == NOT_DUE && ${calendar[write_blocked]} == no ]] || return 1
+        for key in anchor_date next_due_date not_before last_attempt_at last_success_at last_result operation_id; do
+            [[ ${calendar[$key]} == "${before[$key]}" ]] || return 1
+        done
+    done
+)
+
+test_explicit_recovery_rejects_stale_operation() (
+    local dir now operation
+    local -A calendar=() outcome=()
+    blocked_fixture unknown || return 1
+    calendar[operation_id]=$(cat /proc/sys/kernel/random/uuid)
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    gm_gc_recover_locked owner/repo outcome yes "$operation" && return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes && ${calendar[reason]} == unknown ]]
+)
+
+test_explicit_recovery_checks_conditions() (
+    local dir now operation
+    local -A calendar=() outcome=()
+    blocked_fixture unknown || return 1
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    calendar[operation_id]=$operation
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    printf 'retain\n' > "$dir/gc.log"
+    gm_gc_recover_locked owner/repo outcome yes "$operation" || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes && ${calendar[reason]} == unknown && -f $dir/gc.log ]] || return 1
+    mv "$dir/gc.log" "$RUN_ROOT/gc.saved"
+    chmod 500 "$dir/refs"
+    gm_gc_recover_locked owner/repo outcome yes "$operation" || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes ]] || return 1
+    chmod 700 "$dir/refs"
+    gm_gc_recover_locked owner/repo outcome yes "$operation" || return 1
+    gm_gc_write_allowed owner/repo
+)
+
+test_rebuilt_recovery_requires_matching_journal() (
+    local dir now operation identity config key value
+    local -A calendar=() outcome=() replacement=()
+    blocked_fixture rebuild_pending || return 1
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    calendar[operation_id]=$operation
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    gm_gc_recover_locked owner/repo outcome yes "$operation" || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes ]] || return 1
+    identity=$(stat -c '%d-%i' "$dir")
+    config=$(gm_repo_config_identity owner/repo)
+    replacement=([schema]=1 [repo]=owner/repo [operation]="$operation" [phase]=cleanup_complete [old_identity]=0-0 [new_identity]="$identity" [generation]="${calendar[generation]}" [config]="$config" [boot]="$GM_BOOT_GENERATION" [published_boot]="$GM_BOOT_GENERATION" [reason]=none)
+    for key in phase new_identity generation config; do
+        value=${replacement[$key]}
+        case $key in phase) replacement[$key]=candidate_verified ;; new_identity) replacement[$key]=0-1 ;; generation) replacement[$key]=99 ;; config) replacement[$key]=$(printf wrong | sha256sum); replacement[$key]=${replacement[$key]%% *} ;; esac
+        gm_repo_replacement_commit owner/repo replacement || return 1
+        gm_gc_recover_locked owner/repo outcome yes "$operation" || true
+        gm_gc_state_read owner/repo calendar || return 1
+        [[ ${calendar[write_blocked]} == yes ]] || return 1
+        replacement[$key]=$value
+    done
+    gm_repo_replacement_commit owner/repo replacement || return 1
+    gm_gc_recover_locked owner/repo outcome yes "$operation" || return 1
+    gm_gc_write_allowed owner/repo
+)
+
+test_explicit_recovery_cli_never_runs_gc() (
+    local dir now operation
+    local -A calendar=() outcome=()
+    blocked_fixture interrupted || return 1
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    calendar[operation_id]=$operation calendar[not_before]=$((now-1))
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    export REPOS=owner/repo SHORT_LINKS= GIT_TRACE2_EVENT=$RUN_ROOT/recover-cli.json
+    gm_lock_release sync && gm_lock_release instance || return 1
+    gm_prepare_runtime() { return 0; }
+    gm_gc_main --repo owner/repo --recover "$operation" || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == no && ${calendar[last_success_at]} == 0 && ${calendar[not_before]} == $((now-1)) ]] || return 1
+    grep -q fsck "$GIT_TRACE2_EVENT" || return 1
+    ! grep -q gc.autoDetach=false "$GIT_TRACE2_EVENT"
+)
+
+test_explicit_recovery_safety_gates() (
+    local dir now operation original rc=0
+    local -A calendar=() outcome=()
+    blocked_fixture state_failed || return 1
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    calendar[operation_id]=$operation
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    GM_STOP_SCOPE=instance
+    gm_gc_recover_locked owner/repo outcome yes "$operation" && return 1
+    [[ ${outcome[result]} == STOPPED ]] || return 1
+    unset GM_STOP_SCOPE
+    original=$(declare -f gm_gc_state_commit_locked)
+    eval "${original/gm_gc_state_commit_locked/gc_original_commit}"
+    gm_gc_state_commit_locked() {
+        local -n pending=$2
+        [[ ${pending[write_blocked]} == yes ]] || return 1
+        gc_original_commit "$@"
+    }
+    gm_lock_release sync && gm_lock_release instance || return 1
+    gm_gc_run_one owner/repo "$operation" || rc=$?
+    [[ $rc == 1 && -e $RUN_ROOT/runtime/frozen && ! -e $dir/git-daemon-export-ok && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes ]]
+)
+
+for test in test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
+    if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
+done
+printf 'checks=40 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
