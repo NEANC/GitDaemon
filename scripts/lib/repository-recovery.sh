@@ -232,7 +232,7 @@ gm_repo_copy_validate() (
     [[ $(stat -c %d -- "$dir") == "$root_device" ]] || return 1
     listing=$(mktemp "$RUN_ROOT/runtime/copy-scan.XXXXXXXX") || return 1
     trap 'rm -f -- "$listing"' EXIT
-    find "$dir" -depth -print0 > "$listing" || return 1
+    busybox find "$dir" -depth -print0 > "$listing" || return 1
     while IFS= read -r -d '' node; do
         [[ ! -L $node && -O $node ]] || return 1
         metadata=$(stat -c '%d %a %h' -- "$node") || return 1
@@ -339,7 +339,7 @@ gm_repo_replay_locked() {
         if [[ ${replay[phase]} == old_isolated && ${replay[new_identity]} == none ]]; then
             identity=$(stat -c '%d-%i' -- "$candidate") || return 1
             gm_repo_copy_validate "$candidate" "$identity" || return 1
-            identity=$(find "$candidate" -mindepth 1 -print -quit) || return 1
+            identity=$(busybox find "$candidate" -mindepth 1 -print -quit) || return 1
             [[ -z $identity ]] || return 1
             replay[new_identity]=$(stat -c '%d-%i' -- "$candidate") || return 1
             gm_repo_replace_phase "$repo" replay candidate_building || return $?

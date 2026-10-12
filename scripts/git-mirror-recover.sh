@@ -21,10 +21,23 @@ gm_startup_gate_validate() {
     export GM_BOOT_GENERATION
 }
 
+# 启动扫描仅凭当前配置、管理记录与替换副本证据接受悬空别名。
+gm_startup_validate_link() {
+    local path=$1 index
+    if [[ -e $path ]]; then gm_validate_managed_link "$RUN_ROOT" "$path"; return $?; fi
+    for index in "${!GM_LINK_TARGETS[@]}"; do
+        if [[ $path == "$RUN_ROOT/repos/${GM_LINK_NAMES[$index]}.git" ]]; then
+            gm_repo_validate_aliases_locked "${GM_LINK_TARGETS[$index]}"
+            return $?
+        fi
+    done
+    return 1
+}
+
 gm_startup_prepare() {
     [[ ${GM_CONTAINER_OWNER-} == "$BASHPID" && -n ${GM_LOCK_FDS[container]-} && -z ${GM_BOOT_GENERATION-} ]] || return 1
     local path listing repo status=0
-    local -A owner=() replay=()
+    local -A owner=() replay_outcome=()
     gm_lock_acquire instance exclusive || return $?
     gm_lock_acquire sync exclusive || { gm_lock_release instance; return 1; }
     if [[ -e $RUN_ROOT/runtime/task ]]; then
@@ -41,7 +54,7 @@ gm_startup_prepare() {
     if ! busybox find "$RUN_ROOT/repos" \( -name git-daemon-export-ok -o -type l \) -print0 > "$listing"; then rm -f "$listing"; return 1; fi
     while IFS= read -r -d '' path; do
         if [[ -L $path ]]; then
-            gm_validate_managed_link "$RUN_ROOT" "$path" || { status=1; break; }
+            gm_startup_validate_link "$path" || { status=1; break; }
         else
             gm_validate_file "$path" && rm -f -- "$path" && gm_state_flush "${path%/*}" || { status=1; break; }
         fi
@@ -51,7 +64,7 @@ gm_startup_prepare() {
     gm_container_begin || return 1
     for repo in "${GM_REPOS[@]}"; do
         if [[ -e $RUN_ROOT/state/replacements/$repo.state || -L $RUN_ROOT/state/replacements/$repo.state ]]; then
-            gm_repo_replay_locked "$repo" replay || return 1
+            gm_repo_replay_locked "$repo" replay_outcome || return 1
         fi
     done
     gm_process_identity "$BASHPID" owner || return 1
