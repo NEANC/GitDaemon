@@ -38,8 +38,22 @@ gm_gc_mark_recovery_locked() {
     gm_repo_state_commit_locked "$repo" failed_repo
 }
 
+gm_gc_environment_probe() {
+    local dir=$1 node probe status
+    for node in "$dir" "$dir/objects" "$dir/objects/pack" "$dir/refs"; do
+        gm_validate_path "$node" || return 1
+        probe=$(mktemp "$node/.gc-probe.XXXXXXXX") || return 1
+        status=0
+        printf 'git-mirror write probe\n' > "$probe" && gm_state_flush "$probe" && gm_state_flush "$node" || status=1
+        rm -f -- "$probe" || return 1
+        gm_state_flush "$node" || return 1
+        (( status == 0 )) || return 1
+    done
+    return 0
+}
+
 gm_gc_recover_locked() {
-    local repo=$1 output=$2 now status=0 index config=
+    local repo=$1 output=$2 verify_reason=${3:-yes} now status=0 index config=
     local -n recovered=$output
     local -A recovery_gc=() recovery_task=() recovered_repo=() conditions=()
     recovered=([result]=BLOCKED [reason]=check_failed)
@@ -79,9 +93,14 @@ gm_gc_recover_locked() {
         recovery_gc[reason]=rebuild_pending
         recovered[result]=RECOVERY_REQUIRED recovered[reason]=rebuild_pending
     elif [[ ${recovered_repo[health]} == healthy ]]; then
-        if ! gm_gc_precheck "$RUN_ROOT/repos/$repo.git" conditions; then recovery_gc[reason]=${conditions[reason]}; fi
+        if [[ $verify_reason == yes && ( ${recovery_gc[reason]} == environment || ${recovery_gc[reason]} == manual_intervention ) ]]; then
+            if gm_gc_precheck "$RUN_ROOT/repos/$repo.git" conditions && gm_gc_environment_probe "$RUN_ROOT/repos/$repo.git" && ! gm_gc_stopped; then
+                recovery_gc[write_blocked]=no recovery_gc[reason]=none recovery_gc[status]=retry_wait
+            fi
+        fi
         gm_repo_publish_locked "$repo" "${recovered_repo[generation]}" && gm_publish_short_links "$RUN_ROOT" "$repo" || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
         recovered[result]=BLOCKED recovered[reason]=${recovery_gc[reason]}
+        if [[ ${recovery_gc[write_blocked]} == no ]]; then recovered[result]=NOT_DUE; fi
     else
         recovery_gc[reason]=check_failed
         recovered[result]=RECOVERY_REQUIRED recovered[reason]=check_failed
@@ -113,8 +132,12 @@ gm_gc_one_locked() {
     identity=$(stat -c '%d-%i' -- "$dir") || return 1
     [[ ${repo_state[health]-} == healthy && ${repo_state[desired]} == present && ${repo_state[checked_boot]-} == "$boot" && ${repo_state[checked_generation]-} == "${repo_state[generation]}" && ${repo_state[checked_config]-} == "$config" && ${repo_state[checked_identity]-} == "$identity" ]] || return 1
     [[ ${execution[generation]} == "${repo_state[generation]}" && ${execution[identity]} == "$identity" ]] || return 1
+    if [[ ${execution[write_blocked]} == yes ]]; then
+        gm_gc_recover_locked "$repo" "$output" || return 1
+        [[ ${gc_out[result]} == NOT_DUE ]]
+        return $?
+    fi
     if ! gm_gc_due execution "$now"; then gc_out[result]=NOT_DUE gc_out[reason]=none; return 0; fi
-    if [[ ${execution[write_blocked]} == yes ]]; then gc_out[reason]=${execution[reason]}; return 1; fi
     if ! gm_gc_precheck "$dir" conditions; then
         execution[status]=blocked execution[write_blocked]=yes execution[last_result]=BLOCKED execution[reason]=${conditions[reason]}
         gc_out[reason]=${conditions[reason]}
@@ -165,7 +188,7 @@ gm_gc_one_locked() {
     gm_gc_retry execution "$completed" && gm_gc_mark_recovery_locked "$repo" && gm_gc_state_commit_locked "$repo" execution && gm_state_flush "$diagnostic" || { gc_out[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     gc_out[result]=${execution[last_result]} gc_out[reason]=${execution[reason]}
     if ! gm_gc_stopped; then
-        gm_gc_recover_locked "$repo" "$output" || return 1
+        gm_gc_recover_locked "$repo" "$output" no || return 1
     fi
     if (( interrupted != 0 )); then return "$interrupted"; fi
     return 1
