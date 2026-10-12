@@ -56,8 +56,8 @@ test_two_callers_only_one_claim() (
     local -A calendar=() outcome=()
     fixture || return 1
     gm_lock_release sync && gm_lock_release instance || return 1
-    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_gc_run_one owner/repo result' _ "$ROOT" >"$RUN_ROOT/one" 2>&1 & first=$!
-    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_gc_run_one owner/repo result' _ "$ROOT" >"$RUN_ROOT/two" 2>&1 & second=$!
+    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo result' _ "$ROOT" >"$RUN_ROOT/one" 2>&1 & first=$!
+    bash -c 'source "$1/scripts/git-mirror-gc.sh"; gm_parse_repos owner/repo ""; gm_gc_run_one owner/repo result' _ "$ROOT" >"$RUN_ROOT/two" 2>&1 & second=$!
     wait "$first" || a=$?
     wait "$second" || b=$?
     [[ $a == 0 || $a == 75 ]] && [[ $b == 0 || $b == 75 ]] || return 1
@@ -78,7 +78,7 @@ if [[ " $* " == *' gc --auto '* ]]; then
         corrupt) rm -- "$GC_MISSING_OBJECT" ;;
         disk) printf 'fatal: No space left on device\n' >&2 ;;
         unknown) printf 'fatal: unexpected maintenance error\n' >&2 ;;
-        stopped) kill -TERM "$GC_SUPERVISOR"; sleep 0.2 ;;
+        stopped) kill -TERM "$GC_SUPERVISOR"; sleep 2 ;;
     esac
     exit 1
 fi
@@ -141,7 +141,9 @@ test_success_record_failure_is_unknown() (
     local dir now rc=0
     local -A calendar=() outcome=()
     fixture || return 1
-    eval "$(declare -f gm_gc_state_commit_locked | sed '1s/gm_gc_state_commit_locked/gc_original_commit/')"
+    local original
+    original=$(declare -f gm_gc_state_commit_locked)
+    eval "${original/gm_gc_state_commit_locked/gc_original_commit}"
     gm_gc_state_commit_locked() {
         local -n pending=$2
         [[ ${pending[last_result]} != SUCCESS ]] || return 1
@@ -237,8 +239,65 @@ test_state_rejects_invalid_data() (
     return 0
 )
 
-for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data; do
+test_operation_identity_matches_registration() (
+    local dir now original
+    local -A calendar=() outcome=()
+    fixture || return 1
+    original=$(declare -f gm_task_finish_locked)
+    eval "${original/gm_task_finish_locked/gc_original_finish}"
+    gm_task_finish_locked() {
+        local -n active=$1
+        local -A on_disk=()
+        gm_gc_state_read owner/repo on_disk || return 1
+        if [[ ${active[operation]} == gc ]]; then
+            [[ ${active[operation_id]} == "${on_disk[operation_id]}" ]] || printf mismatch > "$RUN_ROOT/mismatch"
+        fi
+        gc_original_finish "$@"
+    }
+    gm_gc_one_locked owner/repo "$now" outcome || return 1
+    [[ ! -e $RUN_ROOT/mismatch ]]
+)
+
+test_startup_unknown_blocks_sync() (
+    local dir now floor
+    local -A calendar=() outcome=()
+    fixture || return 1
+    calendar[status]=running calendar[last_result]=UNKNOWN calendar[not_before]=0 calendar[resumed_boot]=none
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    gm_startup_check_one owner/repo || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes && ${calendar[not_before]} -gt $now ]] || return 1
+    floor=${calendar[not_before]}
+    gm_startup_check_one owner/repo || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[not_before]} == "$floor" ]] || return 1
+    ! gm_gc_write_allowed owner/repo
+)
+
+test_task_cancel_recovers_without_freezing() (
+    local dir now rc=0
+    local -A calendar=() outcome=() state=()
+    fixture && install_failure stopped || return 1
+    export GC_SUPERVISOR=$BASHPID
+    trap 'gm_request_stop task TERM' TERM
+    gm_gc_one_locked owner/repo "$now" outcome || rc=$?
+    gm_repo_state_read owner/repo state || return 1
+    [[ $rc == 143 && ${state[health]} == healthy && ${state[published]} == yes && ! -e $RUN_ROOT/runtime/frozen ]]
+)
+
+test_gc_copy_identity_mismatch_blocks() (
+    local dir now rc=0
+    local -A calendar=() outcome=()
+    fixture || return 1
+    calendar[identity]=0-0
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    gm_gc_one_locked owner/repo "$now" outcome || rc=$?
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ $rc == 1 && ${outcome[result]} == BLOCKED && ${calendar[last_attempt_at]} == 0 ]]
+)
+
+for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=14 failures=%s\n' "$FAILURES"
+printf 'checks=18 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
