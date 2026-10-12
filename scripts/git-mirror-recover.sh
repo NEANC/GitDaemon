@@ -88,6 +88,7 @@ gm_startup_check_one() {
         state=([schema]=1 [repo]="$repo" [generation]=1 [desired]=present [observed]=ready [published]=no [message]=unchecked)
         gm_repo_state_commit_locked "$repo" state || return 1
     fi
+    gm_gc_startup_resume_locked "$repo" "$(date +%s)" || return 1
     gm_repo_check_locked "$repo" "$dir" checked || return $?
     [[ ${checked[health]} == healthy ]] || return 0
     gm_repo_state_read "$repo" state || return 1

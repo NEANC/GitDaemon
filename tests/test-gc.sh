@@ -352,8 +352,71 @@ test_cli_selection_and_due() (
     [[ ${calendar[last_attempt_at]} == 0 ]]
 )
 
-for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due; do
+test_gc_state_fault_boundaries() (
+    local dir now before rc=0
+    local -A calendar=() outcome=()
+    fixture || return 1
+    before=$(cat "$RUN_ROOT/state/gc/owner/repo.state")
+    calendar[reason]=environment
+    GM_STATE_TEST_FAULT=sync
+    gm_gc_state_commit_locked owner/repo calendar && return 1
+    [[ $(cat "$RUN_ROOT/state/gc/owner/repo.state") == "$before" ]] || return 1
+    GM_STATE_TEST_FAULT=directory-sync
+    gm_gc_state_commit_locked owner/repo calendar || rc=$?
+    [[ $rc == 2 && $GM_STATE_COMMIT_RESULT == indeterminate ]] || return 1
+    unset GM_STATE_TEST_FAULT
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[reason]} == environment ]]
+)
+
+test_block_commit_failure_freezes() (
+    local dir now original rc=0
+    local -A calendar=() outcome=()
+    fixture || return 1
+    printf retain > "$dir/gc.log"
+    gm_gc_state_commit_locked() { return 1; }
+    gm_gc_one_locked owner/repo "$now" outcome || rc=$?
+    [[ $rc == 1 && ${outcome[result]} == UNSAFE && -e $RUN_ROOT/runtime/frozen && ! -e $dir/git-daemon-export-ok ]] || return 1
+    [[ -n ${GM_LOCK_FDS[sync]-} && -n ${GM_LOCK_FDS[instance]-} ]]
+)
+
+test_offline_resume_once_online_due_only() (
+    local dir now floor
+    local -A calendar=() outcome=()
+    fixture || return 1
+    calendar[resumed_boot]=none
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    gm_startup_check_one owner/repo || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    floor=${calendar[not_before]}
+    [[ $floor -ge $now ]] || return 1
+    gm_gc_startup_resume_locked owner/repo "$((floor+86400))" || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[not_before]} == "$floor" ]] || return 1
+    gm_gc_one_locked owner/repo "$floor" outcome || return 1
+    [[ ${outcome[result]} == SUCCESS ]]
+)
+
+test_state_rejects_duplicates_links_and_permissions() (
+    local dir now file backup
+    local -A calendar=() outcome=()
+    fixture || return 1
+    file=$RUN_ROOT/state/gc/owner/repo.state
+    backup=$(cat "$file")
+    printf 'repo=owner/repo\n' >> "$file"
+    gm_gc_state_read owner/repo calendar && return 1
+    printf '%s\n' "$backup" > "$file"
+    chmod 666 "$file"
+    gm_gc_state_read owner/repo calendar && return 1
+    chmod 600 "$file"
+    mv "$file" "$file.saved"
+    ln -s "$file.saved" "$file"
+    gm_gc_state_read owner/repo calendar && return 1
+    return 0
+)
+
+for test in test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due test_gc_state_fault_boundaries test_block_commit_failure_freezes test_offline_resume_once_online_due_only test_state_rejects_duplicates_links_and_permissions; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=21 failures=%s\n' "$FAILURES"
+printf 'checks=25 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))

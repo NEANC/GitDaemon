@@ -304,6 +304,7 @@ gm_sync_one_locked() {
     done
     [[ $found == yes && -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} ]] || return 1
     [[ ${GM_LOCAL_FROZEN-} != yes && -z ${GM_STOP_SCOPE-} && ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
+    gm_gc_write_allowed "$repo" || return 1
     gm_repo_state_read "$repo" sync_state || return 1
     [[ ${sync_state[health]-} == healthy && ${sync_state[message]} != recovery_required && ${sync_state[desired]} == present ]] || return 1
     gm_validate_path "$dir" || return 1

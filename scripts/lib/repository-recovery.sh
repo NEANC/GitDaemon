@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lifecycle.sh" || return 1
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/gc-state.sh" || return 1
 
 # 将受管仓库及当前分支配置绑定为不含凭据的身份摘要。
 gm_repo_config_identity() {
@@ -123,6 +124,7 @@ gm_repo_publish_locked() {
     [[ ${publish_state[checked_config]-} == "$config" && ${publish_state[checked_identity]-} == "$identity" ]] || return 1
     marker=$dir/git-daemon-export-ok
     gm_validate_file "$marker" || return 1
+    gm_gc_publication_locked "$repo" "$generation" "$identity" || return 1
     gm_repo_note_publication_locked "$repo" "$boot" || return 1
     if ! (umask 077; : > "$marker") || ! gm_state_flush "$marker" || ! gm_state_flush "$dir"; then
         gm_repo_export_remove_locked "$repo" || return $?

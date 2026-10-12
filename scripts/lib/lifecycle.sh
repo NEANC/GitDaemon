@@ -127,9 +127,10 @@ gm_task_journal() {
 }
 
 gm_task_run_locked() {
-    local repo=$1 operation=$2 output=$3
+    local repo=$1 operation=$2 output=$3 supplied_operation_id
     shift 3
     local -n task=$output
+    supplied_operation_id=${task[requested_operation_id]-}
     task=([repo]="$repo" [operation]="$operation" [result]=BLOCKED)
     [[ ${GM_LOCAL_FROZEN-} != yes ]] || return 1
     [[ -n ${GM_LOCK_FDS[instance]-} && -n ${GM_LOCK_FDS[sync]-} && $# -gt 0 ]] || return 1
@@ -158,7 +159,12 @@ gm_task_run_locked() {
             return 1
         fi
     fi
-    IFS= read -r 'task[operation_id]' < /proc/sys/kernel/random/uuid || status=1
+    if [[ -n $supplied_operation_id ]]; then
+        [[ $supplied_operation_id =~ ^[a-f0-9-]{36}$ ]] || status=1
+        task[operation_id]=$supplied_operation_id
+    else
+        IFS= read -r 'task[operation_id]' < /proc/sys/kernel/random/uuid || status=1
+    fi
     gm_task_journal "$repo" "$operation" starting || status=1
     if (( status != 0 )); then gm_lock_release dispatch; return 1; fi
     directory=$(mktemp -d "$RUN_ROOT/runtime/task.XXXXXXXX") || { gm_lock_release dispatch; return 1; }
