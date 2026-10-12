@@ -92,7 +92,9 @@ test_resume_does_not_slide_retry() {
     [[ ${state[not_before]} == "$saved" ]] || return 1
     gm_gc_resume state "$saved" || return 1
     [[ ${state[not_before]} == "$saved" ]] || return 1
-    gm_gc_due state "$saved"
+    gm_gc_due state "$saved" || return 1
+    gm_gc_resume state "$(epoch '2026-02-12 12:00:00')" || return 1
+    [[ ${state[not_before]} == "$saved" ]]
 }
 
 test_unknown_retry_initialized_once() {
@@ -104,6 +106,7 @@ test_unknown_retry_initialized_once() {
     saved=$(epoch '2026-02-11 02:00:00')
     [[ ${state[not_before]} == "$saved" && ${state[next_due_date]} == 2026-01-15 ]] || return 1
     gm_gc_resume state "$(epoch '2026-02-10 23:00:00')" || return 1
+    gm_gc_resume state "$(epoch '2026-02-12 23:00:00')" || return 1
     [[ ${state[not_before]} == "$saved" && ${state[last_result]} == UNKNOWN ]]
 }
 
@@ -193,7 +196,7 @@ test_advance_is_strict_and_clears_retry() {
 
 test_invalid_input_keeps_state() {
     local -A state=([sentinel]=unchanged)
-    ! gm_gc_init 2026-02-30 UTC state || return 1
+    ! gm_gc_init 2026-02-30 UTC state 2>/dev/null || return 1
     ! gm_gc_init 2026-01-01 No/Such_Zone state || return 1
     [[ ${state[sentinel]} == unchanged ]] || return 1
     gm_gc_init 2026-01-25 UTC state || return 1
