@@ -3,24 +3,6 @@
 source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/git-mirror-sync.sh" || return 1
 source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/repository-recovery.sh" || return 1
 
-gm_startup_gate_validate() {
-    local boot pid start namespace extra current status=0
-    local -A owner=()
-    gm_validate_file "$RUN_ROOT/runtime/publication-gate" read || return 1
-    gm_validate_file "$RUN_ROOT/runtime/generation" read || return 1
-    read -r boot pid start namespace extra < "$RUN_ROOT/runtime/publication-gate" || return 1
-    [[ -z $extra && $boot =~ ^[a-f0-9-]{36}$ && $start =~ ^[0-9]+$ ]] || return 1
-    IFS= read -r current < "$RUN_ROOT/runtime/generation" || return 1
-    [[ $current == "$boot" ]] || return 1
-    gm_process_identity "$pid" owner || return 1
-    [[ ${owner[start]} == "$start" && ${owner[state]} != Z ]] || return 1
-    [[ $(readlink "/proc/$pid/ns/pid") == "$namespace" && $(readlink /proc/self/ns/pid) == "$namespace" ]] || return 1
-    (gm_lock_release container; gm_container_lease_acquire) >/dev/null 2>&1 || status=$?
-    [[ $status == 75 ]] || return 1
-    GM_BOOT_GENERATION=$boot
-    export GM_BOOT_GENERATION
-}
-
 # 启动扫描仅凭当前配置、管理记录与替换副本证据接受悬空别名。
 gm_startup_validate_link() {
     local path=$1 index

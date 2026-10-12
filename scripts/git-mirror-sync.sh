@@ -591,6 +591,7 @@ gm_sync_main() (
     source "$install/lib/repository-recovery.sh" || return 1
     gm_load_sync_credentials "${RUN_ROOT-/var/lib/git-daemon}" || return 1
     gm_begin_operation sync || return $?
+    gm_startup_gate_validate || return 1
     CONFIG_DIR=$RUN_ROOT/config
     MIRROR_ROOT=$RUN_ROOT/repos
     LOG_DIR=$RUN_ROOT/logs

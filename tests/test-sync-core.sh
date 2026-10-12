@@ -774,7 +774,7 @@ gm_sync_main_checks_dispatch_after_first_repo_result() {
     : > "$calls"
     gm_check_identity() { return 0; }
     gm_prepare_runtime() { return 0; }
-    gm_load_sync_credentials() { return 0; }
+    gm_load_sync_credentials() { gm_startup_gate_validate() { return 0; }; }
     gm_begin_operation() { return 0; }
     clear_proxy_environment() { return 0; }
     prepare_credentials() { return 0; }
@@ -985,7 +985,7 @@ test_single_repo_cli() {
     : > "$calls"
     gm_check_identity() { return 0; }
     gm_prepare_runtime() { return 0; }
-    gm_load_sync_credentials() { return 0; }
+    gm_load_sync_credentials() { gm_startup_gate_validate() { return 0; }; }
     clear_proxy_environment() { return 0; }
     prepare_credentials() { return 0; }
     load_resolve_args() { return 0; }

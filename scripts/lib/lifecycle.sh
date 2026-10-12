@@ -35,6 +35,25 @@ gm_container_lease_acquire() {
     GM_CONTAINER_OWNER=$BASHPID
 }
 
+# 校验活跃容器租约与发布门，将独立入口绑定到当前启动代次。
+gm_startup_gate_validate() {
+    local boot pid start namespace extra current status=0
+    local -A owner=()
+    gm_validate_file "$RUN_ROOT/runtime/publication-gate" read || return 1
+    gm_validate_file "$RUN_ROOT/runtime/generation" read || return 1
+    read -r boot pid start namespace extra < "$RUN_ROOT/runtime/publication-gate" || return 1
+    [[ -z $extra && $boot =~ ^[a-f0-9-]{36}$ && $start =~ ^[0-9]+$ ]] || return 1
+    IFS= read -r current < "$RUN_ROOT/runtime/generation" || return 1
+    [[ $current == "$boot" ]] || return 1
+    gm_process_identity "$pid" owner || return 1
+    [[ ${owner[start]} == "$start" && ${owner[state]} != Z ]] || return 1
+    [[ $(readlink "/proc/$pid/ns/pid") == "$namespace" && $(readlink /proc/self/ns/pid) == "$namespace" ]] || return 1
+    (gm_lock_release container; gm_container_lease_acquire) >/dev/null 2>&1 || status=$?
+    [[ $status == 75 ]] || return 1
+    GM_BOOT_GENERATION=$boot
+    export GM_BOOT_GENERATION
+}
+
 gm_without_container_lease() (
     gm_lock_release container || return 1
     "$@"

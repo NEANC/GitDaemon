@@ -203,7 +203,21 @@ test_check_failure_scope() {
     return 0
 }
 
-for test in test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop test_check_failure_scope; do
+# 独立 CLI 不继承启动代次，仍应验证活跃发布门后同步已检查的健康缓存。
+test_cli_sync_validates_live_generation() {
+    setup_startup cli-generation || return 1
+    local dir=$RUN_ROOT/repos/owner/first.git
+    git init -q --bare "$RUN_ROOT/upstream.git" || return 1
+    git --git-dir="$dir" remote add origin "$RUN_ROOT/upstream.git" || return 1
+    gm_startup_prepare && gm_startup_checks || return 1
+    gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first || return 1
+    [[ -f $dir/git-daemon-export-ok ]] || return 1
+    gm_lock_release container || return 1
+    gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first && return 1
+    return 0
+}
+
+for test in test_cli_sync_validates_live_generation test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop test_check_failure_scope; do
     CHECKS=$((CHECKS+1))
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
