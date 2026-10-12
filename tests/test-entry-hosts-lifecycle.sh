@@ -44,10 +44,22 @@ test_hosts_orphan() (
     [[ $alive == 1 && $status == 1 ]]
 )
 
+# 无法确认组身份时不得放行业务，也不得用等待 PID 猜测组号。
+test_hosts_unconfirmed() (
+    RUN_ROOT=$TEST_ROOT/unconfirmed
+    mkdir -p "$RUN_ROOT/runtime"
+    gm_task_freeze() { GM_LOCAL_FROZEN=yes; return 0; }
+    task_process_group() { sleep 0.2; return 1; }
+    local status=0
+    run_task_best_effort hosts bash -c 'printf written > "$1/written"; sleep 60' _ "$RUN_ROOT" || status=$?
+    [[ $status == 1 && ! -e $RUN_ROOT/written ]]
+)
+
 failures=0
 for mode in success failure; do
     test_hosts_stop "$mode" || failures=$((failures+1))
 done
 test_hosts_orphan || failures=$((failures+1))
+test_hosts_unconfirmed || failures=$((failures+1))
 printf 'hosts 生命周期失败：%s\n' "$failures"
 [[ $failures == 0 ]]

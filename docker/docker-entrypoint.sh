@@ -127,10 +127,16 @@ on_stop_signal() {
 # 失败仅告警不终止读取服务；收到停止后先确认组内子孙真实退出再返回，不把回收推给 PID1 退出后的内核清理。
 # 启动时即校验真实进程组 ID（不臆断 $! 等于 PGID），未确认到进程组时明确不声称回收。
 run_task_best_effort() {
-    local label=$1 status=0 pgid= unsafe=0 alive=0
+    local label=$1 status=0 pgid= unsafe=0 alive=0 directory gate start now
     shift
-    (if declare -F gm_lock_release >/dev/null; then gm_lock_release container; fi; exec setsid "$@") &
+    directory=$(mktemp -d "$RUN_ROOT/runtime/hosts.XXXXXXXX") || return 1
+    mkfifo -m 600 "$directory/gate" || return 1
+    exec {gate}<> "$directory/gate" || return 1
+    (if declare -F gm_lock_release >/dev/null; then gm_lock_release container; fi
+        exec setsid bash -c 'gate=$1; shift; IFS= read -r -t 2 token <&"$gate" || exit 1; exec {gate}>&-; [[ $token == GO ]] || exit 1; exec "$@"' _ "$gate" "$@") &
     GM_ENTRYPOINT_TASK=$!
+    local -A direct=() current=()
+    gm_process_identity "$GM_ENTRYPOINT_TASK" direct || true
     if pgid=$(task_process_group "$GM_ENTRYPOINT_TASK"); then
         GM_ENTRYPOINT_TASK_PGID=$pgid
     else
@@ -140,16 +146,27 @@ run_task_best_effort() {
     fi
     if [[ -z $pgid ]]; then
         gm_task_freeze || true
-        local -A direct=() pending=([wait_pid]="$GM_ENTRYPOINT_TASK" [result]=INTERRUPTED)
-        if gm_process_identity "$GM_ENTRYPOINT_TASK" direct && [[ ${direct[ppid]} == "$BASHPID" ]]; then
-            pending[wait_start]=${direct[start]}
-        fi
-        gm_task_finish_locked pending retain >/dev/null 2>&1 || true
+        exec {gate}>&-
+        gm_monotonic_ms start || return 1
+        while gm_process_identity "$GM_ENTRYPOINT_TASK" current && [[ ${current[state]} != Z ]]; do
+            [[ ${direct[start]-} == "${current[start]}" && ${current[ppid]} == "$BASHPID" ]] || return 1
+            kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+            gm_monotonic_ms now || return 1
+            (( now-start < 2000 )) || return 1
+            sleep 0.05
+        done
+        wait "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        rm -f "$directory/gate" && rmdir "$directory" || return 1
         return 1
     fi
+    if [[ $GM_ENTRYPOINT_STOP == 0 && ${GM_LOCAL_FROZEN-} != yes ]]; then
+        printf 'GO\n' >&"$gate" || unsafe=1
+    fi
+    exec {gate}>&-
+    rm -f "$directory/gate" && rmdir "$directory" || unsafe=1
     if [[ $GM_ENTRYPOINT_STOP == 0 ]]; then wait "$GM_ENTRYPOINT_TASK" || status=$?; fi
     gm_task_group_alive "$pgid" "$pgid" || alive=$?
-    if [[ $GM_ENTRYPOINT_STOP != 0 ]] || (( alive != 1 )); then
+    if [[ $GM_ENTRYPOINT_STOP != 0 ]] || (( alive != 1 || unsafe != 0 )); then
         if [[ $GM_ENTRYPOINT_STOP == 0 ]]; then unsafe=1; fi
         gm_task_freeze || unsafe=1
         wait_process_group_gone "$pgid" || return 1
