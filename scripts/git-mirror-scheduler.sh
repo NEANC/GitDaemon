@@ -153,9 +153,53 @@ gm_cron_next_trigger() {
 # 输出当前有效配置下需要调度的任务，每行一个；ENABLE_CRON=no 时不输出任何任务。
 gm_scheduler_plan() {
     if [[ ${GM_CONFIG[ENABLE_CRON]} != yes ]]; then return 0; fi
-    printf '%s\n' sync
+    printf '%s\n' recovery sync
     if [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]} == yes ]]; then printf '%s\n' hosts; fi
+    printf '%s\n' gc
     return 0
+}
+
+# 初始化种类轮转游标与按插入顺序去重的仓库队列。
+gm_scheduler_queue_init() {
+    declare -ga GM_SCHEDULE_KEYS=()
+    declare -gA GM_SCHEDULE_READY=()
+    declare -gA GM_SCHEDULE_COOLDOWN=()
+    GM_SCHEDULE_CURSOR=0
+}
+
+# 已排队条目保留原重查时刻，扫描不能缩短忙锁或故障延迟。
+gm_scheduler_enqueue() {
+    local key=$1:$2 ready=$3
+    if (( ${GM_SCHEDULE_COOLDOWN[$key]:-0} > ready )); then ready=${GM_SCHEDULE_COOLDOWN[$key]}; fi
+    if [[ ! ${GM_SCHEDULE_READY[$key]+present} ]]; then
+        GM_SCHEDULE_KEYS+=("$key")
+        GM_SCHEDULE_READY[$key]=$ready
+    fi
+    return 0
+}
+
+# 每次领取一个就绪仓库，同库恢复尚在队列时不领取写任务。
+gm_scheduler_take() {
+    local now=$1 step cursor kind key repo index
+    local -a kinds=(recovery sync hosts gc)
+    for ((step=0; step<4; step++)); do
+        cursor=$(((GM_SCHEDULE_CURSOR+step)%4))
+        kind=${kinds[$cursor]}
+        for index in "${!GM_SCHEDULE_KEYS[@]}"; do
+            key=${GM_SCHEDULE_KEYS[$index]}
+            [[ $key == "$kind:"* ]] || continue
+            (( ${GM_SCHEDULE_READY[$key]} <= now )) || continue
+            repo=${key#*:}
+            if [[ $kind == sync || $kind == gc ]]; then
+                [[ ! ${GM_SCHEDULE_READY[recovery:$repo]+present} ]] || continue
+            fi
+            GM_SCHEDULE_KIND=$kind GM_SCHEDULE_REPO=$repo
+            unset 'GM_SCHEDULE_KEYS[index]' 'GM_SCHEDULE_READY[$key]'
+            GM_SCHEDULE_CURSOR=$(((cursor+1)%4))
+            return 0
+        done
+    done
+    return 1
 }
 
 # 收到终止信号时置位停止标志，并定向终止当前任务进程组与休眠子进程，不遗留子进程；
@@ -261,7 +305,7 @@ gm_scheduler_run_task() {
     else
         gm_scheduler_log "$label 失败（退出码 $status），继续下一轮"
     fi
-    return 0
+    return "$status"
 }
 
 # 调度入口：校验实例配置后按 cron 计划运行既有同步与刷新入口；--check 只做启动前校验。
@@ -272,8 +316,68 @@ gm_scheduler_freeze() {
     gm_task_freeze
 }
 
+# 仓库入口自身监督写入组，调度器只向监督者请求取消并等待其收尾。
+gm_scheduler_run_entry() {
+    local status=0
+    "$@" &
+    GM_SCHEDULER_CHILD=$!
+    wait "$GM_SCHEDULER_CHILD" || status=$?
+    if (( GM_SCHEDULER_STOP != 0 )); then
+        gm_scheduler_freeze || return 1
+        kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
+        wait "$GM_SCHEDULER_CHILD" 2>/dev/null || true
+    fi
+    GM_SCHEDULER_CHILD=
+    return "$status"
+}
+
+# 失败只调整内存重查队列，绝不改写 GC 的持久重试下限。
+gm_scheduler_dispatch() {
+    local kind=$1 repo=$2 now=$3 status=0
+    case $kind in
+        hosts) gm_scheduler_run_task hosts "$INSTALL_ROOT/update-github-hosts.sh" || status=$? ;;
+        sync) gm_scheduler_run_entry "$INSTALL_ROOT/git-mirror-recover.sh" --repo "$repo" --sync || status=$? ;;
+        recovery) gm_scheduler_run_entry "$INSTALL_ROOT/git-mirror-recover.sh" --repo "$repo" || status=$? ;;
+        gc) gm_scheduler_run_entry "$INSTALL_ROOT/git-mirror-gc.sh" --repo "$repo" || status=$? ;;
+    esac
+    (( GM_SCHEDULER_STOP == 0 )) || return 1
+    now=$(date +%s) || return 1
+    if [[ $kind == recovery ]]; then GM_SCHEDULE_COOLDOWN[$kind:$repo]=$((now+60)); fi
+    if (( status == 75 )); then
+        GM_SCHEDULE_COOLDOWN[$kind:$repo]=$((now+5))
+        gm_scheduler_enqueue "$kind" "$repo" "$((now+5))"
+    elif (( status != 0 )); then
+        gm_scheduler_enqueue "$kind" "$repo" "$((now+60))"
+    fi
+    return 0
+}
+
+# 在线扫描只检查 due，不调用离线 resume；恢复条目先于同库写入。
+gm_scheduler_scan() {
+    local now=$1 repo
+    local -A state=() gc=()
+    for repo in "${GM_REPOS[@]}"; do
+        if [[ ! -e $RUN_ROOT/state/repos/$repo.state ]]; then
+            gm_scheduler_enqueue recovery "$repo" 0
+            continue
+        fi
+        gm_repo_state_read "$repo" state || return 1
+        if [[ ${state[health]-} != healthy ]]; then gm_scheduler_enqueue recovery "$repo" 0; fi
+        if [[ -e $RUN_ROOT/state/gc/$repo.state || -L $RUN_ROOT/state/gc/$repo.state ]]; then
+            gm_gc_state_read "$repo" gc || return 1
+            if [[ ${gc[write_blocked]} == yes || ${gc[status]} == running ]]; then
+                gm_scheduler_enqueue recovery "$repo" 0
+            else
+                gc[schedule_timezone]=${TZ:-UTC}
+                if gm_gc_due gc "$now"; then gm_scheduler_enqueue gc "$repo" 0; fi
+            fi
+        fi
+    done
+    return 0
+}
+
 gm_scheduler_main() {
-    local mode=run install now next next_sync next_hosts
+    local mode=run install now next_sync next_hosts repo
     case "${1-}" in
         --help|-h)
             printf '%s\n' '用法：git-mirror-scheduler.sh [--check]；运行配置来自 RUN_ROOT/config/mirror.env'
@@ -309,24 +413,31 @@ gm_scheduler_main() {
         gm_validate_cron "${GM_CONFIG[HOSTS_CRON]}" || { gm_error '配置值非法：HOSTS_CRON'; return 1; }
     fi
     trap gm_scheduler_on_stop_signal TERM INT
+    source "$install/lib/repository-recovery.sh" || return 1
+    gm_scheduler_queue_init
+    now=$(date +%s)
+    next_sync=$(gm_cron_next_trigger "${GM_CONFIG[CRON_SCHEDULE]}" "$now") || return 1
+    next_hosts=
+    if [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]} == yes ]]; then
+        next_hosts=$(gm_cron_next_trigger "${GM_CONFIG[HOSTS_CRON]}" "$now") || return 1
+    fi
     gm_scheduler_log "调度器启动；任务计划：$(gm_scheduler_plan | tr '\n' ' ')"
     while (( GM_SCHEDULER_STOP == 0 )); do
         now=$(date +%s)
-        next_sync=$(gm_cron_next_trigger "${GM_CONFIG[CRON_SCHEDULE]}" "$now") || return 1
-        next=$next_sync
-        next_hosts=
-        if [[ ${GM_CONFIG[ENABLE_HOSTS_UPDATE]} == yes ]]; then
+        [[ ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || return 1
+        if (( now >= next_sync )); then
+            for repo in "${GM_REPOS[@]}"; do gm_scheduler_enqueue sync "$repo" 0; done
+            next_sync=$(gm_cron_next_trigger "${GM_CONFIG[CRON_SCHEDULE]}" "$now") || return 1
+        fi
+        if [[ -n $next_hosts ]] && (( now >= next_hosts )); then
+            gm_scheduler_enqueue hosts instance 0
             next_hosts=$(gm_cron_next_trigger "${GM_CONFIG[HOSTS_CRON]}" "$now") || return 1
-            if (( next_hosts < next )); then next=$next_hosts; fi
         fi
-        if ! gm_scheduler_sleep_until "$next"; then break; fi
-        now=$(date +%s)
-        # 停止信号可能在上一任务执行期间到达，启动下一个到期任务前再次确认未停止。
-        if (( GM_SCHEDULER_STOP == 0 )) && [[ -n $next_hosts ]] && (( now >= next_hosts )); then
-            gm_scheduler_run_task '地址刷新' "$INSTALL_ROOT/update-github-hosts.sh"
-        fi
-        if (( GM_SCHEDULER_STOP == 0 )) && (( now >= next_sync )); then
-            gm_scheduler_run_task '仓库同步' "$INSTALL_ROOT/git-mirror-sync.sh"
+        gm_scheduler_scan "$now" || return 1
+        if gm_scheduler_take "$now"; then
+            gm_scheduler_dispatch "$GM_SCHEDULE_KIND" "$GM_SCHEDULE_REPO" "$now" || break
+        else
+            gm_scheduler_sleep_until "$((now+1))" || break
         fi
     done
     gm_scheduler_freeze || return 1

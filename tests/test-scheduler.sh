@@ -127,16 +127,17 @@ scheduler_switches() {
     [[ -z $(gm_scheduler_plan) ]] || return 1
     GM_CONFIG[ENABLE_CRON]=yes
     GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
-    [[ $(gm_scheduler_plan) == $'sync\nhosts' ]] || return 1
+    [[ $(gm_scheduler_plan) == $'recovery\nsync\nhosts\ngc' ]] || return 1
     GM_CONFIG[ENABLE_HOSTS_UPDATE]=no
-    [[ $(gm_scheduler_plan) == sync ]] || return 1
+    [[ $(gm_scheduler_plan) == $'recovery\nsync\ngc' ]] || return 1
     return 0
 }
 
 # 验证调度器复用既有交付入口，不含自建同步、下载或第二套锁实现。
 scheduler_reuses_entrypoints() {
     local script=$ROOT/scripts/git-mirror-scheduler.sh
-    grep -Fq 'git-mirror-sync.sh' "$script" || { printf '未复用同步入口\n'; return 1; }
+    grep -Fq 'git-mirror-recover.sh" --repo "$repo" --sync' "$script" || { printf '未复用受监督同步入口\n'; return 1; }
+    grep -Fq '/git-mirror-sync.sh' "$ROOT/scripts/git-mirror-recover.sh" || return 1
     grep -Fq 'update-github-hosts.sh' "$script" || { printf '未复用刷新入口\n'; return 1; }
     if grep -Eq 'git (fetch|init|remote|update-ref)|http\.curloptResolve|gm_hosts_download|curl ' "$script"; then
         printf '调度器不应自建同步或下载逻辑\n'
@@ -322,6 +323,119 @@ scheduler_check_rejects_never_triggering() {
     return 0
 }
 
+# 连续到期的同步逐库让出机会，同种类同仓库只排队一次。
+test_gc_fair_after_sync() {
+    require_function gm_scheduler_enqueue || return 1
+    require_function gm_scheduler_take || return 1
+    gm_scheduler_queue_init
+    gm_scheduler_enqueue sync a/one 0
+    gm_scheduler_enqueue sync a/two 0
+    gm_scheduler_enqueue sync a/one 0
+    gm_scheduler_enqueue gc a/one 0
+    gm_scheduler_take 100 || return 1
+    [[ $GM_SCHEDULE_KIND == sync && $GM_SCHEDULE_REPO == a/one ]] || return 1
+    gm_scheduler_take 100 || return 1
+    [[ $GM_SCHEDULE_KIND == gc ]] || return 1
+    gm_scheduler_take 100 || return 1
+    [[ $GM_SCHEDULE_KIND == sync && $GM_SCHEDULE_REPO == a/two ]] || return 1
+    ! gm_scheduler_take 100
+}
+
+# 恢复等待期间阻止同库写入，不阻止其他仓库与 hosts。
+test_recovery_before_same_repo_write() {
+    require_function gm_scheduler_enqueue || return 1
+    gm_scheduler_queue_init
+    gm_scheduler_enqueue sync a/one 0
+    gm_scheduler_enqueue gc a/one 0
+    gm_scheduler_enqueue recovery a/one 160
+    gm_scheduler_enqueue sync a/two 0
+    gm_scheduler_enqueue hosts instance 0
+    gm_scheduler_take 100 || return 1
+    [[ $GM_SCHEDULE_KIND == sync && $GM_SCHEDULE_REPO == a/two ]] || return 1
+    gm_scheduler_take 100 || return 1
+    [[ $GM_SCHEDULE_KIND == hosts ]] || return 1
+    ! gm_scheduler_take 159 || return 1
+    gm_scheduler_take 160 || return 1
+    [[ $GM_SCHEDULE_KIND == recovery && $GM_SCHEDULE_REPO == a/one ]]
+}
+
+# 禁用自动计划时没有 GC，启用时必须登记恢复与 GC。
+test_enable_cron_no_disables_gc() {
+    declare -A GM_CONFIG=([ENABLE_CRON]=no [ENABLE_HOSTS_UPDATE]=yes)
+    [[ -z $(gm_scheduler_plan) ]] || return 1
+    GM_CONFIG[ENABLE_CRON]=yes
+    [[ $(gm_scheduler_plan) == $'recovery\nsync\nhosts\ngc' ]]
+}
+
+# 派发返回忙锁按五秒重排，故障按六十秒重排且扫描不滑动下限。
+test_scheduler_retry_bounds() {
+    require_function gm_scheduler_dispatch || return 1
+    gm_scheduler_queue_init
+    INSTALL_ROOT=/fixture
+    GM_SCHEDULER_STOP=0
+    gm_scheduler_run_entry() { return 75; }
+    date() { printf '100\n'; }
+    gm_scheduler_dispatch gc a/one 100
+    [[ ${GM_SCHEDULE_READY[gc:a/one]} == 105 ]] || return 1
+    gm_scheduler_enqueue gc a/one 0
+    [[ ${GM_SCHEDULE_READY[gc:a/one]} == 105 ]] || return 1
+    gm_scheduler_run_entry() { return 1; }
+    gm_scheduler_dispatch recovery a/two 100
+    [[ ${GM_SCHEDULE_READY[recovery:a/two]} == 160 ]]
+}
+
+# 再次扫描发现持续阻塞时不能绕过上次完成后的六十秒复查间隔。
+test_recovery_recheck_after_completion() {
+    gm_scheduler_queue_init
+    GM_SCHEDULER_STOP=0 INSTALL_ROOT=/fixture
+    gm_scheduler_run_entry() { return 0; }
+    date() { printf '100\n'; }
+    gm_scheduler_dispatch recovery a/one 100 || return 1
+    gm_scheduler_enqueue recovery a/one 0
+    ! gm_scheduler_take 159 || return 1
+    gm_scheduler_take 160
+}
+
+# 长任务的失败重查以下次可派发时刻为基准，不使用过期的开始时间。
+test_retry_uses_completion_time() {
+    gm_scheduler_queue_init
+    GM_SCHEDULER_STOP=0 INSTALL_ROOT=/fixture
+    gm_scheduler_run_entry() { return 1; }
+    date() { printf '500\n'; }
+    gm_scheduler_dispatch recovery a/one 100 || return 1
+    [[ ${GM_SCHEDULE_READY[recovery:a/one]} == 560 ]]
+}
+
+# 在线扫描使用持久 due，保留未来下限并让恢复阻塞同库 GC。
+test_online_scan_preserves_not_before() (
+    source "$ROOT/scripts/lib/repository-recovery.sh"
+    local work now
+    work=$(mktemp -d) || return 1
+    trap 'rm -rf "$work"' EXIT
+    RUN_ROOT=$work
+    mkdir -p "$work/state/repos/a" "$work/state/gc/a"
+    printf fixture > "$work/state/repos/a/one.state"
+    printf fixture > "$work/state/gc/a/one.state"
+    GM_REPOS=(a/one)
+    gm_repo_state_read() { local -n target=$2; target=([health]=healthy); }
+    gm_gc_state_read() { local -n target=$2; target=([write_blocked]=no [status]=scheduled [schedule_timezone]=UTC [next_due_date]=2026-01-01 [not_before]=200); }
+    gm_gc_due() { local -n target=$1; (( $2 >= target[not_before] )); }
+    gm_gc_resume() { return 99; }
+    gm_scheduler_queue_init
+    gm_scheduler_scan 100 || return 1
+    ! gm_scheduler_take 100 || return 1
+    gm_scheduler_scan 200 || return 1
+    gm_scheduler_take 200 || return 1
+    [[ $GM_SCHEDULE_KIND == gc && $GM_SCHEDULE_REPO == a/one ]]
+)
+
+check 'test_online_scan_preserves_not_before' test_online_scan_preserves_not_before
+check 'test_retry_uses_completion_time' test_retry_uses_completion_time
+check 'test_recovery_recheck_after_completion' test_recovery_recheck_after_completion
+check 'test_scheduler_retry_bounds' test_scheduler_retry_bounds
+check 'test_gc_fair_after_sync' test_gc_fair_after_sync
+check 'test_recovery_before_same_repo_write' test_recovery_before_same_repo_write
+check 'test_enable_cron_no_disables_gc' test_enable_cron_no_disables_gc
 check 'cron 表达式接受合法形式' cron_accepts
 check 'cron 表达式拒绝非法形式' cron_rejects
 check 'cron 单字段匹配（通配/数值/列表/范围/步进/星期）' cron_field_matches

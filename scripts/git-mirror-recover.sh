@@ -113,6 +113,11 @@ gm_startup_run_repo() {
         fi
         if [[ ${startup_task[raw_status]-} == 2 ]]; then gm_task_freeze; return 2; fi
     fi
+    if [[ $operation == sync && ${startup_task[result]} == SUCCESS ]]; then
+        local -A convergence=()
+        gm_state_read_array "$RUN_ROOT/state/sync/$repo.state" "$repo" convergence || status=1
+        [[ ${convergence[message]-} == configuration_converged ]] || status=1
+    fi
     gm_lock_release sync && gm_lock_release instance || return 2
     [[ ! -e $RUN_ROOT/runtime/frozen ]] || return 2
     [[ -z ${GM_STOP_SCOPE-} ]] || return 1
@@ -176,8 +181,47 @@ gm_startup_network() {
     return 0
 }
 
+# 单库调度入口复用监督协议，恢复完成前不开始普通同步。
+gm_recover_scheduled() {
+    local repo=$1 mode=${2-recovery} status=0
+    local -A current=() pending=() outcome=()
+    gm_prepare_runtime "${RUN_ROOT-/var/lib/git-daemon}" "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return 1
+    gm_startup_gate_validate && gm_match_record "$RUN_ROOT/runtime/checks-complete" "$GM_BOOT_GENERATION" || return 1
+    gm_repo_config_identity "$repo" >/dev/null || return 1
+    trap 'gm_request_stop task TERM' TERM
+    trap 'gm_request_stop task INT' INT
+    if [[ -e $RUN_ROOT/state/repos/$repo.state ]]; then
+        gm_repo_state_read "$repo" current || return 1
+    fi
+    if [[ -d $RUN_ROOT/repos/$repo.git && ${current[health]-} != healthy && ${current[health]-} != corrupt ]]; then
+        gm_startup_run_repo "$repo" check || return $?
+        gm_repo_state_read "$repo" current || return 1
+    fi
+    if [[ ! -e $RUN_ROOT/repos/$repo.git || ${current[health]-} == corrupt ]]; then
+        gm_startup_run_repo "$repo" recovery || return $?
+    fi
+    if [[ -e $RUN_ROOT/state/gc/$repo.state ]]; then
+        gm_gc_state_read "$repo" pending || return 1
+        if [[ ${pending[write_blocked]} == yes || ${pending[status]} == running ]]; then
+            source "$INSTALL_ROOT/git-mirror-gc.sh" || return 1
+            gm_begin_operation sync || return $?
+            gm_gc_recover_locked "$repo" outcome || status=$?
+            [[ ${outcome[result]} != UNSAFE ]] || return 2
+            gm_lock_release sync && gm_lock_release instance || return 2
+            (( status == 0 )) || return "$status"
+            gm_gc_write_allowed "$repo" || return 1
+        fi
+    fi
+    gm_repo_state_read "$repo" current || return 1
+    [[ ${current[health]-} == healthy && -z ${GM_STOP_SCOPE-} ]] || return 1
+    if [[ $mode == sync ]]; then gm_startup_run_repo "$repo" sync; return $?; fi
+    return 0
+}
+
 gm_recover_main() {
     case "$#:${1-}" in
+        2:--repo) gm_recover_scheduled "$2" ;;
+        3:--repo) [[ $3 == --sync ]] || return 2; gm_recover_scheduled "$2" sync ;;
         1:--startup)
             [[ ${GM_CONTAINER_OWNER-} == "$BASHPID" && -n ${GM_LOCK_FDS[container]-} ]] || { gm_error '恢复仅允许有效容器启动上下文调用'; return 1; }
             gm_startup_checks ;;
@@ -196,6 +240,24 @@ gm_recover_main() {
             case "$operation" in
                 check) gm_startup_check_one "$repo" ;;
                 recovery) gm_startup_network_one "$repo" ;;
+                sync)
+                    gm_load_sync_credentials "$RUN_ROOT" || return 1
+                    LOG_FILE=$RUN_ROOT/logs/sync.log
+                    clear_proxy_environment && prepare_credentials && load_resolve_args "$RUN_ROOT/hosts/github-hosts.snapshot" && build_transport_sequence || return 1
+                    local index sync_status=0
+                    local -A synced=()
+                    for index in "${!GM_REPOS[@]}"; do
+                        if [[ ${GM_REPOS[$index]} == "$repo" ]]; then
+                            gm_sync_one_locked "$repo" "${GM_BRANCHES[$index]}" synced || sync_status=$?
+                            if (( sync_status != 0 )); then
+                                if [[ ${synced[transport_only]-} == yes ]]; then return 0; fi
+                                return "$sync_status"
+                            fi
+                            gm_publish_short_links "$RUN_ROOT" "$repo"
+                            return $?
+                        fi
+                    done
+                    return 1 ;;
                 *) return 2 ;;
             esac ;;
         *) gm_error '用法：git-mirror-recover.sh --startup'; return 2 ;;
