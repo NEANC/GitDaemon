@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+command="${INSTALL_ROOT:?必须提供独立程序安装路径}/git-mirror-gc.sh"
+command_background=true
+start_inactive=yes
+pidfile="${XDG_RUNTIME_DIR:?必须提供实例运行目录}/git-mirror-gc.pid"
+retry="TERM/20"
+
+# 单次进程结束后撤销服务状态，下一次 start 重新执行到期检查。
+start_post() {
+    local pid
+    if [ -r "$pidfile" ]; then
+        read -r pid < "$pidfile" || return 1
+        while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+    fi
+    mark_service_stopped
+    return 0
+}

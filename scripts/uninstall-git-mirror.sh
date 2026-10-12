@@ -118,6 +118,9 @@ gm_uninstall_main() (
     if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
         gm_stop_instance_service git-mirror-scheduler || return 1
     fi
+    if [[ $GM_GC_CAPABILITY == present ]]; then
+        gm_stop_instance_service git-mirror-gc || return 1
+    fi
     gm_stop_instance_service git-mirror-sync || return 1
     gm_stop_instance_service git-mirror-hosts || return 1
     # 全部写入操作持有 instance 共享锁，卸载按固定顺序独占三把锁。
@@ -147,6 +150,7 @@ gm_uninstall_main() (
         esac
     done
     printf '%s\n' '实例已停止；仅清理显式选择的类别，程序、安装记录和锁目录保留。'
+    printf '保留恢复数据：%s/state、%s/staging、%s/quarantine；清理需另行确认。\n' "$run" "$run" "$run"
     return 0
 )
 

@@ -76,6 +76,12 @@ source() {
         gm_check_private_directory() { return 0; }
         flock() { return 0; }
     fi
+    if [[ ${1-} == "$INSTALL_ROOT/git-mirror-recover.sh" ]]; then
+        gm_startup_gate_validate() { return 0; }
+    fi
+    if [[ ${1-} == "$INSTALL_ROOT/lib/repository-recovery.sh" ]]; then
+        sync_repo() { git config-boundary; }
+    fi
     return 0
 }
 # 截获最终 Git 执行；保留真实生产入口构造的 argv，不启动监听进程。
@@ -355,6 +361,25 @@ filtered_environment_configuration() {
     daemon_configuration environment
 }
 
+# 单次服务执行后清除 started 标记，停止仅交给当前 GC 监督者。
+test_gc_oneshot_stop_is_task_scope() {
+    local work=$TEST_ROOT/gc-service
+    mkdir -p "$work" || return 1
+    export INSTALL_ROOT=$work XDG_RUNTIME_DIR=$work
+    [[ -f $ROOT/scripts/openrc/git-mirror-gc ]] || return 1
+    source "$ROOT/scripts/openrc/git-mirror-gc" || return 1
+    [[ $command == "$work/git-mirror-gc.sh" && $command_background == true ]] || return 1
+    [[ $pidfile == "$work/git-mirror-gc.pid" ]] || return 1
+    declare -F start_post >/dev/null || return 1
+    service_started() { return 0; }
+    mark_service_stopped() { printf 'stopped\n' >> "$work/marks"; }
+    start_post || return 1
+    start_post || return 1
+    [[ $(<"$work/marks") == $'stopped\nstopped' ]] || return 1
+    ! grep -Eq 'freeze|request_stop instance|git-mirror-scheduler' "$ROOT/scripts/openrc/git-mirror-gc"
+}
+
+check 'test_gc_oneshot_stop_is_task_scope' test_gc_oneshot_stop_is_task_scope
 check 'OpenRC 白名单过滤后环境优先且不回写' filtered_environment_configuration
 check '同步交付入口使用文件时区（外部边界桩）' worker_configuration git-mirror-sync
 check '刷新交付入口使用文件 URL 与时区（外部边界桩）' worker_configuration git-mirror-hosts

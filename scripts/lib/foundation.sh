@@ -610,7 +610,7 @@ gm_validate_instance_paths() {
     [[ $run != "$install" && $run != "$install/"* && $install != "$run/"* ]] || {
         gm_error '程序根与运行根必须相互独立'; return 1;
     }
-    for directory in repos config secrets home hosts logs runtime cache tmp state state/repos state/operations; do
+    for directory in repos config secrets home hosts logs runtime cache tmp state state/repos state/operations state/gc state/sync state/replacements staging quarantine; do
         gm_validate_path "$run/$directory" || return 1
     done
     gm_validate_file "$run/config/mirror.env" || return 1
@@ -653,15 +653,21 @@ gm_load_service_capabilities() {
     [[ -e $file || -L $file ]] || { gm_error '缺少安装服务能力记录'; return 1; }
     gm_validate_file "$file" read || return 1
     content=$(<"$file")
+    GM_GC_CAPABILITY=absent
     case "$content" in
         $'FORMAT=1\nSCHEDULER=absent') GM_SCHEDULER_CAPABILITY=absent ;;
         $'FORMAT=1\nSCHEDULER=present') GM_SCHEDULER_CAPABILITY=present ;;
+        $'FORMAT=2\nSCHEDULER=present\nGC=present') GM_SCHEDULER_CAPABILITY=present GM_GC_CAPABILITY=present ;;
         *) gm_error '安装服务能力记录格式非法'; return 1 ;;
     esac
     if [[ $GM_SCHEDULER_CAPABILITY == present ]]; then
         [[ -f $install/openrc/git-mirror-scheduler ]] || { gm_error '已登记调度服务定义缺失'; return 1; }
         gm_validate_file "$install/openrc/git-mirror-scheduler" read || return 1
         [[ -x $install/openrc/git-mirror-scheduler ]] || { gm_error '已登记调度服务定义不可执行'; return 1; }
+    fi
+    if [[ $GM_GC_CAPABILITY == present ]]; then
+        gm_validate_file "$install/openrc/git-mirror-gc" read || return 1
+        [[ -x $install/openrc/git-mirror-gc ]] || { gm_error '已登记 GC 服务定义缺失或不可执行'; return 1; }
     fi
     return 0
 }
@@ -850,7 +856,7 @@ gm_ensure_instance_rc_conf() {
 # 在实例 XDG 配置目录内以符号链接登记交付服务定义，重复登记幂等且不覆盖异常对象。
 gm_register_instance_services() {
     local run=$1 install=$2 service link target actual
-    local -a services=(git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler)
+    local -a services=(git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler git-mirror-gc)
     for service in "${services[@]}"; do
         gm_validate_file "$install/openrc/$service" read || return 1
         [[ -f $install/openrc/$service && -x $install/openrc/$service ]] || { gm_error '实例服务定义缺失'; return 1; }
@@ -888,7 +894,7 @@ gm_instance_default_runlevel_has_delivered_service() {
         done < "$file"
     done
     for level in boot "$default"; do
-        for service in git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler; do
+        for service in git-daemon git-mirror-sync git-mirror-hosts git-mirror-scheduler git-mirror-gc; do
             [[ -e $base/runlevels/$level/$service || -L $base/runlevels/$level/$service ]] && return 0
         done
     done
@@ -957,7 +963,7 @@ gm_confirm_service_stopped() {
 # 仅控制实例内已登记的用户服务，未登记或不可解析时不伪报已停止。
 gm_stop_instance_service() {
     local service=$1 path
-    case "$service" in git-mirror-scheduler|git-mirror-sync|git-mirror-hosts|git-daemon) ;;
+    case "$service" in git-mirror-scheduler|git-mirror-sync|git-mirror-hosts|git-mirror-gc|git-daemon) ;;
         *) gm_error '不支持的实例服务'; return 1 ;;
     esac
     path=$INSTALL_ROOT/openrc/$service

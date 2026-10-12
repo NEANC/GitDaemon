@@ -730,8 +730,8 @@ uninstall_behavior() {
                     [[ ! -e $work/services && ! -e $work/locks ]] || exit 1
                 else
                     local expected_services="--user git-mirror-scheduler stop"$'\n' expected_service
-                    [[ $(<"$work/program/service-capabilities.conf") == $'FORMAT=1\nSCHEDULER=present' ]] || exit 1
-                    for expected_service in git-mirror-sync git-mirror-hosts git-daemon; do
+                    [[ $(<"$work/program/service-capabilities.conf") == $'FORMAT=2\nSCHEDULER=present\nGC=present' ]] || exit 1
+                    for expected_service in git-mirror-gc git-mirror-sync git-mirror-hosts git-daemon; do
                         expected_services+="--user $expected_service stop"$'\n'
                     done
                     [[ -f $work/services && $(<"$work/services") == "${expected_services%$'\n'}" ]] || exit 1
@@ -791,7 +791,7 @@ uninstall_behavior() {
                         [[ $(<"$work/services") == "--user git-mirror-scheduler stop" && ! -e $work/locks ]] || exit 1
                         ;;
                     busy|lock-error)
-                        expected_services="--user git-mirror-scheduler stop"$'\n'"--user git-mirror-sync stop"$'\n'"--user git-mirror-hosts stop"
+                        expected_services="--user git-mirror-scheduler stop"$'\n'"--user git-mirror-gc stop"$'\n'"--user git-mirror-sync stop"$'\n'"--user git-mirror-hosts stop"
                         [[ $(<"$work/services") == "$expected_services" ]] || exit 1
                         local -a lock_calls=()
                         mapfile -t lock_calls < "$work/locks"
@@ -876,7 +876,7 @@ managed_link_cleanup() {
     [[ -f $work/instance/config/mirror.env && -f $work/instance/config/installation.conf ]] || return 1
     [[ -f $work/program/installation.conf ]] || return 1
     if [[ $scenario == valid ]]; then
-        expected=$'stop git-mirror-scheduler\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon'
+        expected=$'stop git-mirror-scheduler\nstop git-mirror-gc\nstop git-mirror-sync\nstop git-mirror-hosts\nlock instance exclusive\nlock sync exclusive\nlock hosts exclusive\nstop git-daemon'
         [[ $status == 0 && ! -e $work/instance/repos && ! -L $work/instance/repos ]] || {
             printf '合法受管理相对链接必须允许分类删除：status=%s\n%s\n' "$status" "$output"
             return 1

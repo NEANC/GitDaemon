@@ -102,6 +102,87 @@ service_uses_read_boundary() {
     gm_stop_instance_service git-daemon
 }
 
+# 初始化只增加缺失目录，程序层及已有数据均不可覆盖。
+test_upgrade_preserves_volume_state() {
+    source "$ROOT/scripts/deploy-git-mirror.sh"
+    local work=$TEST_ROOT/upgrade name
+    gm_check_platform() { return 0; }
+    gm_bootstrap_user_runlevel() { return 0; }
+    mkdir -p "$work" || return 1
+    gm_deploy_main --install --install-root "$work/install" || return 1
+    for name in git-mirror-gc.sh lib/gc-state.sh lib/gc-schedule.sh openrc/git-mirror-gc; do
+        [[ -x $work/install/$name ]] || return 1
+    done
+    export REPOS=a/one SHORT_LINKS=
+    gm_deploy_main --init --install-root "$work/install" --run-root "$work/run" || return 1
+    printf 'TZ=UTC\n' > "$work/run/config/mirror.env"
+    for name in state staging quarantine; do
+        [[ -d $work/run/$name ]] || return 1
+        printf '%s\n' "$name" > "$work/run/$name/sentinel"
+    done
+    gm_deploy_main --init --install-root "$work/install" --run-root "$work/run" || return 1
+    [[ $(<"$work/run/config/mirror.env") == TZ=UTC ]] || return 1
+    for name in state staging quarantine; do [[ $(<"$work/run/$name/sentinel") == "$name" ]] || return 1; done
+    gm_load_service_capabilities "$work/install" || return 1
+    [[ $GM_GC_CAPABILITY == present ]]
+}
+
+# 显式删除仓库不得连带删除恢复数据，并向操作者说明保留项。
+test_uninstall_does_not_expand_deletion() {
+    source "$ROOT/scripts/deploy-git-mirror.sh"
+    local work=$TEST_ROOT/uninstall name output
+    gm_check_platform() { return 0; }
+    gm_bootstrap_user_runlevel() { return 0; }
+    mkdir -p "$work" || return 1
+    gm_deploy_main --install --install-root "$work/install" || return 1
+    export REPOS=a/one SHORT_LINKS=
+    gm_deploy_main --init --install-root "$work/install" --run-root "$work/run" || return 1
+    for name in state staging quarantine; do
+        mkdir -p "$work/run/$name"
+        printf '%s\n' "$name" > "$work/run/$name/sentinel"
+    done
+    source "$work/install/uninstall-git-mirror.sh"
+    gm_check_platform() { return 0; }
+    rc-service() { return 0; }
+    output=$(gm_uninstall_main --run-root "$work/run" --delete-repos --yes) || return 1
+    [[ ! -e $work/run/repos ]] || return 1
+    for name in state staging quarantine; do
+        [[ $(<"$work/run/$name/sentinel") == "$name" && $output == *"$name"* ]] || return 1
+    done
+    [[ $output == *另行确认* ]]
+}
+
+# 未知状态格式不得通过初始化，明确旧版迁移必须保持周期字段。
+test_upgrade_schema_contract() {
+    source "$ROOT/scripts/deploy-git-mirror.sh"
+    source "$ROOT/scripts/lib/repository-recovery.sh"
+    local work=$TEST_ROOT/schema status=0
+    local -A calendar=()
+    gm_check_platform() { return 0; }
+    gm_bootstrap_user_runlevel() { return 0; }
+    mkdir -p "$work" || return 1
+    gm_deploy_main --install --install-root "$work/install" || return 1
+    export REPOS=a/one SHORT_LINKS=
+    gm_deploy_main --init --install-root "$work/install" --run-root "$work/run" || return 1
+    mkdir -p "$work/run/state/gc/a"
+    printf 'schema=999\nrepo=a/one\n' > "$work/run/state/gc/a/one.state"
+    gm_deploy_main --init --install-root "$work/install" --run-root "$work/run" >/dev/null 2>&1 || status=$?
+    [[ $status != 0 && $(<"$work/run/state/gc/a/one.state") == $'schema=999\nrepo=a/one' ]] || return 1
+    gm_gc_init 2026-01-01 UTC calendar || return 1
+    calendar[schema]=1 calendar[repo]=a/one calendar[generation]=1 calendar[identity]=1-2
+    calendar[operation_id]=none calendar[reason]=none calendar[write_blocked]=no calendar[resumed_boot]=none calendar[log]=none
+    : > "$work/run/state/gc/a/one.state"
+    local key
+    for key in "${!calendar[@]}"; do printf '%s=%s\n' "$key" "${calendar[$key]}" >> "$work/run/state/gc/a/one.state"; done
+    gm_deploy_main --init --install-root "$work/install" --run-root "$work/run" || return 1
+    grep -qx schema=2 "$work/run/state/gc/a/one.state" || return 1
+    gm_gc_state_read a/one calendar || return 1
+    [[ ${calendar[anchor_date]} == 2026-01-01 && ${calendar[next_due_date]} == 2026-01-15 && ${calendar[failed_identity]} == none ]]
+}
+
+check 'test_upgrade_schema_contract' test_upgrade_schema_contract
+check 'test_upgrade_preserves_volume_state' test_upgrade_preserves_volume_state
+check 'test_uninstall_does_not_expand_deletion' test_uninstall_does_not_expand_deletion
 check '读取模式拒绝缺失的安装目录' read_missing_directory_rejected
 check '读取模式拒绝缺失的安装记录' read_missing_file_rejected
 check '路径与文件检查拒绝未知访问模式' invalid_mode_rejected

@@ -9,14 +9,15 @@ usage() {
         '安装：deploy-git-mirror.sh --install --install-root /调用者拥有的程序目录' \
         '初始化：deploy-git-mirror.sh --init --install-root /程序目录 [--run-root /var/lib/git-daemon]' \
         '恢复：deploy-git-mirror.sh --resume --install-root /程序目录 [--run-root /var/lib/git-daemon]' \
-        '恢复仅解除停止标记，不启动服务；普通初始化保留停止意图。' \
+        '恢复必须重启容器完成启动检查；普通初始化保留停止意图。' \
+        '升级请构建新镜像、重建容器并复用原命名卷；不要覆盖旧安装层。' \
         '安装无需 REPOS，不读取运行凭据；初始化和恢复的 REPOS/SHORT_LINKS 仅来自环境。'
 }
 
 # 安装固定程序文件；对已有不同内容明确失败，不覆盖用户文件。
 gm_install_program() {
     local install=$1 source_root=$2 file directory record
-    local -a files=(deploy-git-mirror.sh uninstall-git-mirror.sh git-daemon-config.sh git-mirror-sync.sh git-mirror-recover.sh git-mirror-scheduler.sh update-github-hosts.sh lib/foundation.sh lib/repository-state.sh lib/lifecycle.sh lib/repository-recovery.sh openrc/git-daemon openrc/git-mirror-sync openrc/git-mirror-hosts openrc/git-mirror-scheduler)
+    local -a files=(deploy-git-mirror.sh uninstall-git-mirror.sh git-daemon-config.sh git-mirror-sync.sh git-mirror-recover.sh git-mirror-gc.sh git-mirror-scheduler.sh update-github-hosts.sh lib/foundation.sh lib/repository-state.sh lib/lifecycle.sh lib/repository-recovery.sh lib/gc-schedule.sh lib/gc-state.sh openrc/git-daemon openrc/git-mirror-sync openrc/git-mirror-hosts openrc/git-mirror-scheduler openrc/git-mirror-gc)
     [[ $install != "${HOME:-/}" ]] || { gm_error '不能将用户 HOME 作为安装根'; return 1; }
     gm_validate_path "$install" || return 1
     for directory in lib openrc; do gm_validate_path "$install/$directory" || return 1; done
@@ -34,7 +35,7 @@ gm_install_program() {
     fi
     gm_validate_file "$install/service-capabilities.conf" || return 1
     if [[ -e $install/service-capabilities.conf ]]; then
-        gm_match_record "$install/service-capabilities.conf" $'FORMAT=1\nSCHEDULER=present' || return 1
+        gm_match_record "$install/service-capabilities.conf" $'FORMAT=2\nSCHEDULER=present\nGC=present' || return 1
     fi
     (umask 077; mkdir -p -- "$install/lib" "$install/openrc") || return 1
     for file in "${files[@]}"; do
@@ -44,9 +45,27 @@ gm_install_program() {
         fi
     done
     gm_create_data_file "$install/installation.conf" "$record" || return 1
-    gm_create_data_file "$install/service-capabilities.conf" $'FORMAT=1\nSCHEDULER=present' || return 1
+    gm_create_data_file "$install/service-capabilities.conf" $'FORMAT=2\nSCHEDULER=present\nGC=present' || return 1
     printf '程序安装位置：%s\n' "$install"
 }
+
+# 先校验全部 GC 记录，再仅迁移明确的旧 schema；不改周期与失败证据。
+gm_migrate_gc_state() (
+    local file repo
+    local -A migration=()
+    local -a legacy=()
+    shopt -s nullglob dotglob
+    for file in "$RUN_ROOT/state/gc"/*/*.state; do
+        repo=${file#"$RUN_ROOT/state/gc/"}
+        repo=${repo%.state}
+        gm_gc_state_read "$repo" migration || return 1
+        if grep -qx 'schema=1' "$file"; then legacy+=("$repo"); fi
+    done
+    for repo in "${legacy[@]}"; do
+        gm_gc_state_read "$repo" migration && gm_gc_state_commit_locked "$repo" migration || return 1
+    done
+    return 0
+)
 
 # 初始化缺失的实例文件，验证现存记录并保留已有配置和数据。
 gm_initialize_instance() {
@@ -84,8 +103,11 @@ gm_initialize_instance() {
         if [[ -e $run/config/installation.conf ]]; then
             gm_match_record "$run/config/installation.conf" "$record" || exit 1
         fi
+        source "$install/lib/repository-state.sh" || exit 1
+        source "$install/lib/gc-state.sh" || exit 1
+        gm_migrate_gc_state || exit 1
         gm_load_config "$run/config/mirror.env" || exit 1
-        for directory in repos config secrets home hosts logs runtime cache tmp state state/repos state/operations; do
+        for directory in repos config secrets home hosts logs runtime cache tmp state state/repos state/operations state/gc state/sync state/replacements staging quarantine; do
             (umask 077; mkdir -p -- "$run/$directory") || exit 1
         done
         gm_create_data_file "$run/config/mirror.env" '# 固定允许键的 KEY=VALUE 纯数据配置；环境参数不自动回写。' || exit 1
