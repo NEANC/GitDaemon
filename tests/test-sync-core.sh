@@ -1124,6 +1124,19 @@ test_fetch_success_with_maintenance_error() {
     [[ ${result[stage]} == maintenance && ${saved[health]} == recovery_required && ! -e $DIR/git-daemon-export-ok ]]
 }
 
+# HTTP 503 仅在纯传输诊断时保留健康缓存，混合本地错误仍失败关闭。
+test_http_503_classification() {
+    local text="fatal: unable to access 'https://github.com/owner/repo.git/': The requested URL returned error: 503"
+    local -A result=()
+    gm_sync_classify_failure fetch "$text" result || return 1
+    [[ ${result[transport_only]} == yes ]] || return 1
+    gm_sync_classify_failure fetch "$text"$'\nerror: unable to write object' result || return 1
+    [[ ${result[transport_only]} == no ]] || return 1
+    gm_sync_classify_failure maintenance "$text" result || return 1
+    [[ ${result[transport_only]} == no ]]
+}
+
+check 'test_http_503_classification' test_http_503_classification
 check 'test_fetch_failed_refs_succeed' test_fetch_failed_refs_succeed
 check 'test_fetch_success_maintenance_error' test_fetch_success_with_maintenance_error 'error: automatic maintenance failed'
 check 'test_fetch_success_maintenance_warning' test_fetch_success_with_maintenance_error 'warning: gc failed'
