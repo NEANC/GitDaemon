@@ -256,6 +256,13 @@ supervise_loop() {
     return 0
 }
 
+# 在编排边界持久化停止意图，冻结失败保留非零退出。
+entry_checkpoint() {
+    if [[ $GM_ENTRYPOINT_STOP == 0 && ${GM_STOP_SCOPE-} != instance && ${GM_LOCAL_FROZEN-} != yes ]]; then return 0; fi
+    gm_task_freeze || return 1
+    return 130
+}
+
 # 主流程：身份预检 → 环境准备 → 交付 CLI 初始化命名卷 → 首次刷新/同步 → 启动并监督服务。
 main() {
     local scheduler_supervised=no status=0
@@ -272,27 +279,39 @@ main() {
     trap on_stop_signal TERM INT
     # 程序层已于构建期由交付安装器烘焙为只读；运行期只做实例初始化与恢复，避免只读根下写模式校验失败。
     log '初始化命名卷内实例'
+    entry_checkpoint || return $?
     gm_without_container_lease "$INSTALL_ROOT/deploy-git-mirror.sh" --init --install-root "$INSTALL_ROOT" --run-root "$RUN_ROOT" || die '实例初始化失败'
+    entry_checkpoint || return $?
     gm_prepare_runtime "$RUN_ROOT" "$INSTALL_ROOT" || return 1
-    [[ $GM_ENTRYPOINT_STOP == 0 ]] || return 0
+    entry_checkpoint || return $?
     gm_startup_prepare || die '关闭旧发布或重放失败'
     log '启动 git-daemon'
+    entry_checkpoint || return $?
     reset_stale_service_state git-daemon
+    entry_checkpoint || return $?
     gm_without_container_lease rc-service --user git-daemon start || die 'git-daemon 启动失败'
+    entry_checkpoint || return $?
     confirm_daemon_listening || die 'git-daemon 启动后未真实监听，容器退出'
+    entry_checkpoint || return $?
     gm_recover_main --startup || return 1
+    entry_checkpoint || return $?
     run_task_best_effort '首次地址刷新' "$INSTALL_ROOT/update-github-hosts.sh" || return $?
+    entry_checkpoint || return $?
     gm_startup_network || return 1
-    [[ $GM_ENTRYPOINT_STOP == 0 ]] || return 0
+    entry_checkpoint || return $?
     if scheduler_enabled; then
         log '启动调度服务'
+        entry_checkpoint || return $?
         reset_stale_service_state git-mirror-scheduler
+        entry_checkpoint || return $?
         gm_without_container_lease rc-service --user git-mirror-scheduler start || die '调度服务启动失败'
+        entry_checkpoint || return $?
         scheduler_supervised=yes
     else
         log 'ENABLE_CRON=no，按配置不启动调度服务；首次刷新与首次同步已执行'
     fi
     log '容器前台就绪'
+    entry_checkpoint || return $?
     supervise_loop "$scheduler_supervised" || status=$?
     log '收到停止信号，停止服务并回收子进程'
     return "$status"

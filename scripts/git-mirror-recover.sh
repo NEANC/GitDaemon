@@ -35,6 +35,7 @@ gm_startup_validate_link() {
 }
 
 gm_startup_prepare() {
+    [[ -z ${GM_STOP_SCOPE-} && ${GM_LOCAL_FROZEN-} != yes ]] || return 1
     [[ ${GM_CONTAINER_OWNER-} == "$BASHPID" && -n ${GM_LOCK_FDS[container]-} && -z ${GM_BOOT_GENERATION-} ]] || return 1
     local path listing repo status=0
     local -A owner=() replay_outcome=()
@@ -63,12 +64,19 @@ gm_startup_prepare() {
     (( status == 0 )) || return 1
     gm_container_begin || return 1
     for repo in "${GM_REPOS[@]}"; do
+        [[ -z ${GM_STOP_SCOPE-} && ${GM_LOCAL_FROZEN-} != yes ]] || return 1
         if [[ -e $RUN_ROOT/state/replacements/$repo.state || -L $RUN_ROOT/state/replacements/$repo.state ]]; then
             gm_repo_replay_locked "$repo" replay_outcome || return 1
         fi
     done
     gm_process_identity "$BASHPID" owner || return 1
+    [[ -z ${GM_STOP_SCOPE-} && ${GM_LOCAL_FROZEN-} != yes ]] || return 1
     gm_lifecycle_record "$RUN_ROOT/runtime/publication-gate" "$GM_BOOT_GENERATION $BASHPID ${owner[start]} $(readlink /proc/self/ns/pid)" || return 1
+    if [[ -n ${GM_STOP_SCOPE-} || ${GM_LOCAL_FROZEN-} == yes ]]; then
+        rm -f -- "$RUN_ROOT/runtime/publication-gate" || return 1
+        gm_task_freeze || return 1
+        return 1
+    fi
     gm_lock_release sync && gm_lock_release instance
 }
 

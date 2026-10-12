@@ -41,6 +41,7 @@ gm_without_container_lease() (
 )
 
 gm_container_begin() {
+    [[ -z ${GM_STOP_SCOPE-} && ${GM_LOCAL_FROZEN-} != yes ]] || return 1
     [[ ${GM_CONTAINER_OWNER-} == "$BASHPID" && -n ${GM_LOCK_FDS[container]-} && -z ${GM_BOOT_GENERATION-} ]] || return 1
     local -A owner=()
     gm_process_identity "$BASHPID" owner || return 1
@@ -48,11 +49,13 @@ gm_container_begin() {
     gm_lock_acquire dispatch exclusive || return $?
     local status=0
     gm_lifecycle_record "$RUN_ROOT/runtime/generation" "$GM_BOOT_GENERATION" || status=1
+    [[ -z ${GM_STOP_SCOPE-} && ${GM_LOCAL_FROZEN-} != yes ]] || status=1
     if (( status == 0 )); then
         gm_validate_file "$RUN_ROOT/runtime/frozen" && gm_validate_file "$RUN_ROOT/runtime/stopped" &&
             rm -f -- "$RUN_ROOT/runtime/frozen" "$RUN_ROOT/runtime/stopped" && gm_state_flush "$RUN_ROOT/runtime" || status=1
     fi
     gm_lock_release dispatch || return 1
+    if [[ -n ${GM_STOP_SCOPE-} || ${GM_LOCAL_FROZEN-} == yes ]]; then gm_task_freeze || return 1; return 1; fi
     export GM_BOOT_GENERATION
     return "$status"
 }

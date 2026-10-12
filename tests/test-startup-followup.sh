@@ -44,7 +44,20 @@ test_startup_dangling_rejects_forgery() {
     done
 }
 
-for test in test_startup_dangling_replay test_startup_dangling_rejects_forgery; do
+# 在代次写入期间收到 TERM，不能清除旧冻结或写入发布门。
+test_prepare_stop_during_generation() {
+    setup_startup generation-stop || return 1
+    printf 'FROZEN=1\n' > "$RUN_ROOT/runtime/frozen"
+    trap 'gm_request_stop instance test_signal' TERM
+    gm_lifecycle_record() {
+        if [[ $1 == "$RUN_ROOT/runtime/generation" ]]; then kill -TERM "$BASHPID"; fi
+        printf '%s\n' "$2" > "$1"
+    }
+    gm_startup_prepare && return 1
+    [[ -f $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/publication-gate ]]
+}
+
+for test in test_startup_dangling_replay test_startup_dangling_rejects_forgery test_prepare_stop_during_generation; do
     CHECKS=$((CHECKS+1))
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
