@@ -164,10 +164,22 @@ startup_probe() {
 }
 trap startup_probe DEBUG
 PROBE
-for window in init prepare daemon checks hosts network scheduler; do
-    docker run --rm --network none -v "$VOL:/var/lib/git-daemon" --entrypoint bash "$IMAGE" -c '
+for scenario in preserve-init preserve-prepare fresh-init fresh-prepare fresh-daemon fresh-checks fresh-hosts fresh-network fresh-scheduler; do
+    window=${scenario#*-}
+    docker run --rm --network none -e IT_FREEZE_SCENARIO="$scenario" -v "$VOL:/var/lib/git-daemon" --entrypoint bash "$IMAGE" -c '
+        set -eu
         rm -f "$RUN_ROOT/probe-reached" "$RUN_ROOT/probe-release" "$RUN_ROOT/probe-fifo"
         mkfifo "$RUN_ROOT/probe-fifo"
+        case "$IT_FREEZE_SCENARIO" in
+            preserve-*)
+                printf "FROZEN=1\n" > "$RUN_ROOT/runtime/frozen"
+                test -f "$RUN_ROOT/runtime/frozen"
+                ;;
+            fresh-*)
+                rm -f "$RUN_ROOT/runtime/frozen"
+                test ! -e "$RUN_ROOT/runtime/frozen"
+                ;;
+        esac
     '
     docker run -d --name "$NAME" --network none -v "$VOL:/var/lib/git-daemon" \
         --entrypoint /usr/local/bin/git-mirror-entrypoint -e REPOS='owner/first;owner/second' \
@@ -179,6 +191,12 @@ for window in init prepare daemon checks hosts network scheduler; do
         sleep 1
     done
     [[ $reached == "$window" ]]
+    if [[ $scenario == preserve-* ]]; then
+        docker exec "$NAME" bash -c 'test -f "$RUN_ROOT/runtime/frozen" && test "$(cat "$RUN_ROOT/runtime/frozen")" = FROZEN=1'
+    else
+        docker exec "$NAME" bash -c 'test ! -e "$RUN_ROOT/runtime/frozen"'
+    fi
+    printf 'SCENARIO=%s PRE_TERM_VERIFIED=1\n' "$scenario"
     if [[ $window == checks ]]; then
         docker exec "$NAME" bash -c '
             set -eu
@@ -197,8 +215,10 @@ for window in init prepare daemon checks hosts network scheduler; do
     [[ $(docker inspect -f '{{.State.Running}}' "$NAME") == false ]]
     [[ $(docker inspect -f '{{.State.ExitCode}}' "$NAME") != 137 ]]
     docker run --rm --network none -v "$VOL:/var/lib/git-daemon" --entrypoint bash "$IMAGE" -c '
+        set -eu
         test -f "$RUN_ROOT/runtime/frozen"
+        test "$(cat "$RUN_ROOT/runtime/frozen")" = FROZEN=1
     '
     docker rm "$NAME" >/dev/null
-    printf '[PASS] 真实镜像停止边界 %s：冻结、非KILL退出\n' "$window"
+    printf '[PASS] 真实镜像停止边界 %s：冻结、非KILL退出\n' "$scenario"
 done
