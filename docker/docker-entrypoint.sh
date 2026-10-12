@@ -248,7 +248,7 @@ confirm_daemon_listening() {
 supervise_loop() {
     local scheduler_supervised=$1
     while [[ $GM_ENTRYPOINT_STOP == 0 ]]; do
-        sleep 5 &
+        (gm_lock_release container; exec sleep 5) &
         GM_ENTRYPOINT_SLEEP=$!
         wait "$GM_ENTRYPOINT_SLEEP" 2>/dev/null || true
         if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
@@ -259,12 +259,12 @@ supervise_loop() {
         if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
             break
         fi
-        if ! rc-service --user git-daemon status >/dev/null 2>&1; then
+        if ! gm_without_container_lease rc-service --user git-daemon status >/dev/null 2>&1; then
             log '关键服务 git-daemon 已停止，容器退出'
             return 1
         fi
         if [[ $scheduler_supervised == yes ]]; then
-            if ! rc-service --user git-mirror-scheduler status >/dev/null 2>&1; then
+            if ! gm_without_container_lease rc-service --user git-mirror-scheduler status >/dev/null 2>&1; then
                 log '调度服务 git-mirror-scheduler 已停止，容器退出'
                 return 1
             fi
