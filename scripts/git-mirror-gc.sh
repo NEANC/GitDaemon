@@ -100,6 +100,7 @@ gm_gc_recover_locked() {
     gm_repo_state_read "$repo" recovered_repo || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     if [[ ${recovered_repo[health]} == corrupt ]]; then
         recovery_gc[reason]=rebuild_pending
+        recovery_gc[failed_identity]=${recovered_repo[checked_identity]} recovery_gc[failed_generation]=${recovered_repo[generation]}
         recovered[result]=RECOVERY_REQUIRED recovered[reason]=rebuild_pending
     elif [[ ${recovered_repo[health]} == healthy ]]; then
         case ${recovery_gc[reason]} in
@@ -107,7 +108,9 @@ gm_gc_recover_locked() {
             interrupted|unknown|state_failed|check_failed)
                 if [[ -n $acknowledged ]]; then eligible=yes; fi ;;
             rebuild_pending)
-                if gm_repo_replacement_read "$repo" replacement &&
+                if [[ ${recovery_gc[failed_generation]} != none ]] &&
+                    gm_repo_replacement_read "$repo" replacement &&
+                    [[ ${replacement[old_identity]} == "${recovery_gc[failed_identity]}" && ${replacement[generation]} == "$((10#${recovery_gc[failed_generation]}+1))" ]] &&
                     [[ ${replacement[phase]} == published || ${replacement[phase]} == cleanup_complete ]] &&
                     [[ ${replacement[new_identity]} != "${replacement[old_identity]}" && ${replacement[new_identity]} == "${recovered_repo[checked_identity]}" && ${replacement[generation]} == "${recovered_repo[generation]}" && ${replacement[config]} == "${recovered_repo[checked_config]}" ]]; then
                     eligible=yes
@@ -123,8 +126,8 @@ gm_gc_recover_locked() {
         recovered[result]=BLOCKED recovered[reason]=${recovery_gc[reason]}
         if [[ ${recovery_gc[write_blocked]} == no ]]; then recovered[result]=NOT_DUE; fi
     else
-        recovery_gc[reason]=check_failed
-        recovered[result]=RECOVERY_REQUIRED recovered[reason]=check_failed
+        if [[ ${recovery_gc[reason]} != rebuild_pending ]]; then recovery_gc[reason]=check_failed; fi
+        recovered[result]=RECOVERY_REQUIRED recovered[reason]=${recovery_gc[reason]}
     fi
     gm_gc_state_commit_locked "$repo" recovery_gc || { recovered[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }
     return 0

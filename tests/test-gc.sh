@@ -640,10 +640,12 @@ test_rebuilt_recovery_requires_matching_journal() (
     [[ ${calendar[write_blocked]} == yes ]] || return 1
     identity=$(stat -c '%d-%i' "$dir")
     config=$(gm_repo_config_identity owner/repo)
+    calendar[failed_identity]=0-0 calendar[failed_generation]=$((10#${calendar[generation]}-1))
+    gm_gc_state_commit_locked owner/repo calendar || return 1
     replacement=([schema]=1 [repo]=owner/repo [operation]="$operation" [phase]=cleanup_complete [old_identity]=0-0 [new_identity]="$identity" [generation]="${calendar[generation]}" [config]="$config" [boot]="$GM_BOOT_GENERATION" [published_boot]="$GM_BOOT_GENERATION" [reason]=none)
-    for key in phase new_identity generation config; do
+    for key in phase old_identity new_identity generation config; do
         value=${replacement[$key]}
-        case $key in phase) replacement[$key]=candidate_verified ;; new_identity) replacement[$key]=0-1 ;; generation) replacement[$key]=99 ;; config) replacement[$key]=$(printf wrong | sha256sum); replacement[$key]=${replacement[$key]%% *} ;; esac
+        case $key in phase) replacement[$key]=candidate_verified ;; old_identity|new_identity) replacement[$key]=0-1 ;; generation) replacement[$key]=99 ;; config) replacement[$key]=$(printf wrong | sha256sum); replacement[$key]=${replacement[$key]%% *} ;; esac
         gm_repo_replacement_commit owner/repo replacement || return 1
         gm_gc_recover_locked owner/repo outcome yes "$operation" || true
         gm_gc_state_read owner/repo calendar || return 1
@@ -723,6 +725,8 @@ test_old_cleanup_cannot_release_later_corruption() (
     gm_repo_replacement_read owner/repo replacement || return 1
     operation=${replacement[operation]}
     [[ ${replacement[phase]} == cleanup_complete && ${replacement[new_identity]} == "$identity" ]] || return 1
+    calendar[not_before]=$((now+86400))
+    gm_gc_state_commit_locked owner/repo calendar || return 1
     for key in anchor_date next_due_date not_before last_attempt_at last_success_at operation_id; do before[$key]=${calendar[$key]}; done
     printf 'second\n' | git --git-dir="$dir" hash-object -w --stdin >/dev/null || return 1
     GM_BOOT_GENERATION=$(cat /proc/sys/kernel/random/uuid)
@@ -750,8 +754,29 @@ test_old_cleanup_cannot_release_later_corruption() (
     for key in "${!before[@]}"; do [[ ${calendar[$key]} == "${before[$key]}" ]] || return 1; done
 )
 
-for test in test_old_cleanup_cannot_release_later_corruption test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
+test_legacy_rebuild_evidence_is_not_inferred() (
+    local dir now file key
+    local -A calendar=() outcome=()
+    blocked_fixture rebuild_pending || return 1
+    file=$RUN_ROOT/state/gc/owner/repo.state
+    calendar[schema]=1
+    for key in schema repo anchor_date schedule_timezone next_due_date not_before last_attempt_at last_success_at last_result operation_id status generation identity reason write_blocked resumed_boot log; do
+        printf '%s=%s\n' "$key" "${calendar[$key]}"
+    done > "$file"
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[schema]} == 2 && ${calendar[failed_identity]} == none && ${calendar[failed_generation]} == none ]] || return 1
+    gm_gc_recover_locked owner/repo outcome || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes && ${calendar[reason]} == rebuild_pending ]] || return 1
+    calendar[failed_identity]=0-0
+    gm_gc_state_commit_locked owner/repo calendar && return 1
+    calendar[failed_generation]=invalid
+    gm_gc_state_commit_locked owner/repo calendar && return 1
+    return 0
+)
+
+for test in test_legacy_rebuild_evidence_is_not_inferred test_old_cleanup_cannot_release_later_corruption test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=41 failures=%s\n' "$FAILURES"
+printf 'checks=42 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
