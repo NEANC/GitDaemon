@@ -437,8 +437,109 @@ test_recovery_unsafe_retains_outer_locks() (
     grep -q 'result=UNSAFE' "$RUN_ROOT/outer.log"
 )
 
-for test in test_recovery_unsafe_retains_outer_locks test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due test_gc_state_fault_boundaries test_block_commit_failure_freezes test_offline_resume_once_online_due_only test_state_rejects_duplicates_links_and_permissions; do
+blocked_fixture() {
+    fixture || return 1
+    calendar[status]=blocked calendar[write_blocked]=yes calendar[reason]=$1
+    calendar[last_result]=BLOCKED calendar[last_attempt_at]=$((now-60))
+    calendar[not_before]=$((now+86400))
+    gm_gc_state_commit_locked owner/repo calendar
+}
+
+test_environment_recheck_preserves_schedule() (
+    local dir now key
+    local -A calendar=() outcome=() before=()
+    blocked_fixture environment || return 1
+    for key in "${!calendar[@]}"; do before[$key]=${calendar[$key]}; done
+    export GIT_TRACE2_EVENT=$RUN_ROOT/recheck.json
+    gm_gc_one_locked owner/repo "$now" outcome || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == no && ${calendar[reason]} == none && ${calendar[status]} == retry_wait ]] || return 1
+    for key in anchor_date next_due_date not_before last_attempt_at last_success_at last_result operation_id; do
+        [[ ${calendar[$key]} == "${before[$key]}" ]] || return 1
+    done
+    gm_gc_write_allowed owner/repo || return 1
+    grep -q 'fsck' "$GIT_TRACE2_EVENT" || return 1
+    ! grep -q 'gc.autoDetach=false' "$GIT_TRACE2_EVENT"
+)
+
+test_manual_recheck_requires_external_removal() (
+    local dir now node
+    local -A calendar=() outcome=()
+    blocked_fixture manual_intervention || return 1
+    for node in packed-refs.lock gc.pid gc.log; do
+        printf 'external evidence\n' > "$dir/$node"
+        gm_gc_one_locked owner/repo "$now" outcome || true
+        gm_gc_state_read owner/repo calendar || return 1
+        [[ ${calendar[write_blocked]} == yes && $(cat "$dir/$node") == 'external evidence' ]] || return 1
+        mv "$dir/$node" "$RUN_ROOT/$node.saved" || return 1
+    done
+    gm_gc_one_locked owner/repo "$now" outcome || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == no && ${calendar[last_attempt_at]} == $((now-60)) ]]
+)
+
+test_environment_probe_sync_failure_blocks() (
+    local dir now original
+    local -A calendar=() outcome=()
+    blocked_fixture environment || return 1
+    original=$(declare -f gm_state_flush)
+    eval "${original/gm_state_flush/gc_original_flush}"
+    gm_state_flush() {
+        if [[ $1 == "$dir"/*/.gc-probe.* || $1 == "$dir"/.gc-probe.* ]]; then
+            printf 'probe\n' >> "$RUN_ROOT/probe-seen"
+            return 1
+        fi
+        gc_original_flush "$@"
+    }
+    gm_gc_one_locked owner/repo "$now" outcome || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ -s $RUN_ROOT/probe-seen && ${calendar[write_blocked]} == yes ]] || return 1
+    [[ -z $(busybox find "$dir" -name '.gc-probe.*' -print) ]]
+)
+
+test_environment_probe_real_permission_failure() (
+    local dir now
+    local -A calendar=() outcome=()
+    blocked_fixture environment || return 1
+    chmod 500 "$dir/objects/pack"
+    gm_gc_one_locked owner/repo "$now" outcome || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes ]] || return 1
+    chmod 700 "$dir/objects/pack"
+    gm_gc_one_locked owner/repo "$now" outcome || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == no ]]
+)
+
+test_unknown_cannot_be_laundered_by_native_lock() (
+    local dir now reason
+    local -A calendar=() outcome=()
+    for reason in unknown state_failed interrupted check_failed; do
+        blocked_fixture "$reason" || return 1
+        printf 'retain\n' > "$dir/gc.log"
+        gm_gc_recover_locked owner/repo outcome || return 1
+        mv "$dir/gc.log" "$RUN_ROOT/gc.saved" || return 1
+        gm_gc_recover_locked owner/repo outcome || return 1
+        gm_gc_state_read owner/repo calendar || return 1
+        [[ ${calendar[write_blocked]} == yes && ${calendar[reason]} == "$reason" ]] || return 1
+        gm_lock_release sync && gm_lock_release instance && gm_lock_release container || return 1
+    done
+)
+
+test_recheck_corruption_never_unblocks() (
+    local dir now oid
+    local -A calendar=() outcome=()
+    blocked_fixture environment || return 1
+    oid=$(printf 'reachable\n' | git --git-dir="$dir" hash-object -w --stdin) || return 1
+    git --git-dir="$dir" update-ref refs/tags/blob "$oid" || return 1
+    rm "$dir/objects/${oid:0:2}/${oid:2}"
+    gm_gc_one_locked owner/repo "$now" outcome || true
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[write_blocked]} == yes && ${calendar[reason]} == rebuild_pending && ! -e $dir/git-daemon-export-ok ]]
+)
+
+for test in test_environment_recheck_preserves_schedule test_manual_recheck_requires_external_removal test_environment_probe_sync_failure_blocks test_environment_probe_real_permission_failure test_unknown_cannot_be_laundered_by_native_lock test_recheck_corruption_never_unblocks test_recovery_unsafe_retains_outer_locks test_auto_no_work_advances_cycle test_busy_keeps_attempt_time test_two_callers_only_one_claim test_gc_failure_fsck_healthy_republishes test_gc_corruption_enqueues_rebuild test_disk_full_healthy_read_only test_gc_log_not_deleted test_success_record_failure_is_unknown test_native_lock_precheck test_unknown_retry_stays_fixed test_not_due_and_generation_gate test_stopped_skips_recovery test_real_threshold_foreground test_state_rejects_invalid_data test_operation_identity_matches_registration test_startup_unknown_blocks_sync test_task_cancel_recovers_without_freezing test_gc_copy_identity_mismatch_blocks test_replacement_preserves_calendar_and_rebinds test_cli_signal_targets_supervisor test_cli_selection_and_due test_gc_state_fault_boundaries test_block_commit_failure_freezes test_offline_resume_once_online_due_only test_state_rejects_duplicates_links_and_permissions; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=26 failures=%s\n' "$FAILURES"
+printf 'checks=32 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
