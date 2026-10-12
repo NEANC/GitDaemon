@@ -975,8 +975,8 @@ source "$ROOT/tests/docker-host-git.sh"
 source "$ROOT/tests/docker-push-denial.sh"
 # 宿主侧真实 git 客户端经容器发布端口访问：带 export-ok 的仓库可 ls-remote。
 compose_publish_exported_readable() {
-    local out status=0
-    out=$(host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/fixtures/pub.git" 2>&1) || status=$?
+    local out status=0 repo=${1:-fixtures/pub.git}
+    out=$(host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/$repo" 2>&1) || status=$?
     if [[ $status == 0 ]]; then return 0; fi
     printf 'ls-remote 失败诊断：%s\n' "$out" >&2
     return 1
@@ -1034,13 +1034,21 @@ compose_retention_marker_present() {
     [[ $content == 'retention-marker-ok' ]]
 }
 
-# 重建后卷内预置仓库与其 refs、导出标记仍在。
+# 重建保留配置外仓库与引用，但撤销其旧导出标记。
 compose_retention_repo_present() {
     docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" -c '
         d=/var/lib/git-daemon/repos/fixtures/pub.git
-        [ -f "$d/git-daemon-export-ok" ] || exit 1
+        [ ! -e "$d/git-daemon-export-ok" ] || exit 1
         git --git-dir="$d" rev-parse --verify refs/heads/trunk >/dev/null 2>&1 || exit 1
     ' >/dev/null 2>&1
+}
+
+# 用配置内缓存证明端口可达，再核验配置外旧发布仓库被明确拒绝。
+compose_retention_repo_unexported() {
+    compose_publish_exported_readable "octocat/Nonexistent-$COMPOSE_TAG.git" || return 1
+    local out status=0
+    out=$(host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/fixtures/pub.git" 2>&1) || status=$?
+    [[ $status != 0 && $out == *'not exported'* ]]
 }
 
 # 容器内真实执行拒绝上游同步，三代复用同一缓存且验证真实宿主发布。
@@ -1065,10 +1073,11 @@ git branch -M trunk
 rm -rf '"$dir"'
 git clone -q --bare "$work" '"$dir"'
 git --git-dir='"$dir"' remote set-url origin https://github.com/octocat/Nonexistent-'"$COMPOSE_TAG"'.git
-: > '"$dir"'/git-daemon-export-ok
 '
     if [[ $CACHE_GENERATION == 1 ]]; then
         docker exec "$id" sh -c "$script" >/dev/null 2>&1 || return 1
+        docker restart -t 30 "$id" >/dev/null || return 1
+        compose_wait_running || return 1
     fi
     assert_product_egress "$id" "cache-$CACHE_GENERATION" || return 1
     assert_dns_witness "cache-$CACHE_GENERATION" || return 1
@@ -2866,8 +2875,8 @@ if integration_group_selected compose-publish && [[ $COMPOSE_ENABLED == 1 ]]; th
     check '数据保留：重建后容器就绪' compose_wait_running
     check '重建代拒绝上游且保留同一缓存与宿主发布' compose_sync_failure_retains_cache 2
     check '数据保留：卷内标记文件仍在' compose_retention_marker_present
-    check '数据保留：卷内预置仓库与导出标记仍在' compose_retention_repo_present
-    check '数据保留：daemon 重建后仍对外提供该仓库' compose_publish_exported_readable
+    check '数据保留：配置外仓库与引用仍在但导出已撤销' compose_retention_repo_present
+    check '数据保留：配置内缓存可达且配置外仓库拒绝导出' compose_retention_repo_unexported
     check '卷内配置：重建后 mirror.env 字节不变' compose_mirror_env_unchanged
     compose_remove_container
 
@@ -2925,7 +2934,7 @@ if integration_group_selected compose-publish && [[ $COMPOSE_ENABLED == 1 ]]; th
     check 'Compose 强杀后同卷重建就绪' compose_wait_running
     check '强杀重建代拒绝上游且保留同一缓存与宿主发布' compose_sync_failure_retains_cache 3
     check '强杀重建后 daemon 真实监听 9418' compose_publish_daemon_listens_9418
-    check '强杀重建后发布端口真实可达（非仅 State.Running）' compose_publish_exported_readable
+    check '强杀重建后配置内缓存可达且配置外仓库拒绝导出' compose_retention_repo_unexported
     compose_remove_container
 
     compose_teardown
