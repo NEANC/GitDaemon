@@ -98,17 +98,22 @@ task_process_group() {
 # 契约：仅当调用方已确认该进程组曾真实存在（task_process_group 成功）时才可调用，
 # 因此组消失（kill -0 -pgid 失败）即代表回收完成，而非「组从未存在」的假成功。
 wait_process_group_gone() {
-    local pgid=$1 i
-    for i in $(seq 1 50); do
-        kill -0 -"$pgid" 2>/dev/null || return 0
-        sleep 0.1
+    local pgid=$1 now start alive killed=no
+    gm_monotonic_ms start || return 1
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    while :; do
+        alive=0
+        gm_task_group_alive "$pgid" "$pgid" || alive=$?
+        (( alive == 1 )) && return 0
+        (( alive == 0 )) || return 1
+        gm_monotonic_ms now || return 1
+        (( now-start < 7000 )) || return 1
+        if (( now-start >= 5000 )) && [[ $killed == no ]]; then
+            kill -KILL -- "-$pgid" 2>/dev/null || return 1
+            killed=yes
+        fi
+        sleep 0.05
     done
-    kill -KILL -"$pgid" 2>/dev/null || true
-    for i in $(seq 1 20); do
-        kill -0 -"$pgid" 2>/dev/null || return 0
-        sleep 0.1
-    done
-    return 1
 }
 
 # 信号回调仅登记停止意图，由主控制流执行冻结和回收。
@@ -122,7 +127,7 @@ on_stop_signal() {
 # 失败仅告警不终止读取服务；收到停止后先确认组内子孙真实退出再返回，不把回收推给 PID1 退出后的内核清理。
 # 启动时即校验真实进程组 ID（不臆断 $! 等于 PGID），未确认到进程组时明确不声称回收。
 run_task_best_effort() {
-    local label=$1 status=0 pgid=
+    local label=$1 status=0 pgid= unsafe=0 alive=0
     shift
     (if declare -F gm_lock_release >/dev/null; then gm_lock_release container; fi; exec setsid "$@") &
     GM_ENTRYPOINT_TASK=$!
@@ -133,24 +138,24 @@ run_task_best_effort() {
         GM_ENTRYPOINT_TASK_PGID=
         log "$label 未能确认任务独立进程组，停止时仅回收直接子进程"
     fi
-    wait "$GM_ENTRYPOINT_TASK" || status=$?
-    if [[ $GM_ENTRYPOINT_STOP != 0 ]]; then
-        gm_task_freeze || return 1
-        if [[ -n $pgid ]]; then
-            kill -TERM -"$pgid" 2>/dev/null || true
-        else
-            kill -TERM "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+    if [[ -z $pgid ]]; then
+        gm_task_freeze || true
+        local -A direct=() pending=([wait_pid]="$GM_ENTRYPOINT_TASK" [result]=INTERRUPTED)
+        if gm_process_identity "$GM_ENTRYPOINT_TASK" direct && [[ ${direct[ppid]} == "$BASHPID" ]]; then
+            pending[wait_start]=${direct[start]}
         fi
-        if [[ -n $pgid ]] && wait_process_group_gone "$pgid"; then
-            log "$label 已回收进程组全部子孙"
-        elif [[ -n $pgid ]]; then
-            log "$label 子孙回收超时，已按组强制终止"
-        else
-            log "$label 停止时未能确认任务进程组，未声称回收"
-        fi
-        GM_ENTRYPOINT_TASK=
-        GM_ENTRYPOINT_TASK_PGID=
-        log "$label 因停止信号中断"
+        gm_task_finish_locked pending retain >/dev/null 2>&1 || true
+        return 1
+    fi
+    if [[ $GM_ENTRYPOINT_STOP == 0 ]]; then wait "$GM_ENTRYPOINT_TASK" || status=$?; fi
+    gm_task_group_alive "$pgid" "$pgid" || alive=$?
+    if [[ $GM_ENTRYPOINT_STOP != 0 ]] || (( alive != 1 )); then
+        if [[ $GM_ENTRYPOINT_STOP == 0 ]]; then unsafe=1; fi
+        gm_task_freeze || unsafe=1
+        wait_process_group_gone "$pgid" || return 1
+        wait "$GM_ENTRYPOINT_TASK" 2>/dev/null || true
+        (( unsafe == 0 )) || return 1
+        GM_ENTRYPOINT_TASK= GM_ENTRYPOINT_TASK_PGID=
         return 130
     fi
     GM_ENTRYPOINT_TASK=
@@ -165,11 +170,12 @@ run_task_best_effort() {
 
 # 停止调度与读取服务并回收子进程；未运行的服务停止失败被忽略。
 shutdown_services() {
-    if declare -F gm_task_freeze >/dev/null; then gm_task_freeze || true; fi
+    local status=$? freeze_status=0
+    if declare -F gm_task_freeze >/dev/null; then gm_task_freeze || freeze_status=1; fi
     gm_without_container_lease rc-service --user git-mirror-scheduler stop >/dev/null 2>&1 || true
     gm_without_container_lease rc-service --user git-daemon stop >/dev/null 2>&1 || true
-    wait 2>/dev/null || true
-    return 0
+    if (( freeze_status != 0 )); then return 1; fi
+    return "$status"
 }
 
 # 复位实例 OpenRC 用户态常驻服务的残留状态：卷内持久化的“已启动”记录与陈旧 pidfile 不代表真实存活，
@@ -262,7 +268,7 @@ main() {
     gm_validate_path "$RUN_ROOT" || return 1
     (umask 077; mkdir -p "$RUN_ROOT/runtime") || return 1
     gm_container_lease_acquire || return $?
-    trap shutdown_services EXIT
+    trap 'shutdown_services || exit $?' EXIT
     trap on_stop_signal TERM INT
     # 程序层已于构建期由交付安装器烘焙为只读；运行期只做实例初始化与恢复，避免只读根下写模式校验失败。
     log '初始化命名卷内实例'
@@ -275,7 +281,7 @@ main() {
     gm_without_container_lease rc-service --user git-daemon start || die 'git-daemon 启动失败'
     confirm_daemon_listening || die 'git-daemon 启动后未真实监听，容器退出'
     gm_recover_main --startup || return 1
-    if ! run_task_best_effort '首次地址刷新' "$INSTALL_ROOT/update-github-hosts.sh"; then return 0; fi
+    run_task_best_effort '首次地址刷新' "$INSTALL_ROOT/update-github-hosts.sh" || return $?
     gm_startup_network || return 1
     [[ $GM_ENTRYPOINT_STOP == 0 ]] || return 0
     if scheduler_enabled; then
