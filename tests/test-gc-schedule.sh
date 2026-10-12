@@ -161,6 +161,15 @@ test_forward_clock_merges_once() {
     ! gm_gc_due state "$now"
 }
 
+test_clock_rolls_back_during_completion() {
+    local -A state=()
+    gm_gc_init 2026-01-25 UTC state || return 1
+    gm_gc_due state "$(epoch '2026-02-08 02:00:00')" || return 1
+    gm_gc_advance state "$(epoch '2026-02-08 01:59:00')" || return 1
+    [[ ${state[next_due_date]} == 2026-02-22 ]] || return 1
+    ! gm_gc_due state "$(epoch '2026-02-08 02:00:00')"
+}
+
 test_offline_resume_next_two_once() {
     local -A state=()
     local saved
@@ -228,7 +237,7 @@ for test in test_interfaces test_calendar_dates test_delayed_completion_keeps_an
     test_retry_next_date_not_24_hours test_resume_does_not_slide_retry \
     test_unknown_retry_initialized_once test_interrupted_retry_initialized_once \
     test_timezone_change_keeps_completed_cycle test_timezone_reinterprets_unfinished_date \
-    test_backward_clock_no_duplicate test_forward_clock_merges_once \
+    test_backward_clock_no_duplicate test_forward_clock_merges_once test_clock_rolls_back_during_completion \
     test_offline_resume_next_two_once test_retry_preserves_later_floor \
     test_advance_is_strict_and_clears_retry test_invalid_input_keeps_state test_calculation_is_pure; do
     check "$test"
