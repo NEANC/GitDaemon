@@ -280,6 +280,10 @@ gm_scheduler_run_task() {
         GM_SCHEDULER_CHILD_PGID=
         gm_scheduler_log "$label 未能确认任务独立进程组，停止时仅回收直接子进程"
     fi
+    while (( GM_SCHEDULER_STOP == 0 )); do
+        kill -0 "$GM_SCHEDULER_CHILD" 2>/dev/null || break
+        sleep 0.05
+    done
     if (( GM_SCHEDULER_STOP == 0 )); then wait "$GM_SCHEDULER_CHILD" || status=$?; fi
     if (( GM_SCHEDULER_STOP != 0 )); then
         gm_scheduler_freeze || status=1
@@ -318,13 +322,19 @@ gm_scheduler_freeze() {
 # 仓库入口自身监督写入组，调度器只向监督者请求取消并等待其收尾。
 gm_scheduler_run_entry() {
     local status=0 start now sent=no
-    local -A identity=() current=()
+    local -A current=()
     (( GM_SCHEDULER_STOP == 0 )) || return 1
     source "$(dirname -- "${BASH_SOURCE[0]}")/lib/lifecycle.sh" || return 1
     (( GM_SCHEDULER_STOP == 0 )) || return 1
+    declare -gA GM_SCHEDULER_CHILD_IDENTITY=()
+    local -n identity=GM_SCHEDULER_CHILD_IDENTITY
     "$@" &
     GM_SCHEDULER_CHILD=$!
     gm_process_identity "$GM_SCHEDULER_CHILD" identity || true
+    while (( GM_SCHEDULER_STOP == 0 )); do
+        kill -0 "$GM_SCHEDULER_CHILD" 2>/dev/null || break
+        sleep 0.05
+    done
     if (( GM_SCHEDULER_STOP == 0 )); then wait "$GM_SCHEDULER_CHILD" || status=$?; fi
     if (( GM_SCHEDULER_STOP != 0 )); then
         status=1
@@ -354,6 +364,7 @@ gm_scheduler_run_entry() {
         [[ ${GM_SCHEDULER_UNSAFE-} != 1 ]] || return 1
     fi
     GM_SCHEDULER_CHILD=
+    GM_SCHEDULER_CHILD_IDENTITY=()
     return "$status"
 }
 

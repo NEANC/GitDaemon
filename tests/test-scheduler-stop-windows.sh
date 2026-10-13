@@ -133,6 +133,12 @@ bash -c '
     status=0
     gm_scheduler_run_entry "$WORK/stubborn" || status=$?
     [[ $status != 0 && ${GM_SCHEDULER_UNSAFE-} == 1 && -n $GM_SCHEDULER_CHILD ]] || exit 1
+    declare -A live=()
+    gm_process_identity "$GM_SCHEDULER_CHILD" live || exit 1
+    for field in pid start ppid pgid session; do
+        [[ ${GM_SCHEDULER_CHILD_IDENTITY[$field]-} == "${live[$field]}" ]] || exit 1
+    done
+    [[ ${live[state]} != Z && ${live[state]} != X ]] || exit 1
 ' &
 driver=$!
 for ((i=0; i<100; i++)); do
@@ -198,6 +204,29 @@ for boundary in entry hosts; do
         printf '[FAIL] STOP判断后等待前TERM %s\n' "$boundary"
         failures=$((failures+1))
     fi
+done
+for boundary in entry hosts; do
+    for expected in 0 23; do
+        export boundary expected
+        if bash -c '
+            source "$ROOT/scripts/git-mirror-scheduler.sh"
+            gm_scheduler_log() { :; }
+            printf "#!/usr/bin/env bash\nsleep 0.1\nexit %s\n" "$expected" > "$WORK/normal-child"
+            chmod 700 "$WORK/normal-child"
+            status=0
+            if [[ $boundary == entry ]]; then
+                gm_scheduler_run_entry "$WORK/normal-child" || status=$?
+            else
+                gm_scheduler_run_task hosts "$WORK/normal-child" || status=$?
+            fi
+            [[ $status == "$expected" && -z $GM_SCHEDULER_CHILD ]]
+        '; then
+            printf '[PASS] 正常等待退出码 %s=%s\n' "$boundary" "$expected"
+        else
+            printf '[FAIL] 正常等待退出码 %s=%s\n' "$boundary" "$expected"
+            failures=$((failures+1))
+        fi
+    done
 done
 printf '停止窗口失败数：%s\n' "$failures"
 [[ $failures == 0 ]]
