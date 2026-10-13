@@ -179,7 +179,7 @@ C2_FACT_FILE=$TEST_ROOT/c2-facts.txt
 # 停止信号的卷内标记文件：采样侧车据此在信号后进入紧凑采样。
 C2_SIGNAL_FILE=$C2_MOUNT/c2-signal
 # 任务标记：出现在任务进程树中的可执行/脚本名，用于识别「多层子孙」并检查回收。
-C2_MARKERS='git-mirror-sync\.sh|update-github-hosts\.sh|git-remote-(https|curl)|git .*fetch|tee -a [^ ]*sync\.log|curl '
+C2_MARKERS='git-mirror-sync\.sh|git-mirror-recover\.sh|update-github-hosts\.sh|git-remote-(https|curl)|git .*fetch|tee -a [^ ]*sync\.log|curl '
 
 # 测试通过 override 文件把 compose.yml 的固定全局卷名改写到测试作用域，
 # 从而绝不触碰宿主上真实部署使用的 git-daemon-data 卷（即使它已存在）。
@@ -2326,7 +2326,7 @@ c2_scene_start_product() {
 # 不用宿主命名空间的 PID/ppid（宿主 PID1 与容器入口 PID1 不是同一进程，语义不同）。
 # 按模式限定到真正挂起的传输助手，避免把「首次地址刷新」等短暂子进程误判为待观察的多层任务树。
 c2_timeline_has_deep_tree() {
-    C2_MARKERS="$C2_MARKERS" C2_MODE="$1" awk '
+    C2_MARKERS="$C2_MARKERS" C2_MODE="$1" timeout "${2:-120}" awk '
         BEGIN {
             mode = ENVIRON["C2_MODE"]
             if (mode == "timedhosts") {
@@ -2334,7 +2334,7 @@ c2_timeline_has_deep_tree() {
                 taskpat = "update-github-hosts\\.sh"
             } else if (mode == "timedsync") {
                 helper = "(git-remote-(https|curl)|fetch --progress)"
-                taskpat = "git-mirror-sync\\.sh"
+                taskpat = "git-mirror-recover\\.sh .*--sync( |$)"
             } else {
                 helper = "(git-remote-(https|curl)|fetch --progress)"
                 taskpat = ""
@@ -2371,10 +2371,17 @@ c2_timeline_has_deep_tree() {
 # 等待目标模式的多层任务树出现（夹具步骤）：数据取自采样侧车的容器命名空间时间线。
 # 定时模式需等 Cron 到点（最多约一分钟），故等待上限设为约 120 秒。
 c2_scene_wait_tree() {
-    local mode=${1-} i
-    for i in $(seq 1 480); do
-        c2_scene_read_timeline
-        if c2_timeline_has_deep_tree "$mode"; then return 0; fi
+    local mode=${1-} deadline=$((SECONDS+${2:-120})) remaining status
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline-SECONDS))
+        c2_scene_read_timeline "$remaining" || return 1
+        remaining=$((deadline-SECONDS))
+        (( remaining > 0 )) || return 1
+        status=0
+        c2_timeline_has_deep_tree "$mode" "$remaining" || status=$?
+        (( SECONDS < deadline )) || return 1
+        if (( status == 0 )); then return 0; fi
+        (( status == 1 )) || return 1
         sleep 0.25
     done
     return 1
@@ -2545,7 +2552,7 @@ c2_scene_signal() {
 # 把采样侧车容器内的采样时间线复制到测试临时目录；不额外启动容器，避免污染被测 PID 命名空间。
 # 侧车容器即便已随 PID1 退出而停止，docker cp 仍可读取其文件系统快照。
 c2_scene_read_timeline() {
-    docker cp "$C2_SAMP:$C2_SAMPLE" "$C2_TIMELINE" >/dev/null 2>&1 || : > "$C2_TIMELINE"
+    timeout "${1:-120}" docker cp "$C2_SAMP:$C2_SAMPLE" "$C2_TIMELINE" >/dev/null 2>&1 || { : > "$C2_TIMELINE"; return 1; }
     return 0
 }
 
