@@ -1179,29 +1179,34 @@ compose_no_leftover_processes() {
     return 0
 }
 
-# 调度场景：在就绪后（首次同步已完成）持续采样，等待调度器真实派发一次同步任务，
-# 并捕获该 git-mirror-sync.sh 进程在宿主侧 /proc 中的实际 UID 必须为 10001。
+# 验证同步监督入口由调度器派发，且真实及有效 UID 均为非 root 产品身份。
+compose_scheduler_process_identity() {
+    [[ $1 =~ git-mirror-recover\.sh[[:space:]].*--sync([[:space:]]|$) &&
+       $2 == *git-mirror-scheduler.sh* && $3 == 10001 && $4 == 10001 ]]
+}
+
+# 就绪后持续采样调度器的真实同步子进程，不依赖已移除的派发日志。
 compose_scheduler_dispatch_and_uid() {
-    local id i pid pids cmd uid dispatched=no saw_uid=no
+    local id i pid pids cmd parent ppid key real effective rest
     id=$(compose_container_id) || return 1
     [[ -n $id ]] || return 1
     for i in $(seq 1 150); do
-        if [[ $dispatched == no ]] && docker exec "$id" sh -c \
-            'grep -q "开始仓库同步" /var/lib/git-daemon/logs/scheduler.log 2>/dev/null'; then
-            dispatched=yes
-        fi
         pids=$(docker top "$id" -o pid 2>/dev/null | tail -n +2) || pids=
         for pid in $pids; do
             [[ $pid =~ ^[0-9]+$ ]] || continue
             cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || cmd=
-            case "$cmd" in
-                *git-mirror-sync.sh*)
-                    uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9]*\).*/\1/p' "/proc/$pid/status" 2>/dev/null) || uid=
-                    [[ $uid == 10001 ]] && saw_uid=yes
-                    ;;
-            esac
+            [[ $cmd =~ git-mirror-recover\.sh[[:space:]].*--sync([[:space:]]|$) ]] || continue
+            ppid= real= effective=
+            while read -r key rest; do
+                case "$key" in
+                    PPid:) ppid=$rest ;;
+                    Uid:) read -r real effective rest <<< "$rest" ;;
+                esac
+            done < "/proc/$pid/status" 2>/dev/null || continue
+            [[ $ppid =~ ^[0-9]+$ ]] || continue
+            parent=$(tr '\0' ' ' < "/proc/$ppid/cmdline" 2>/dev/null) || continue
+            compose_scheduler_process_identity "$cmd" "$parent" "$real" "$effective" && return 0
         done
-        if [[ $dispatched == yes && $saw_uid == yes ]]; then return 0; fi
         sleep 0.5
     done
     return 1
@@ -1758,7 +1763,6 @@ fixture_proxy_path_succeeds() {
     out=$(fixture_exec_sync_scenario "$FIXTURE_PROXY_URL" "$([[ ${IT_DEFER_MAPPING:-0} == 1 ]] && printf no || printf yes)" "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-run-output"
     fixture_record_count "$TEST_ROOT/proxy-after-run"
-    [[ $out == *'本次同步成功'* ]] || { printf '%s\n' "$out" >&2; return 1; }
     [[ $out == *'同步传输路径：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
     before=$(fixture_read_count "$TEST_ROOT/proxy-baseline")
     after=$(fixture_read_count "$TEST_ROOT/proxy-after-run")
@@ -1827,7 +1831,6 @@ fixture_direct_attempts_leave_proxy_untouched() {
     out=$(fixture_exec_sync_scenario '' yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
     after=$(fixture_connect_count)
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-direct-output"
-    [[ $out == *'本次同步成功'* ]] || { printf '%s\n' "$out" >&2; return 1; }
     [[ $out == *'同步传输路径：直连加动态地址映射'* ]] || { printf '%s\n' "$out" >&2; return 1; }
     [[ $before == "$after" ]] || { printf '直连尝试后代理计数变化（%s→%s）\n' "$before" "$after" >&2; return 1; }
     return 0
@@ -1843,7 +1846,7 @@ fixture_system_direct_leaves_proxy_untouched() {
     out=$(fixture_exec_sync_scenario '' no "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
     after=$(fixture_connect_count)
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-system-direct-output"
-    [[ $out == *'本次同步成功'* && $out == *'同步传输路径：直连系统 DNS'* && $before == "$after" ]]
+    [[ $out == *'同步传输路径：直连系统 DNS'* && $before == "$after" ]]
 }
 
 # 凭据夹具：在独立网络上以 github.com 别名启动需要 Basic 凭据的认证上游；
@@ -1899,10 +1902,9 @@ fixture_start_auth_product() {
     return 1
 }
 
-# 合成 Token 访问受认证夹具成功：镜像引用与上游一致，已发布且同步日志记录成功。
+# 合成 Token 访问受认证夹具成功：镜像引用与上游一致、对象完整且已发布。
 fixture_auth_sync_with_token_succeeds() {
     local expected
-    docker logs "$AUTH_PROD" 2>&1 | grep -q '本次同步成功' || return 1
     expected=$(bash "$FIXTURE_SCRIPT" rev-parse "$FIXTURE_FIX_VOL" "$IMAGE" "$FIXTURE_REPO" refs/heads/main) || return 1
     docker run --rm --user 10001:10001 -v "$AUTH_PROD_VOL:$FIXTURE_MOUNT" \
         -e "GM_EXPECT_MAIN=$expected" --entrypoint /bin/sh "$IMAGE" -c '
@@ -1910,6 +1912,7 @@ fixture_auth_sync_with_token_succeeds() {
         d='"$FIXTURE_MOUNT"'/repos/'"$FIXTURE_REPO"'.git
         [ "$(git --git-dir="$d" rev-parse refs/heads/main)" = "$GM_EXPECT_MAIN" ]
         git --git-dir="$d" rev-parse --verify refs/heads/dev >/dev/null
+        git --git-dir="$d" fsck --full
         [ -f "$d/git-daemon-export-ok" ]
     '
 }
@@ -2454,10 +2457,17 @@ EOS
 # 等待采样侧车确实写入至少一个含 PID1 的进程行：避免在侧车尚未开始记录时就发出停止信号，
 # 使「子孙在 PID1 存活期间被回收」的判定建立在真实时间线之上。
 c2_scene_wait_sampler() {
-    local i
-    for i in $(seq 1 100); do
-        c2_scene_read_timeline
-        if grep -qE '(^| )pid=1 ' "$C2_TIMELINE"; then return 0; fi
+    local deadline=$((SECONDS+${1:-20})) remaining status
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline-SECONDS))
+        c2_scene_read_timeline "$remaining" || return 1
+        remaining=$((deadline-SECONDS))
+        (( remaining > 0 )) || return 1
+        status=0
+        timeout "$remaining" grep -qE '(^| )pid=1 ' "$C2_TIMELINE" || status=$?
+        (( SECONDS < deadline )) || return 1
+        (( status == 0 )) && return 0
+        (( status == 1 )) || return 1
         sleep 0.2
     done
     return 1
@@ -2509,20 +2519,17 @@ c2_assert_reclaimed_behavior() {
     (( m == 0 ))
 }
 
-# 代理判据（辅助）：产品自证「已回收进程组全部子孙」日志（首次任务由入口输出，定时任务由调度器写入实例调度日志）。
-# 该判据衡量的是产品声明而非直接测量：缺少该日志时对旧产品失败，但存在该日志不证明子孙确实已回收。
+# 同步监督以持久冻结和登记清理为辅助证据；地址刷新保留现行回收日志断言。
 c2_assert_reclaimed_log() {
     local mode=$1 label
     case "$mode" in
-        firstsync) label='首次仓库同步' ;;
-        timedsync) label='仓库同步' ;;
+        firstsync|timedsync)
+            docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" \
+                -c "test -s $C2_MOUNT/runtime/frozen && test ! -e $C2_MOUNT/runtime/task && test ! -L $C2_MOUNT/runtime/task"
+            return ;;
         timedhosts) label='地址刷新' ;;
         *) return 1 ;;
     esac
-    if [[ $mode == firstsync ]]; then
-        docker logs "$C2_PROD" 2>&1 | grep -q "$label 已回收进程组全部子孙"
-        return
-    fi
     docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
         -c "grep -q '$label 已回收进程组全部子孙' $C2_MOUNT/logs/scheduler.log" >/dev/null 2>&1
 }
@@ -2725,7 +2732,7 @@ c2_run_scenario() {
     printf 'C-2[%s/%s] 采样事实：%s\n' "$mode" "$sig" "$(c2_scene_analyze)"
     check_c2 "C-2[$mode/$sig] 停止在 30 秒宽限期内完成且未被 SIGKILL" c2_assert_bounded
     check_c2 "C-2[$mode/$sig] 多层子孙在 PID1 存活期间被回收（行为采样）" c2_assert_reclaimed_behavior
-    check_c2 "C-2[$mode/$sig] 产品自证已回收进程组日志（代理判据）" c2_assert_reclaimed_log "$mode"
+    check_c2 "C-2[$mode/$sig] 停止持久状态或现行回收日志（辅助判据）" c2_assert_reclaimed_log "$mode"
     check_c2 "C-2[$mode/$sig] 停止后不再派发新任务（行为采样）" c2_assert_no_dispatch
     check_c2 "C-2[$mode/$sig] 停止前捕获到多层任务树" c2_assert_tree
     check_c2 "C-2[$mode/$sig] 全树实际/有效 UID 均为 10001（无 root 业务进程）" c2_assert_uid_nonroot
