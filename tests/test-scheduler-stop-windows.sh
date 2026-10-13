@@ -44,3 +44,47 @@ done
 cat "$WORK/result"
 [[ $status == 0 && $(cat "$WORK/result") == JOINED ]]
 printf '[PASS] 重复 TERM 不把中断的 wait 当成监督者退出\n'
+
+failures=0
+for freeze_status in 0 1; do
+    export freeze_status
+    bash -c '
+        source "$ROOT/scripts/git-mirror-scheduler.sh"
+        gm_scheduler_freeze() { return "$freeze_status"; }
+        trap gm_scheduler_on_stop_signal TERM INT
+        GM_SCHEDULER_STOP=1
+        status=0
+        gm_scheduler_run_entry bash -c "exit 0" || status=$?
+        [[ $status != 0 && -z $GM_SCHEDULER_CHILD ]] || exit 1
+        [[ $(trap -p TERM INT) == *gm_scheduler_on_stop_signal* ]] || exit 1
+    ' || { printf '[FAIL] 停止状态收尾 freeze=%s\n' "$freeze_status"; failures=$((failures+1)); }
+done
+
+rm "$WORK/finished" "$WORK/child.pid" "$WORK/frozen" "$WORK/result"
+bash -c '
+    source "$ROOT/scripts/git-mirror-scheduler.sh"
+    gm_scheduler_freeze() { printf "frozen\n" > "$WORK/frozen"; return 1; }
+    trap gm_scheduler_on_stop_signal TERM INT
+    status=0
+    gm_scheduler_run_entry "$WORK/child" || status=$?
+    [[ -f $WORK/finished && $status != 0 && -z $GM_SCHEDULER_CHILD ]] || exit 1
+    [[ $(trap -p TERM INT) == *gm_scheduler_on_stop_signal* ]] || exit 1
+' &
+driver=$!
+for ((i=0; i<100; i++)); do
+    [[ ! -f $WORK/child.pid ]] || break
+    sleep 0.02
+done
+[[ -f $WORK/child.pid ]]
+kill -TERM "$driver"
+status=0
+wait "$driver" || status=$?
+sleep 3
+if [[ $status == 0 ]]; then
+    printf '[PASS] 冻结失败仍等待监督者真实退出\n'
+else
+    printf '[FAIL] 冻结失败未完整收尾\n'
+    failures=$((failures+1))
+fi
+printf '停止窗口失败数：%s\n' "$failures"
+[[ $failures == 0 ]]

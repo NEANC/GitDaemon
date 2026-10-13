@@ -217,7 +217,74 @@ test_cli_sync_validates_live_generation() {
     return 0
 }
 
-for test in test_cli_sync_validates_live_generation test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop test_check_failure_scope; do
+setup_cli_probe() {
+    setup_startup "$1" || return 1
+    git --git-dir="$RUN_ROOT/repos/owner/first.git" remote add origin https://github.com/owner/first.git || return 1
+    gm_startup_prepare && gm_startup_checks || return 1
+    export REAL_GIT=$(command -v git)
+    mkdir -p "$RUN_ROOT/bin" || return 1
+    cat > "$RUN_ROOT/bin/git" <<'PROBE'
+#!/usr/bin/env bash
+for arg in "$@"; do
+    if [[ $arg == fetch ]]; then
+        printf '%s\n' "$BASHPID" > "$RUN_ROOT/fetch.pid"
+        if [[ -f $RUN_ROOT/runtime/task ]]; then cp "$RUN_ROOT/runtime/task" "$RUN_ROOT/fetch.task"; fi
+        if [[ ${PROBE_MODE-} == wait ]]; then sleep 15; fi
+        printf 'fatal: unable to access upstream: The requested URL returned error: 503\n' >&2
+        exit 128
+    fi
+done
+exec "$REAL_GIT" "$@"
+PROBE
+    chmod 700 "$RUN_ROOT/bin/git" || return 1
+    export PATH="$RUN_ROOT/bin:$PATH"
+}
+
+test_cli_checks_gate_before_network() {
+    local mode status
+    for mode in missing stale; do
+        (
+            setup_cli_probe "cli-gate-$mode" || exit 1
+            if [[ $mode == missing ]]; then rm "$RUN_ROOT/runtime/checks-complete"; else printf 'stale\n' > "$RUN_ROOT/runtime/checks-complete"; fi
+            status=0
+            gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first || status=$?
+            [[ $status != 0 && ! -e $RUN_ROOT/fetch.pid ]]
+        ) || return 1
+    done
+}
+
+test_cli_transport_failure_is_supervised() {
+    setup_cli_probe cli-transport || return 1
+    local status=0
+    local -A state=()
+    gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first || status=$?
+    [[ $status == 1 && -s $RUN_ROOT/fetch.task && ! -e $RUN_ROOT/runtime/task ]] || return 1
+    gm_repo_state_read owner/first state || return 1
+    [[ ${state[health]} == healthy && ${state[message]} != recovery_required && -f $RUN_ROOT/repos/owner/first.git/git-daemon-export-ok ]]
+}
+
+test_cli_term_joins_writer() {
+    setup_cli_probe cli-term || return 1
+    local pid writer= status=0 i result=0
+    (gm_lock_release container; exec env -u GM_BOOT_GENERATION PROBE_MODE=wait "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first) &
+    pid=$!
+    for ((i=0; i<200; i++)); do
+        [[ ! -s $RUN_ROOT/fetch.pid ]] || break
+        sleep 0.02
+    done
+    if [[ -s $RUN_ROOT/fetch.pid ]]; then writer=$(cat "$RUN_ROOT/fetch.pid"); else result=1; fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" || status=$?
+    [[ $status != 0 && -s $RUN_ROOT/fetch.task && ! -e $RUN_ROOT/runtime/task ]] || result=1
+    if [[ -n $writer ]] && kill -0 "$writer" 2>/dev/null; then
+        result=1
+        sleep 16
+    fi
+    [[ ! -f $RUN_ROOT/repos/owner/first.git/git-daemon-export-ok ]] || result=1
+    return "$result"
+}
+
+for test in test_cli_checks_gate_before_network test_cli_transport_failure_is_supervised test_cli_term_joins_writer test_cli_sync_validates_live_generation test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop test_check_failure_scope; do
     CHECKS=$((CHECKS+1))
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
