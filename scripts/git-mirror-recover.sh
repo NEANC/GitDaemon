@@ -130,7 +130,7 @@ gm_startup_checks() {
 
 gm_startup_network_one() {
     local repo=$1 index branches= dir=$RUN_ROOT/repos/$1.git status=0
-    local -A current=() outcome=()
+    local -A current=() outcome=() replacement=()
     gm_match_record "$RUN_ROOT/runtime/checks-complete" "$GM_BOOT_GENERATION" || return 1
     for index in "${!GM_REPOS[@]}"; do
         if [[ ${GM_REPOS[$index]} == "$repo" ]]; then branches=${GM_BRANCHES[$index]}; break; fi
@@ -146,7 +146,10 @@ gm_startup_network_one() {
         gm_startup_check_one "$repo" || return $?
     fi
     gm_repo_state_read "$repo" current || return 1
-    if [[ ${current[health]-} == corrupt || -e $RUN_ROOT/state/replacements/$repo.state ]]; then
+    if [[ -e $RUN_ROOT/state/replacements/$repo.state || -L $RUN_ROOT/state/replacements/$repo.state ]]; then
+        gm_repo_replacement_read "$repo" replacement || return 1
+    fi
+    if [[ ${current[health]-} == corrupt || ( ${replacement[phase]-cleanup_complete} != cleanup_complete ) ]]; then
         gm_repo_rebuild_locked "$repo" "$branches" outcome || status=$?
     elif [[ ${current[health]-} == healthy ]]; then
         gm_sync_one_locked "$repo" "$branches" outcome || status=$?

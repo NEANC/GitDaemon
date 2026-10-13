@@ -57,7 +57,27 @@ test_prepare_stop_during_generation() {
     [[ -f $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/publication-gate ]]
 }
 
-for test in test_startup_dangling_replay test_startup_dangling_rejects_forgery test_prepare_stop_during_generation; do
+# 已完成替换的历史记录不应阻止新启动通过真实 fetch 获取上游新对象。
+test_completed_replacement_fetches() {
+    setup_startup completed-fetch || return 1
+    local dir=$RUN_ROOT/repos/owner/first.git upstream=$RUN_ROOT/upstream.git oid tree
+    local operation=12345678-1234-1234-1234-123456789abc
+    git init -q --bare "$upstream" || return 1
+    tree=$(git --git-dir="$upstream" mktree < /dev/null) || return 1
+    oid=$(printf 'new upstream\n' | git -c user.name=test -c user.email=test@example.invalid --git-dir="$upstream" commit-tree "$tree") || return 1
+    git --git-dir="$upstream" update-ref refs/heads/main "$oid" || return 1
+    git --git-dir="$dir" remote add origin "$upstream" || return 1
+    local -A replacement=([schema]=1 [repo]=owner/first [operation]="$operation" [phase]=cleanup_complete [old_identity]=0-1 [new_identity]="$(stat -c '%d-%i' "$dir")" [generation]=1 [config]="$(gm_repo_config_identity owner/first)" [boot]="$operation" [published_boot]="$operation" [reason]=complete)
+    mkdir -p "$RUN_ROOT/quarantine/$operation" || return 1
+    gm_repo_replacement_commit owner/first replacement || return 1
+    gm_startup_prepare && gm_startup_checks || return 1
+    gm_startup_run_repo owner/first recovery || return 1
+    [[ $(git --git-dir="$dir" rev-parse refs/heads/main) == "$oid" && -f $dir/git-daemon-export-ok ]] || return 1
+    gm_repo_replacement_read owner/first replacement || return 1
+    [[ ${replacement[phase]} == cleanup_complete && ${replacement[published_boot]} == "$operation" ]]
+}
+
+for test in test_completed_replacement_fetches test_startup_dangling_replay test_startup_dangling_rejects_forgery test_prepare_stop_during_generation; do
     CHECKS=$((CHECKS+1))
     if ( "$test" ); then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
