@@ -1054,7 +1054,7 @@ compose_retention_repo_unexported() {
 # 容器内真实执行拒绝上游同步，三代复用同一缓存且验证真实宿主发布。
 compose_sync_failure_retains_cache() {
     local CACHE_GENERATION=$1
-    local id dir before after before_count after_count script status=0 requests_before requests_after
+    local id dir before after before_count after_count script status=0 requests_before requests_after expected_head clone_head
     id=$(compose_container_id) || return 1
     [[ -n $id ]] || return 1
     dir="/var/lib/git-daemon/repos/octocat/Nonexistent-$COMPOSE_TAG.git"
@@ -1107,6 +1107,24 @@ git --git-dir='"$dir"' remote set-url origin https://github.com/octocat/Nonexist
     cmp -s "$TEST_ROOT/cache-read-before.log" "$TEST_ROOT/cache-read.log" || return 1
     host_git ls-remote "git://127.0.0.1:$COMPOSE_PORT/octocat/Nonexistent-$COMPOSE_TAG.git" > "$TEST_ROOT/cache-host-after-$CACHE_GENERATION" || return 1
     cmp -s "$TEST_ROOT/cache-host-before-$CACHE_GENERATION" "$TEST_ROOT/cache-host-after-$CACHE_GENERATION" || return 1
+    expected_head=$(docker exec "$id" git --git-dir="$dir" rev-parse HEAD) || return 1
+    docker exec -e CACHE_GENERATION="$CACHE_GENERATION" -e CACHE_REPO="octocat/Nonexistent-$COMPOSE_TAG.git" -e EXPECTED_HEAD="$expected_head" "$id" bash -c '
+        set -e
+        destination=/var/lib/git-daemon/tmp/cache-clone-$CACHE_GENERATION
+        git clone "git://127.0.0.1:9418/$CACHE_REPO" "$destination"
+        git -C "$destination" fsck --full
+        actual=$(git -C "$destination" rev-parse HEAD)
+        [[ $actual == "$EXPECTED_HEAD" ]]
+        [[ $(git -C "$destination" symbolic-ref HEAD) == refs/heads/trunk ]]
+        printf "CACHE_CLONE generation=%s fsck=0 HEAD=%s branch=trunk\n" "$CACHE_GENERATION" "$actual"
+    ' > "$TEST_ROOT/cache-clone-$CACHE_GENERATION.log" 2>&1 || return 1
+    cat "$TEST_ROOT/cache-clone-$CACHE_GENERATION.log"
+    clone_head=$(docker exec "$id" git -C "/var/lib/git-daemon/tmp/cache-clone-$CACHE_GENERATION" rev-parse HEAD) || return 1
+    if [[ $CACHE_GENERATION == 1 ]]; then
+        printf '%s\n' "$clone_head" > "$TEST_ROOT/cache-original-head"
+    else
+        [[ $clone_head == "$(cat "$TEST_ROOT/cache-original-head")" ]] || return 1
+    fi
     after=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
         -c "git --git-dir=$dir for-each-ref --format='%(refname) %(objectname)'" 2>/dev/null) || return 1
     after_count=$(docker run --rm --user 10001:10001 -v "$COMPOSE_VOLUME:/var/lib/git-daemon" --entrypoint /bin/sh "$IMAGE" \
