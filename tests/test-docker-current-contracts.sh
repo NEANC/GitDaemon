@@ -43,6 +43,31 @@ test_sync_stop_contract() (
     return 0
 )
 
+# 地址刷新辅助断言必须接受实际派发标签，并拒绝缺失或失败的回收证据。
+test_hosts_stop_contract() (
+    source "$ROOT/scripts/git-mirror-scheduler.sh"
+    C2_MOUNT=$TEST_ROOT/hosts-stop
+    mkdir -p "$C2_MOUNT/logs"
+    SCHEDULER_LOG_FILE=$C2_MOUNT/logs/scheduler.log
+    INSTALL_ROOT=$ROOT/scripts
+    docker() { bash -c "${!#}"; }
+    gm_scheduler_run_task() {
+        gm_scheduler_log "$1 已回收进程组全部子孙"
+        GM_SCHEDULER_STOP=1
+        return 1
+    }
+    gm_scheduler_dispatch hosts '' 0 || true
+    c2_assert_reclaimed_log timedhosts || return 1
+    local message
+    for message in '' 'hosts 开始' 'hosts 子孙回收超时，已按组强制终止' 'hosts 停止时未能确认任务进程组，未声称回收' 'sync 已回收进程组全部子孙'; do
+        printf '%s\n' "$message" > "$SCHEDULER_LOG_FILE"
+        if c2_assert_reclaimed_log timedhosts; then return 1; fi
+    done
+    rm "$SCHEDULER_LOG_FILE"
+    if c2_assert_reclaimed_log timedhosts; then return 1; fi
+    return 0
+)
+
 # 采样就绪同样必须拒绝耗尽预算后才出现的 PID1。
 test_sampler_budget() (
     c2_scene_read_timeline() { sleep 2; printf 'pid=1 \n' > "$C2_TIMELINE"; }
@@ -54,5 +79,6 @@ test_sampler_budget() (
 check '调度入口父进程与双 UID 正反例' test_scheduler_identity
 check '代理成功不依赖旧展示日志' test_proxy_success_contract
 check '同步停止核对冻结与登记清理' test_sync_stop_contract
+check '地址刷新停止核对实际派发标签及失败负例' test_hosts_stop_contract
 check '采样就绪拒绝过期结果' test_sampler_budget
 [[ $FAILURES == 0 ]]
