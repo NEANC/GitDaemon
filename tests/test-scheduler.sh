@@ -222,14 +222,13 @@ scheduler_stop_suppresses_due_task() {
     chmod +x "$work/install/update-github-hosts.sh" "$work/install/git-mirror-sync.sh"
     export RUN_ROOT=$work/run
     STUB_INSTALL=$work/install
-    # 以桩替换运行时准备与 cron 计算，聚焦主循环的停止判据；本地缺 setsid 时以直启替身。
+    # 仅替换运行时准备与 cron 计算，进程组使用真实 setsid。
     gm_prepare_runtime() {
         INSTALL_ROOT=$STUB_INSTALL
         declare -gA GM_CONFIG=([ENABLE_CRON]=yes [ENABLE_HOSTS_UPDATE]=yes [CRON_SCHEDULE]='* * * * *' [HOSTS_CRON]='* * * * *')
         return 0
     }
     gm_cron_next_trigger() { printf '1\n'; }
-    setsid() { exec "$@"; }
     gm_scheduler_main >/dev/null 2>&1 &
     pid=$!
     for (( index = 0; index < 200; index++ )); do

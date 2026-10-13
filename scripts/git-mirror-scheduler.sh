@@ -250,59 +250,96 @@ gm_scheduler_task_group() {
 # 契约：仅当调用方已确认该进程组曾真实存在（gm_scheduler_task_group 成功）时才可调用，
 # 因此组消失（kill -0 -pgid 失败）即代表回收完成，而非「组从未存在」的假成功。
 gm_scheduler_wait_group_gone() {
-    local pgid=$1 i
-    for i in $(seq 1 50); do
-        kill -0 -"$pgid" 2>/dev/null || return 0
-        sleep 0.1
+    local pgid=$1 start now alive killed=no
+    gm_monotonic_ms start || return 1
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    while :; do
+        alive=0
+        gm_task_group_alive "$pgid" "$pgid" || alive=$?
+        (( alive != 1 )) || return 0
+        (( alive == 0 )) || return 1
+        gm_monotonic_ms now || return 1
+        (( now-start < 7000 )) || return 1
+        if (( now-start >= 5000 )) && [[ $killed == no ]]; then
+            kill -KILL -- "-$pgid" 2>/dev/null || return 1
+            killed=yes
+        fi
+        sleep 0.05
     done
-    kill -KILL -"$pgid" 2>/dev/null || true
-    for i in $(seq 1 20); do
-        kill -0 -"$pgid" 2>/dev/null || return 0
-        sleep 0.1
-    done
-    return 1
 }
 
 # 以独立进程组运行既有交付入口；记录结果后继续，单次失败不终止调度循环；
 # 收到停止信号后按组回收任务整棵进程树并等待子孙退出再返回。
 # 启动时即校验真实进程组 ID（不臆断 $! 等于 PGID），未确认到进程组时明确不声称回收。
 gm_scheduler_run_task() {
-    local label=$1 script=$2 status=0 pgid=
+    local label=$1 script=$2 status=0 pgid= directory gate alive=0
     (( GM_SCHEDULER_STOP == 0 )) || return 1
+    [[ ${GM_SCHEDULER_UNSAFE-} != 1 ]] || return 1
+    source "$(dirname -- "${BASH_SOURCE[0]}")/lib/lifecycle.sh" || return 1
     gm_scheduler_log "开始$label：$(basename -- "$script")"
-    (( GM_SCHEDULER_STOP == 0 )) || return 1
-    setsid "$script" &
+    directory=$(mktemp -d "${TMPDIR:-/tmp}/scheduler-hosts.XXXXXXXX") || return 1
+    mkfifo -m 600 "$directory/gate" || { rmdir "$directory"; return 1; }
+    exec {gate}<> "$directory/gate" || { rm -f -- "$directory/gate"; rmdir "$directory"; return 1; }
+    declare -gA GM_SCHEDULER_CHILD_IDENTITY=()
+    local -n identity=GM_SCHEDULER_CHILD_IDENTITY
+    local -A current=()
+    if (( GM_SCHEDULER_STOP != 0 )); then
+        exec {gate}>&-
+        rm -f -- "$directory/gate" && rmdir "$directory"
+        return 1
+    fi
+    setsid bash -c 'gate=$1; shift; IFS= read -r -t 2 token <&"$gate" || exit 1; exec {gate}>&-; [[ $token == 0 ]] || exit 1; exec "$@"' _ "$gate" "$script" &
     GM_SCHEDULER_CHILD=$!
-    if pgid=$(gm_scheduler_task_group "$GM_SCHEDULER_CHILD"); then
+    gm_process_identity "$GM_SCHEDULER_CHILD" identity || true
+    if pgid=$(gm_scheduler_task_group "$GM_SCHEDULER_CHILD") &&
+        gm_process_identity "$GM_SCHEDULER_CHILD" current &&
+        [[ ${identity[start]-} == "${current[start]}" && ${current[ppid]} == "$BASHPID" && ${current[session]} == "$pgid" ]]; then
         GM_SCHEDULER_CHILD_PGID=$pgid
+        gm_process_identity "$GM_SCHEDULER_CHILD" identity || GM_SCHEDULER_UNSAFE=1
     else
         pgid=
         GM_SCHEDULER_CHILD_PGID=
-        gm_scheduler_log "$label 未能确认任务独立进程组，停止时仅回收直接子进程"
+        GM_SCHEDULER_UNSAFE=1
+        GM_SCHEDULER_STOP=1
+        gm_scheduler_log "$label 未能确认任务独立进程组，保留身份并停止派发"
     fi
+    if [[ -n $pgid && ${GM_SCHEDULER_UNSAFE-} != 1 ]]; then
+        printf '%s\n' "$GM_SCHEDULER_STOP" >&"$gate" || GM_SCHEDULER_UNSAFE=1
+    fi
+    exec {gate}>&-
+    rm -f -- "$directory/gate" && rmdir "$directory" || GM_SCHEDULER_UNSAFE=1
+    if [[ ${GM_SCHEDULER_UNSAFE-} == 1 ]]; then GM_SCHEDULER_STOP=1; fi
     while (( GM_SCHEDULER_STOP == 0 )); do
         kill -0 "$GM_SCHEDULER_CHILD" 2>/dev/null || break
         sleep 0.05
     done
     if (( GM_SCHEDULER_STOP == 0 )); then wait "$GM_SCHEDULER_CHILD" || status=$?; fi
+    if [[ -n $pgid ]]; then gm_task_group_alive "$pgid" "$pgid" || alive=$?; fi
+    if (( GM_SCHEDULER_STOP == 0 && alive != 1 )); then GM_SCHEDULER_STOP=1; fi
     if (( GM_SCHEDULER_STOP != 0 )); then
+        trap '' TERM INT
         gm_scheduler_freeze || status=1
-        if [[ -n $pgid ]]; then kill -TERM -"$pgid" 2>/dev/null || true; fi
-        kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
         if [[ -n $pgid ]] && gm_scheduler_wait_group_gone "$pgid"; then
+            wait "$GM_SCHEDULER_CHILD" 2>/dev/null || true
             gm_scheduler_log "$label 已回收进程组全部子孙"
         elif [[ -n $pgid ]]; then
-            gm_scheduler_log "$label 子孙回收超时，已按组强制终止"
+            GM_SCHEDULER_UNSAFE=1
+            gm_scheduler_log "$label 子孙回收未确认，保留身份并停止派发"
         else
+            GM_SCHEDULER_UNSAFE=1
             gm_scheduler_log "$label 停止时未能确认任务进程组，未声称回收"
         fi
+        trap gm_scheduler_on_stop_signal TERM INT
+        [[ ${GM_SCHEDULER_UNSAFE-} != 1 ]] || return 1
         GM_SCHEDULER_CHILD=
         GM_SCHEDULER_CHILD_PGID=
+        GM_SCHEDULER_CHILD_IDENTITY=()
         gm_scheduler_log "$label 因停止信号中断"
         return 1
     fi
     GM_SCHEDULER_CHILD=
     GM_SCHEDULER_CHILD_PGID=
+    GM_SCHEDULER_CHILD_IDENTITY=()
     if (( status == 0 )); then
         gm_scheduler_log "$label 完成"
     else
