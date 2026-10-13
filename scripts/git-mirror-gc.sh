@@ -176,7 +176,7 @@ gm_gc_one_locked() {
     for config in "${!execution[@]}"; do previous[$config]=${execution[$config]}; done
     diagnostic=$(mktemp "$RUN_ROOT/logs/gc.XXXXXXXX") || return 1
     execution[log]=${diagnostic##*/}
-    execution[status]=running execution[last_result]=UNKNOWN execution[reason]=running
+    execution[status]=running execution[last_result]=UNKNOWN execution[reason]=running execution[not_before]=0
     execution[last_attempt_at]=$now execution[generation]=${repo_state[generation]} execution[identity]=$identity
     execution[operation_id]=$(cat /proc/sys/kernel/random/uuid) || return 1
     gm_gc_state_commit_locked "$repo" execution || { gc_out[result]=UNSAFE; gm_gc_unsafe_locked "$repo"; return 1; }

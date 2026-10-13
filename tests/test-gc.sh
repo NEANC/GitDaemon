@@ -775,8 +775,35 @@ test_legacy_rebuild_evidence_is_not_inferred() (
     return 0
 )
 
-for test in test_legacy_rebuild_evidence_is_not_inferred test_old_cleanup_cannot_release_later_corruption test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
+# 新操作持久化后中断，启动保护必须重新建立且后续启动不能滑动下限。
+test_new_running_resets_retry_floor() (
+    local dir now floor status=0 operation
+    local -A calendar=() outcome=()
+    fixture || return 1
+    calendar[not_before]=$((now-60)) calendar[status]=retry_wait
+    gm_gc_state_commit_locked owner/repo calendar || return 1
+    (
+        gm_task_run_locked() { exit 99; }
+        gm_gc_one_locked owner/repo "$now" outcome
+    ) || status=$?
+    [[ $status == 99 ]] || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[status]} == running && ${calendar[last_result]} == UNKNOWN ]] || return 1
+    operation=${calendar[operation_id]}
+    GM_BOOT_GENERATION=$(cat /proc/sys/kernel/random/uuid)
+    gm_gc_startup_resume_locked owner/repo "$now" || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    floor=$(gm_gc_at_two "$(gm_gc_add_days "$(TZ=UTC date -d "@$now" +%F)" 1)" UTC) || return 1
+    printf 'new running resumed floor=%s expected=%s blocked=%s\n' "${calendar[not_before]}" "$floor" "${calendar[write_blocked]}"
+    [[ ${calendar[not_before]} == "$floor" && ${calendar[write_blocked]} == yes && ${calendar[operation_id]} == "$operation" ]] || return 1
+    GM_BOOT_GENERATION=$(cat /proc/sys/kernel/random/uuid)
+    gm_gc_startup_resume_locked owner/repo "$((floor+86400))" || return 1
+    gm_gc_state_read owner/repo calendar || return 1
+    [[ ${calendar[not_before]} == "$floor" ]]
+)
+
+for test in test_new_running_resets_retry_floor test_legacy_rebuild_evidence_is_not_inferred test_old_cleanup_cannot_release_later_corruption test_explicit_recovery_preserves_cycle test_explicit_recovery_rejects_stale_operation test_explicit_recovery_checks_conditions test_rebuilt_recovery_requires_matching_journal test_explicit_recovery_cli_never_runs_gc test_explicit_recovery_safety_gates; do
     if "$test"; then printf '[PASS] %s\n' "$test"; else printf '[FAIL] %s\n' "$test"; FAILURES=$((FAILURES+1)); fi
 done
-printf 'checks=42 failures=%s\n' "$FAILURES"
+printf 'checks=43 failures=%s\n' "$FAILURES"
 (( FAILURES == 0 ))
