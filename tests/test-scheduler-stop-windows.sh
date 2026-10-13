@@ -152,5 +152,52 @@ else
     failures=$((failures+1))
 fi
 sleep 12
+cat > "$WORK/boundary-child" <<'CHILD'
+#!/usr/bin/env bash
+trap 'exit 0' TERM INT
+printf ready > "$WORK/boundary-ready"
+for ((i=0; i<100; i++)); do sleep 0.05; done
+printf expired > "$WORK/boundary-expired"
+CHILD
+chmod 700 "$WORK/boundary-child"
+for boundary in entry hosts; do
+    export boundary
+    rm -f "$WORK/boundary-ready" "$WORK/boundary-expired"
+    if bash -c '
+        source "$ROOT/scripts/git-mirror-scheduler.sh"
+        source "$ROOT/scripts/lib/lifecycle.sh"
+        gm_scheduler_log() { :; }
+        gm_scheduler_freeze() { gm_monotonic_ms frozen; }
+        trap gm_scheduler_on_stop_signal TERM INT
+        armed=no injected=no frozen=0 signaled=0
+        inject_boundary() {
+            if [[ $armed == yes && $injected == no ]]; then
+                injected=yes
+                while [[ ! -e $WORK/boundary-ready ]]; do sleep 0.01; done
+                gm_monotonic_ms signaled
+                kill -TERM "$BASHPID"
+            elif [[ -n $GM_SCHEDULER_CHILD && $BASH_COMMAND == "(( GM_SCHEDULER_STOP == 0 ))" ]]; then
+                armed=yes
+            fi
+            return 0
+        }
+        set -T
+        trap inject_boundary DEBUG
+        status=0
+        if [[ $boundary == entry ]]; then
+            gm_scheduler_run_entry "$WORK/boundary-child" || status=$?
+        else
+            gm_scheduler_run_task hosts "$WORK/boundary-child" || status=$?
+        fi
+        trap - DEBUG
+        printf "boundary=%s injected=%s freeze_ms=%s status=%s\n" "$boundary" "$injected" "$((frozen-signaled))" "$status"
+        [[ $injected == yes && $status != 0 && $frozen -ge $signaled && $((frozen-signaled)) -lt 1000 && ! -e $WORK/boundary-expired && -z $GM_SCHEDULER_CHILD ]]
+    '; then
+        printf '[PASS] STOP判断后等待前TERM %s\n' "$boundary"
+    else
+        printf '[FAIL] STOP判断后等待前TERM %s\n' "$boundary"
+        failures=$((failures+1))
+    fi
+done
 printf '停止窗口失败数：%s\n' "$failures"
 [[ $failures == 0 ]]
