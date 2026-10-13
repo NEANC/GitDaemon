@@ -1145,6 +1145,21 @@ test_http_503_classification() {
     [[ ${result[transport_only]} == no ]]
 }
 
+# CONNECT 拒绝属于代理传输失败，源站拒绝及混合写入错误仍失败关闭。
+test_connect_403_classification() {
+    local text="fatal: unable to access 'https://github.com/owner/repo.git/': CONNECT tunnel failed, response 403"
+    local -A result=()
+    gm_sync_classify_failure fetch "$text" result || return 1
+    [[ ${result[transport_only]} == yes ]] || return 1
+    gm_sync_classify_failure fetch "$text"$'\nerror: unable to write object' result || return 1
+    [[ ${result[transport_only]} == no ]] || return 1
+    gm_sync_classify_failure fetch "${text%CONNECT*}The requested URL returned error: 403" result || return 1
+    [[ ${result[transport_only]} == no ]] || return 1
+    gm_sync_classify_failure maintenance "$text" result || return 1
+    [[ ${result[transport_only]} == no ]]
+}
+
+check 'test_connect_403_classification' test_connect_403_classification
 check 'test_http_503_classification' test_http_503_classification
 check 'test_fetch_failed_refs_succeed' test_fetch_failed_refs_succeed
 check 'test_fetch_success_maintenance_error' test_fetch_success_with_maintenance_error 'error: automatic maintenance failed'

@@ -287,6 +287,7 @@ gm_sync_classify_failure() {
             '') ;;
             "fatal: unable to access "*': Could not resolve host: '*|"fatal: unable to access "*': Could not resolve proxy: '*|"fatal: unable to access "*': Failed to connect to '*|"fatal: unable to access "*': Connection timed out'*) seen=yes ;;
             "fatal: unable to access "*': The requested URL returned error: 503') seen=yes ;;
+            "fatal: unable to access "*': CONNECT tunnel failed, response 403') seen=yes ;;
             *) unknown=yes ;;
         esac
     done <<< "$diagnostics"
