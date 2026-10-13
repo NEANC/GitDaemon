@@ -2535,7 +2535,7 @@ c2_assert_reclaimed_log() {
             docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT:ro" --entrypoint /bin/sh "$IMAGE" \
                 -c "test -s $C2_MOUNT/runtime/frozen && test ! -e $C2_MOUNT/runtime/task && test ! -L $C2_MOUNT/runtime/task"
             return ;;
-        timedhosts) label='地址刷新' ;;
+        timedhosts) label='hosts' ;;
         *) return 1 ;;
     esac
     docker run --rm --user 10001:10001 -v "$C2_VOL:$C2_MOUNT" --entrypoint /bin/sh "$IMAGE" \
