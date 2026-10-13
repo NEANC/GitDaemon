@@ -2377,7 +2377,11 @@ c2_scene_wait_tree() {
     local mode=${1-} deadline=$((SECONDS+${2:-120})) remaining status
     while (( SECONDS < deadline )); do
         remaining=$((deadline-SECONDS))
-        c2_scene_read_timeline "$remaining" || return 1
+        if ! c2_scene_read_timeline "$remaining"; then
+            (( SECONDS < deadline )) || return 1
+            sleep 0.25
+            continue
+        fi
         remaining=$((deadline-SECONDS))
         (( remaining > 0 )) || return 1
         status=0
@@ -2460,7 +2464,11 @@ c2_scene_wait_sampler() {
     local deadline=$((SECONDS+${1:-20})) remaining status
     while (( SECONDS < deadline )); do
         remaining=$((deadline-SECONDS))
-        c2_scene_read_timeline "$remaining" || return 1
+        if ! c2_scene_read_timeline "$remaining"; then
+            (( SECONDS < deadline )) || return 1
+            sleep 0.2
+            continue
+        fi
         remaining=$((deadline-SECONDS))
         (( remaining > 0 )) || return 1
         status=0
