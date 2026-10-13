@@ -164,6 +164,10 @@ run_task_best_effort() {
     fi
     exec {gate}>&-
     rm -f "$directory/gate" && rmdir "$directory" || unsafe=1
+    while [[ $GM_ENTRYPOINT_STOP == 0 ]]; do
+        kill -0 "$GM_ENTRYPOINT_TASK" 2>/dev/null || break
+        sleep 0.05
+    done
     if [[ $GM_ENTRYPOINT_STOP == 0 ]]; then wait "$GM_ENTRYPOINT_TASK" || status=$?; fi
     gm_task_group_alive "$pgid" "$pgid" || alive=$?
     if [[ $GM_ENTRYPOINT_STOP != 0 ]] || (( alive != 1 || unsafe != 0 )); then

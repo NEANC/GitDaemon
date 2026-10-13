@@ -55,7 +55,36 @@ test_hosts_unconfirmed() (
     [[ $status == 1 && ! -e $RUN_ROOT/written ]]
 )
 
+# 在停止判断通过后的指令边界注入真实信号，避免随机延时掩盖丢唤醒。
+test_hosts_wait_boundary() (
+    local signal=$1 armed=no injected=no signaled=0 frozen=0 status=0
+    RUN_ROOT=$TEST_ROOT/boundary-$signal
+    mkdir -p "$RUN_ROOT/runtime"
+    gm_task_freeze() { GM_LOCAL_FROZEN=yes; gm_monotonic_ms frozen; }
+    trap on_stop_signal TERM INT
+    inject_boundary() {
+        if [[ $armed == yes && $injected == no ]]; then
+            injected=yes
+            while [[ ! -e $RUN_ROOT/ready ]]; do sleep 0.01; done
+            gm_monotonic_ms signaled
+            kill -"$signal" "$BASHPID"
+        elif [[ -n $GM_ENTRYPOINT_TASK && $BASH_COMMAND == '[[ $GM_ENTRYPOINT_STOP == 0 ]]' ]]; then
+            armed=yes
+        fi
+        return 0
+    }
+    set -T
+    trap inject_boundary DEBUG
+    run_task_best_effort hosts bash -c 'trap "exit 0" TERM INT; printf ready > "$1/ready"; for ((i=0;i<100;i++)); do sleep 0.05; done; printf expired > "$1/expired"' _ "$RUN_ROOT" || status=$?
+    trap - DEBUG
+    printf 'hosts boundary=%s injected=%s freeze_ms=%s status=%s\n' "$signal" "$injected" "$((frozen-signaled))" "$status"
+    [[ $injected == yes && $status == 130 && $frozen -ge $signaled && $((frozen-signaled)) -lt 1000 && ! -e $RUN_ROOT/expired && -z $GM_ENTRYPOINT_TASK ]]
+)
+
 failures=0
+for signal in TERM INT; do
+    test_hosts_wait_boundary "$signal" || failures=$((failures+1))
+done
 for mode in success failure; do
     test_hosts_stop "$mode" || failures=$((failures+1))
 done
