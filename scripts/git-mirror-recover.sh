@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/git-mirror-sync.sh" || return 1
+if ! declare -F gm_sync_one_locked >/dev/null; then
+    source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/git-mirror-sync.sh" || return 1
+fi
 source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/repository-recovery.sh" || return 1
 
 # 启动扫描仅凭当前配置、管理记录与替换副本证据接受悬空别名。
@@ -86,6 +88,12 @@ gm_startup_run_repo() {
     local repo=$1 operation=${2-check} status=0
     local -A startup_task=()
     gm_begin_operation sync || return $?
+    if [[ $operation != check ]]; then
+        gm_startup_gate_validate && gm_match_record "$RUN_ROOT/runtime/checks-complete" "$GM_BOOT_GENERATION" || {
+            gm_lock_release sync && gm_lock_release instance
+            return 1
+        }
+    fi
     gm_task_run_locked "$repo" "$operation" startup_task bash "$INSTALL_ROOT/git-mirror-recover.sh" --worker "$repo" "$operation" "${GM_LOCK_FDS[instance]}" "${GM_LOCK_FDS[sync]}" || status=$?
     gm_task_finish_locked startup_task retain || return 2
     [[ ${startup_task[result]} != UNSAFE ]] || return 2
@@ -223,6 +231,7 @@ gm_recover_main() {
                 check) gm_startup_check_one "$repo" ;;
                 recovery) gm_startup_network_one "$repo" ;;
                 sync)
+                    gm_match_record "$RUN_ROOT/runtime/checks-complete" "$GM_BOOT_GENERATION" || return 1
                     gm_load_sync_credentials "$RUN_ROOT" || return 1
                     LOG_FILE=$RUN_ROOT/logs/sync.log
                     clear_proxy_environment && prepare_credentials && load_resolve_args "$RUN_ROOT/hosts/github-hosts.snapshot" && build_transport_sequence || return 1

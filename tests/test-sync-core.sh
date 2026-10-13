@@ -781,10 +781,13 @@ gm_sync_main_checks_dispatch_after_first_repo_result() {
     load_resolve_args() { return 0; }
     build_transport_sequence() { return 0; }
     # 首库注入指定结果，后续库若被派发则留下可断言的写入记录。
-    sync_repo() {
-        printf 'sync %s\n' "$1" >> "$calls"
-        if [[ $1 == owner/first ]]; then return "$first_status"; fi
-        return 0
+    source() {
+        builtin source "$@" || return $?
+        gm_recover_scheduled() {
+            printf 'sync %s\n' "$1" >> "$calls"
+            if [[ $1 == owner/first && $first_status != 0 ]]; then return "$first_status"; fi
+            gm_publish_short_links "$RUN_ROOT" "$1"
+        }
     }
     gm_publish_short_links() { printf 'publish %s\n' "$2" >> "$calls"; }
     gm_prune_short_links() { printf 'prune\n' >> "$calls"; }
@@ -990,7 +993,13 @@ test_single_repo_cli() {
     prepare_credentials() { return 0; }
     load_resolve_args() { return 0; }
     build_transport_sequence() { return 0; }
-    sync_repo() { printf '%s\n' "$1" >> "$calls"; }
+    source() {
+        builtin source "$@" || return $?
+        gm_recover_scheduled() {
+            [[ ! -e $RUN_ROOT/runtime/frozen ]] || return 1
+            printf '%s\n' "$1" >> "$calls"
+        }
+    }
     gm_publish_short_links() { return 0; }
     gm_prune_short_links() { return 0; }
     gm_sync_main --repo owner/second || return 1

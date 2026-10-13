@@ -337,6 +337,7 @@ test_startup_no_network_before_checks() {
     [[ $text == *'gm_startup_network'* ]]
 }
 
+check '启动恢复与补充行为测试' bash "$ROOT/tests/test-startup-followup.sh"
 check 'test_startup_no_network_before_checks' test_startup_no_network_before_checks
 check '容器脚本通过 Bash 语法检查' docker_scripts_syntax
 check '每个执行阶段的 RUN 之前已设置 USER' dockerfile_user_before_run

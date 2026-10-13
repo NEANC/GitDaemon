@@ -323,8 +323,9 @@ gm_scheduler_run_entry() {
     GM_SCHEDULER_CHILD=$!
     wait "$GM_SCHEDULER_CHILD" || status=$?
     if (( GM_SCHEDULER_STOP != 0 )); then
+        status=1
         trap '' TERM INT
-        gm_scheduler_freeze || return 1
+        gm_scheduler_freeze || status=1
         kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
         wait "$GM_SCHEDULER_CHILD" 2>/dev/null || true
         trap gm_scheduler_on_stop_signal TERM INT

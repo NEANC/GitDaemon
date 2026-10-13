@@ -78,6 +78,7 @@ source() {
     fi
     if [[ ${1-} == "$INSTALL_ROOT/git-mirror-recover.sh" ]]; then
         gm_startup_gate_validate() { return 0; }
+        gm_recover_scheduled() { git config-boundary; }
     fi
     if [[ ${1-} == "$INSTALL_ROOT/lib/repository-recovery.sh" ]]; then
         sync_repo() { git config-boundary; }

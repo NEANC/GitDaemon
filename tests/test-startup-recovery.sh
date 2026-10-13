@@ -245,6 +245,9 @@ test_cli_checks_gate_before_network() {
     for mode in missing stale; do
         (
             setup_cli_probe "cli-gate-$mode" || exit 1
+            gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first || true
+            [[ -s $RUN_ROOT/fetch.pid ]] || exit 1
+            rm "$RUN_ROOT/fetch.pid"
             if [[ $mode == missing ]]; then rm "$RUN_ROOT/runtime/checks-complete"; else printf 'stale\n' > "$RUN_ROOT/runtime/checks-complete"; fi
             status=0
             gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first || status=$?
@@ -268,7 +271,7 @@ test_cli_term_joins_writer() {
     local pid writer= status=0 i result=0
     (gm_lock_release container; exec env -u GM_BOOT_GENERATION PROBE_MODE=wait "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/first) &
     pid=$!
-    for ((i=0; i<200; i++)); do
+    for ((i=0; i<3000; i++)); do
         [[ ! -s $RUN_ROOT/fetch.pid ]] || break
         sleep 0.02
     done
@@ -281,6 +284,7 @@ test_cli_term_joins_writer() {
         sleep 16
     fi
     [[ ! -f $RUN_ROOT/repos/owner/first.git/git-daemon-export-ok ]] || result=1
+    printf 'CLI TERM status=%s writer=%s result=%s\n' "$status" "$writer" "$result"
     return "$result"
 }
 

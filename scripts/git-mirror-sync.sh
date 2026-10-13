@@ -569,8 +569,8 @@ gm_prune_short_links() {
 }
 
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
-gm_sync_main() (
-    local index failed=0 install snapshot status selected= found=no
+gm_sync_main() {
+    local index failed=0 install status selected= found=no
     if [[ ${1-} == --help || ${1-} == -h ]]; then
         printf '%s\n' '用法：git-mirror-sync.sh [--repo owner/repo]'
         return 0
@@ -588,39 +588,27 @@ gm_sync_main() (
         done
         [[ $found == yes ]] || { gm_error '仓库未配置'; return 2; }
     fi
-    source "$install/lib/repository-recovery.sh" || return 1
-    gm_load_sync_credentials "${RUN_ROOT-/var/lib/git-daemon}" || return 1
-    gm_begin_operation sync || return $?
-    gm_startup_gate_validate || return 1
-    CONFIG_DIR=$RUN_ROOT/config
-    MIRROR_ROOT=$RUN_ROOT/repos
-    LOG_DIR=$RUN_ROOT/logs
-    RUN_DIR=$RUN_ROOT/runtime
-    LOG_FILE=$LOG_DIR/sync.log
-    LOCK_FILE=$RUN_DIR/sync.lock
-    GITHUB_HOST=${GITHUB_HOST:-github.com}
-    snapshot=$RUN_ROOT/hosts/github-hosts.snapshot
-    clear_proxy_environment || return 1
-    prepare_credentials || return 1
-    load_resolve_args "$snapshot" || return 1
-    build_transport_sequence || return 1
+    source "$install/git-mirror-recover.sh" || return 1
+    trap 'gm_request_stop task TERM' TERM
+    trap 'gm_request_stop task INT' INT
     for index in "${!GM_REPOS[@]}"; do
         if [[ -n $selected && ${GM_REPOS[$index]} != "$selected" ]]; then continue; fi
-        if sync_repo "${GM_REPOS[$index]}" "${GM_BRANCHES[$index]}"; then
-            if gm_publish_short_links "$RUN_ROOT" "${GM_REPOS[$index]}"; then
-                :
-            else
-                failed=1
-            fi
+        if gm_recover_scheduled "${GM_REPOS[$index]}" sync; then
+            :
         else
             status=$?
             if (( status == 2 )); then return 2; fi
             failed=1
         fi
+        [[ -z ${GM_STOP_SCOPE-} ]] || return 1
     done
-    if [[ -z $selected ]]; then gm_prune_short_links "$RUN_ROOT" || failed=1; fi
+    if [[ -z $selected ]]; then
+        gm_begin_operation sync || return $?
+        gm_prune_short_links "$RUN_ROOT" || failed=1
+        gm_lock_release sync && gm_lock_release instance || return 2
+    fi
     return "$failed"
-)
+}
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     set -euo pipefail
