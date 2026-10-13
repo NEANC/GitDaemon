@@ -383,6 +383,8 @@ docker volume rm git-daemon-data
 
 每次容器启动先撤销旧导出，串行执行 `git fsck --full`，逐库检查通过后开放下载，再进行网络同步。健康旧缓存允许离线下载；完整性检查通过不代表缓存与上游实时一致，需另看最近成功同步记录。配置外遗留仓库不自动导出，也不自动删除。
 
+替换事务日志中的 `phase=cleanup_complete` 表示历史替换已完成，不表示本轮启动同步已完成。健康仓库通过启动检查且允许写入后，仍会执行启动 fetch 获取上游新引用；不能因为保留了完成日志就跳过同步，也不能把完成日志当作最新同步成功证据。
+
 本地写入失败、维护失败、中断或结果未知会要求重新检查；只有明确的网络失败且没有本地异常时保留健康发布。确认对象损坏后才从配置上游独立重建，新副本验证、发布及记录持久化成功前保留旧副本。曾在本轮启动中发布的仓库无法可靠证明读者排空时，仅撤销新下载入口，物理移动和替换延后到容器重启，不能靠一次进程扫描或手工删除标记绕过。
 
 `git-mirror-recover.sh --startup` 需要有效的容器启动上下文，不是供人工 `exec` 的解冻命令。无法安全回收进程或持久化关键状态时会停止或冻结，不能凭“容器前台就绪”推断所有仓库已恢复。
@@ -390,6 +392,8 @@ docker volume rm git-daemon-data
 ## 自动 GC
 
 每个仓库以首次发布日期为锚点，按有效 `TZ` 在锚点日期加 14 个日历日的 02:00 调用 `git gc --auto`；成功后沿原锚点每 14 天推进。没有达到 Git 清理阈值也算正常完成，不保证释放空间。离线错过的周期在启动检查后的下一个 02:00 补一次；失败或中断不推进周期，最早在失败当地日期次日 02:00 重试，重启不缩短或重复后移已保存的重试下限。
+
+真正开始新一轮 GC 时会清除上一轮的重试下限；若新一轮结果未知，恢复时必须为这次未知结果重新建立当地次日 02:00 的保护下限，不能沿用已过期的旧值立即重试。该下限一旦保存，重复启动检查不再把它逐次后移；解除写阻塞也不等于绕过保护下限。
 
 `ENABLE_CRON=no` 同时关闭自动 GC、同步和地址刷新调度，不取消启动检查与启动同步。手工单次 GC 仍受到期、冻结和共同写锁约束，不是强制清理入口。fetch 自身仍可能触发受监督的前台自动维护，因此不能承诺只在双周时刻运行维护；程序不使用 `--prune=now` 或 `--aggressive`，也不覆盖 Git 默认清理阈值。
 
@@ -433,6 +437,8 @@ docker compose exec git-daemon /usr/local/lib/git-mirror/git-mirror-gc.sh --repo
 
 单任务 TERM 只取消该任务；实例或 scheduler 停止会冻结后续写入。OpenRC restart 和普通 resume 不解除冻结，必须经过新的容器启动检查。Compose 的 `restart: unless-stopped` 可能在 scheduler 停止导致入口退出后自动重启容器，从而进入新代次检查；不能据此承诺冻结一直持续到人工操作。计划停机请使用 Compose stop，并保留 30 秒停止宽限；所有裸 `docker run` 示例也必须指定 `--stop-timeout 30`。
 
+首次 hosts 地址刷新也受入口的停止监督：收到 TERM/INT 后冻结后续任务，按已确认的独立进程组回收刷新任务及其子孙，不再继续首次同步或后续启动派发。普通下载失败可以尽力继续启动，但停止请求、冻结失败、进程组身份无法确认或子孙未安全收尾不能当作普通下载失败忽略；直接子进程退出不代表整组已退出。
+
 受控恢复可在排除根因后执行 `docker compose start git-daemon`（已停止且配置未变），或 `docker compose up -d --force-recreate`（配置或镜像改变）。不要删除 `runtime/frozen`、`runtime/stopped` 或应用锁文件来绕过启动检查。
 
 ## 验证与验收边界
@@ -459,12 +465,23 @@ docker compose config --quiet
 
 `IMAGE_TAG` 须已设置。Compose 渲染成功不验证容器启动、卷权限、端口可达或 Git 引用；上述回归包含静态检查和桩边界测试，不能整体称为容器实机验收。
 
-实机集成入口：
+实机网络验收必须经过 [docker-network-guard.sh](tests/docker-network-guard.sh)，不能直接运行内部集成脚本或手工设置 `IT_NETWORK_GUARD_READY=1` 冒充 guard。当前 guard 仅面向已授权的 `192.168.10.9` 宿主，外层管理员负责专属隔离规则，业务与 Docker 构建、运行及资源删除使用非 root 用户 `gmtest`；容器保持 UID/GID `10001:10001`、只读根、丢弃 capabilities 与命名卷约束。
+
+先固定提交、源码目录及对应产品和工具镜像，再在该授权宿主通过 guard 选择 `o1` 或 `startup`，例如（路径、镜像和唯一运行 ID 必须替换为本次实际值，证据目录必须尚不存在且不能位于 `/tmp` 或 `/var/tmp`）：
 
 ```bash
-bash tests/test-docker-integration.sh
+bash tests/docker-network-guard.sh \
+  --run-id checko1 \
+  --evidence-dir /home/gmtest/checko1-evidence \
+  --source-dir /home/gmtest/fixed-source \
+  --runner-user gmtest \
+  --mode o1 \
+  --product-image git-daemon:COMMIT7 \
+  --tools-image gm-r2-tools:20261007
 ```
 
-报告应分别记录环境、执行入口、退出码、失败、跳过与延期项目。Docker 不可用时集成入口可返回 `77`，属于跳过而非通过；缺失 Compose 也不能宣称其编排已验证。使用 `IT_FILTER` 只运行部分场景时，不得报告全套通过。
+`startup` 使用独立运行 ID 和证据目录另行执行；`probe` 仅校准网络边界，不能替代业务验收。当前 guard 支持 `probe/o1/startup/full`，不提供 `c2` 模式；内部 `IT_FILTER=c2` 的六个停止场景不能作为绕过 guard 的理由。不可通过重跑 `full` 冒充定向筛选，也不应为消除 mapping 延期擅自新增 NAT。guard 前置条件不满足时应报告阻塞或跳过。
+
+报告应分别记录固定提交与镜像 ID、环境、执行入口、外层退出码、`PRIMARY_EXIT`、`CLEANUP_EXIT`、失败、跳过与延期项目，并确认本轮标签资源已清空。Docker 不可用时集成入口可返回 `77`，属于跳过而非通过；缺失 Compose 也不能宣称其编排已验证。使用 `IT_FILTER` 只运行部分场景时，不得报告全套通过；保留隔离或清理失败也不能报告完整通过。
 
 **真实 mapping 成功验证不能被静态接线、日志出现 mapping、系统 DNS 回退成功或延期计数替代。** `IT_DEFER_MAPPING=1` 会显式输出 `DEFER` 并累计延期，相关 NAT 与真实 mapping 成功断言仍未验收。没有真实执行证据时，只报告已完成的文档或静态检查，不承诺 CI、代理、映射或容器集成通过。
