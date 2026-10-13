@@ -229,7 +229,9 @@ for arg in "$@"; do
     if [[ $arg == fetch ]]; then
         printf '%s\n' "$BASHPID" > "$RUN_ROOT/fetch.pid"
         if [[ -f $RUN_ROOT/runtime/task ]]; then cp "$RUN_ROOT/runtime/task" "$RUN_ROOT/fetch.task"; fi
+        cat "$RUN_ROOT/runtime/task" >> "$RUN_ROOT/fetch.tasks"
         if [[ ${PROBE_MODE-} == wait ]]; then sleep 15; fi
+        if [[ ${PROBE_MODE-} == multiwait && $* == *owner/first.git* ]]; then sleep 15; fi
         printf 'fatal: unable to access upstream: The requested URL returned error: 503\n' >&2
         exit 128
     fi
@@ -287,6 +289,62 @@ test_cli_term_joins_writer() {
     printf 'CLI TERM status=%s writer=%s result=%s\n' "$status" "$writer" "$result"
     return "$result"
 }
+
+# 在两库独立 CLI 首库拉取时发送真实信号，验证取消只结束本次调用且不触碰后库或清理链接。
+test_cli_multirepo_signal_stops_invocation() {
+    local signal=$1
+    setup_cli_probe "cli-multi-$signal" || return 1
+    export LOG_FILE=$RUN_ROOT/logs/sync.log
+    git --git-dir="$RUN_ROOT/repos/owner/second.git" remote add origin https://github.com/owner/second.git || return 1
+    gm_create_short_link "$RUN_ROOT" owner/second obsolete || return 1
+    cp "$RUN_ROOT/state/repos/owner/second.state" "$RUN_ROOT/second.before" || return 1
+    local pid writer= status=0 i result=0 repo operation boot leader start pgid session operation_id begin end group_status
+    set -m
+    (gm_lock_release container; exec env -u GM_BOOT_GENERATION PROBE_MODE=multiwait "$INSTALL_ROOT/git-mirror-sync.sh") &
+    pid=$!
+    set +m
+    for ((i=0; i<3000; i++)); do
+        [[ ! -s $RUN_ROOT/fetch.tasks ]] || break
+        sleep 0.02
+    done
+    if [[ -s $RUN_ROOT/fetch.tasks ]]; then
+        writer=$(cat "$RUN_ROOT/fetch.pid")
+        read -r repo operation boot leader start pgid session operation_id < "$RUN_ROOT/fetch.task"
+        [[ $repo == owner/first ]] || result=1
+    else result=1
+    fi
+    gm_monotonic_ms begin
+    kill -"$signal" "$pid" 2>/dev/null || result=1
+    for ((i=0; i<500; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; result=1; fi
+    wait "$pid" || status=$?
+    gm_monotonic_ms end
+    [[ $status != 0 && $((end-begin)) -lt 10000 && ! -e $RUN_ROOT/runtime/task ]] || result=1
+    if [[ -n $writer ]]; then
+        kill -0 "$writer" 2>/dev/null && result=1
+        group_status=0
+        gm_task_group_alive "$pgid" "$session" || group_status=$?
+        [[ $group_status == 1 ]] || result=1
+    fi
+    [[ $(wc -l < "$RUN_ROOT/fetch.tasks") == 1 ]] || result=1
+    cmp "$RUN_ROOT/second.before" "$RUN_ROOT/state/repos/owner/second.state" || result=1
+    [[ ! -f $RUN_ROOT/repos/owner/first.git/git-daemon-export-ok && -f $RUN_ROOT/repos/owner/second.git/git-daemon-export-ok ]] || result=1
+    [[ -L $RUN_ROOT/repos/obsolete.git && -f $RUN_ROOT/config/managed-links/obsolete.git ]] || result=1
+    [[ ! -e $RUN_ROOT/runtime/frozen && ! -e $RUN_ROOT/runtime/stopped ]] || result=1
+    printf 'CLI multi %s status=%s elapsed_ms=%s fetches=%s result=%s\n' "$signal" "$status" "$((end-begin))" "$(wc -l < "$RUN_ROOT/fetch.tasks")" "$result"
+    status=0
+    gm_without_container_lease env -u GM_BOOT_GENERATION "$INSTALL_ROOT/git-mirror-sync.sh" --repo owner/second || status=$?
+    [[ $status == 1 && $(tail -n 1 "$RUN_ROOT/fetch.tasks") == owner/second\ * && ! -e $RUN_ROOT/runtime/task ]] || result=1
+    return "$result"
+}
+
+for signal in TERM INT; do
+    CHECKS=$((CHECKS+1))
+    if ( test_cli_multirepo_signal_stops_invocation "$signal" ); then printf '[PASS] CLI multi %s\n' "$signal"; else printf '[FAIL] CLI multi %s\n' "$signal"; FAILURES=$((FAILURES+1)); fi
+done
 
 for test in test_cli_checks_gate_before_network test_cli_transport_failure_is_supervised test_cli_term_joins_writer test_cli_sync_validates_live_generation test_legacy_export_cannot_bypass test_first_healthy_available_before_second_checked test_resume_cannot_clear_freeze test_startup_requires_live_owner test_offline_healthy_downloads test_startup_no_network_before_checks test_daemon_rejects_stale_gate test_resume_without_context_rejected test_bad_repository_keeps_other_available test_worker_failure_revokes_publication test_unknown_writer_blocks_startup test_startup_uses_delivered_find test_scheduler_stop_freezes test_frozen_worker_revokes_before_unlock test_entry_signal_only_records_stop test_check_failure_scope; do
     CHECKS=$((CHECKS+1))

@@ -343,7 +343,7 @@ gm_task_finish_locked() {
     if [[ ${2-release} != retain ]]; then
         gm_lock_release sync && gm_lock_release instance || return 1
     fi
-    if [[ ${GM_STOP_SCOPE-} == task ]]; then unset GM_STOP_SCOPE GM_STOP_REASON; fi
+    if [[ ${GM_STOP_SCOPE-} == task && ${GM_RETAIN_TASK_STOP-no} != yes ]]; then unset GM_STOP_SCOPE GM_STOP_REASON; fi
     return 0
 }
 

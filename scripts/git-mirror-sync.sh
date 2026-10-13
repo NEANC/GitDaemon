@@ -571,6 +571,7 @@ gm_prune_short_links() {
 # 显式执行同步前读取纯数据并完成整组预检，不创建短链接。
 gm_sync_main() {
     local index failed=0 install status selected= found=no
+    local GM_RETAIN_TASK_STOP=yes
     if [[ ${1-} == --help || ${1-} == -h ]]; then
         printf '%s\n' '用法：git-mirror-sync.sh [--repo owner/repo]'
         return 0
