@@ -32,7 +32,7 @@ fi
 if ! bash "$ROOT/tests/test-scheduler.sh"; then
     fail '用户态调度行为测试'
 fi
-for suite in repository-state task-lifecycle repository-recovery recovery-lifecycle gc-schedule gc scheduler-recovery scheduler-stop-windows; do
+for suite in repository-state task-lifecycle repo-gate-signals repository-recovery recovery-lifecycle gc-schedule gc scheduler-recovery scheduler-stop-windows scheduler-hosts-gate; do
     if ! bash "$ROOT/tests/test-$suite.sh"; then fail "恢复与 GC：$suite"; fi
 done
 if ! bash "$ROOT/tests/test-docker.sh"; then
