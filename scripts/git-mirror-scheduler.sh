@@ -202,19 +202,9 @@ gm_scheduler_take() {
     return 1
 }
 
-# 收到终止信号时置位停止标志，并定向终止当前任务进程组与休眠子进程，不遗留子进程；
-# 尚未确认独立进程组时只终止直接子进程，绝不按未经校验的 PID 推断进程组。
+# 信号处理只登记停止意图，由主控制流冻结与回收。
 gm_scheduler_on_stop_signal() {
     GM_SCHEDULER_STOP=1
-    if [[ -n ${GM_SCHEDULER_CHILD-} ]]; then
-        if [[ -n ${GM_SCHEDULER_CHILD_PGID-} ]]; then
-            kill -TERM -"$GM_SCHEDULER_CHILD_PGID" 2>/dev/null || true
-        fi
-        kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
-    fi
-    if [[ -n ${GM_SCHEDULER_SLEEP_CHILD-} ]]; then
-        kill -TERM "$GM_SCHEDULER_SLEEP_CHILD" 2>/dev/null || true
-    fi
     return 0
 }
 
@@ -227,6 +217,10 @@ gm_scheduler_sleep_until() {
         sleep 1 &
         GM_SCHEDULER_SLEEP_CHILD=$!
         wait "$GM_SCHEDULER_SLEEP_CHILD" 2>/dev/null || true
+        if (( GM_SCHEDULER_STOP != 0 )); then
+            kill -TERM "$GM_SCHEDULER_SLEEP_CHILD" 2>/dev/null || true
+            wait "$GM_SCHEDULER_SLEEP_CHILD" 2>/dev/null || true
+        fi
         GM_SCHEDULER_SLEEP_CHILD=
     done
 }
@@ -274,7 +268,9 @@ gm_scheduler_wait_group_gone() {
 # 启动时即校验真实进程组 ID（不臆断 $! 等于 PGID），未确认到进程组时明确不声称回收。
 gm_scheduler_run_task() {
     local label=$1 script=$2 status=0 pgid=
+    (( GM_SCHEDULER_STOP == 0 )) || return 1
     gm_scheduler_log "开始$label：$(basename -- "$script")"
+    (( GM_SCHEDULER_STOP == 0 )) || return 1
     setsid "$script" &
     GM_SCHEDULER_CHILD=$!
     if pgid=$(gm_scheduler_task_group "$GM_SCHEDULER_CHILD"); then
@@ -284,8 +280,11 @@ gm_scheduler_run_task() {
         GM_SCHEDULER_CHILD_PGID=
         gm_scheduler_log "$label 未能确认任务独立进程组，停止时仅回收直接子进程"
     fi
-    wait "$GM_SCHEDULER_CHILD" || status=$?
+    if (( GM_SCHEDULER_STOP == 0 )); then wait "$GM_SCHEDULER_CHILD" || status=$?; fi
     if (( GM_SCHEDULER_STOP != 0 )); then
+        gm_scheduler_freeze || status=1
+        if [[ -n $pgid ]]; then kill -TERM -"$pgid" 2>/dev/null || true; fi
+        kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
         if [[ -n $pgid ]] && gm_scheduler_wait_group_gone "$pgid"; then
             gm_scheduler_log "$label 已回收进程组全部子孙"
         elif [[ -n $pgid ]]; then
@@ -318,17 +317,41 @@ gm_scheduler_freeze() {
 
 # 仓库入口自身监督写入组，调度器只向监督者请求取消并等待其收尾。
 gm_scheduler_run_entry() {
-    local status=0
+    local status=0 start now sent=no
+    local -A identity=() current=()
+    (( GM_SCHEDULER_STOP == 0 )) || return 1
+    source "$(dirname -- "${BASH_SOURCE[0]}")/lib/lifecycle.sh" || return 1
+    (( GM_SCHEDULER_STOP == 0 )) || return 1
     "$@" &
     GM_SCHEDULER_CHILD=$!
-    wait "$GM_SCHEDULER_CHILD" || status=$?
+    gm_process_identity "$GM_SCHEDULER_CHILD" identity || true
+    if (( GM_SCHEDULER_STOP == 0 )); then wait "$GM_SCHEDULER_CHILD" || status=$?; fi
     if (( GM_SCHEDULER_STOP != 0 )); then
         status=1
         trap '' TERM INT
+        gm_monotonic_ms start || { GM_SCHEDULER_UNSAFE=1; trap gm_scheduler_on_stop_signal TERM INT; return 1; }
         gm_scheduler_freeze || status=1
-        kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
-        wait "$GM_SCHEDULER_CHILD" 2>/dev/null || true
+        while :; do
+            if ! gm_process_identity "$GM_SCHEDULER_CHILD" current; then
+                [[ ! -e /proc/$GM_SCHEDULER_CHILD ]] || GM_SCHEDULER_UNSAFE=1
+                break
+            fi
+            if [[ ${identity[start]-} != "${current[start]}" || ${current[ppid]} != "$BASHPID" ]]; then
+                GM_SCHEDULER_UNSAFE=1
+                break
+            fi
+            [[ ${current[state]} != Z && ${current[state]} != X ]] || break
+            if [[ $sent == no ]]; then
+                kill -TERM "$GM_SCHEDULER_CHILD" 2>/dev/null || true
+                sent=yes
+            fi
+            gm_monotonic_ms now || { GM_SCHEDULER_UNSAFE=1; break; }
+            if (( now-start >= 7000 )); then GM_SCHEDULER_UNSAFE=1; break; fi
+            sleep 0.05
+        done
+        if [[ ${GM_SCHEDULER_UNSAFE-} != 1 ]]; then wait "$GM_SCHEDULER_CHILD" 2>/dev/null || true; fi
         trap gm_scheduler_on_stop_signal TERM INT
+        [[ ${GM_SCHEDULER_UNSAFE-} != 1 ]] || return 1
     fi
     GM_SCHEDULER_CHILD=
     return "$status"
@@ -444,6 +467,7 @@ gm_scheduler_main() {
         fi
     done
     gm_scheduler_freeze || return 1
+    [[ ${GM_SCHEDULER_UNSAFE-} != 1 ]] || return 1
     gm_scheduler_log '调度器收到停止信号，退出'
     return 0
 }

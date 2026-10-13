@@ -86,5 +86,71 @@ else
     printf '[FAIL] 冻结失败未完整收尾\n'
     failures=$((failures+1))
 fi
+for boundary in handler entry hosts; do
+    export boundary
+    if bash -c '
+        source "$ROOT/scripts/git-mirror-scheduler.sh"
+        gm_scheduler_freeze() { return 0; }
+        gm_scheduler_log() { :; }
+        case $boundary in
+            handler)
+                kill() { printf "signal\n" >> "$WORK/handler-signal"; }
+                GM_SCHEDULER_CHILD=999999 GM_SCHEDULER_CHILD_PGID=999999 GM_SCHEDULER_SLEEP_CHILD=999998
+                gm_scheduler_on_stop_signal
+                [[ $GM_SCHEDULER_STOP == 1 && ! -e $WORK/handler-signal ]]
+                ;;
+            entry)
+                GM_SCHEDULER_STOP=1
+                gm_scheduler_run_entry bash -c '\''printf started > "$WORK/stopped-entry"'\'' || true
+                [[ ! -e $WORK/stopped-entry ]]
+                ;;
+            hosts)
+                GM_SCHEDULER_STOP=1
+                gm_scheduler_run_task hosts "$WORK/child" || true
+                [[ ! -e $WORK/finished ]]
+                ;;
+        esac
+    '; then
+        printf '[PASS] 停止门边界 %s\n' "$boundary"
+    else
+        printf '[FAIL] 停止门边界 %s\n' "$boundary"
+        failures=$((failures+1))
+    fi
+    rm -f "$WORK/finished"
+done
+cat > "$WORK/stubborn" <<'CHILD'
+#!/usr/bin/env bash
+trap '' TERM INT
+printf '%s\n' "$BASHPID" > "$WORK/stubborn.pid"
+sleep 12
+CHILD
+chmod 700 "$WORK/stubborn"
+bash -c '
+    source "$ROOT/scripts/git-mirror-scheduler.sh"
+    INSTALL_ROOT=$ROOT/scripts
+    gm_scheduler_freeze() { :; }
+    trap gm_scheduler_on_stop_signal TERM INT
+    status=0
+    gm_scheduler_run_entry "$WORK/stubborn" || status=$?
+    [[ $status != 0 && ${GM_SCHEDULER_UNSAFE-} == 1 && -n $GM_SCHEDULER_CHILD ]] || exit 1
+' &
+driver=$!
+for ((i=0; i<100; i++)); do
+    [[ ! -f $WORK/stubborn.pid ]] || break
+    sleep 0.02
+done
+[[ -f $WORK/stubborn.pid ]]
+SECONDS=0
+kill -TERM "$driver"
+status=0
+wait "$driver" || status=$?
+elapsed=$SECONDS
+if [[ $status == 0 && $elapsed -lt 10 ]]; then
+    printf '[PASS] 监督者超时保留身份并报告不安全 elapsed=%s\n' "$elapsed"
+else
+    printf '[FAIL] 监督者收尾没有预算或丢失身份 elapsed=%s status=%s\n' "$elapsed" "$status"
+    failures=$((failures+1))
+fi
+sleep 12
 printf '停止窗口失败数：%s\n' "$failures"
 [[ $failures == 0 ]]
