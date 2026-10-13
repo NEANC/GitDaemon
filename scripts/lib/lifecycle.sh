@@ -214,7 +214,7 @@ gm_task_run_locked() {
     fi
     if (( status == 0 )) && [[ -z ${GM_STOP_SCOPE-} ]]; then
         exec {gate}<> "$directory/gate" || status=1
-        if (( status == 0 )); then printf '%s\n' "$GM_BOOT_GENERATION" >&"$gate" || status=1; exec {gate}>&-; fi
+        if (( status == 0 )); then printf '%s' "${GM_STOP_SCOPE:-$GM_BOOT_GENERATION$'\n'}" >&"$gate" || status=1; exec {gate}>&-; fi
     else
         status=1
     fi
