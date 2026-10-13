@@ -316,7 +316,7 @@ Dockerfile 基于固定 Alpine manifest 组装依赖，所有 `RUN` 前均设置
 - 不使用宿主机路径 bind mount。
 - 不把 GitHub Token 写入镜像、Git URL、命令参数或普通日志。
 - GitHub 地址数据只作为数据解析，不执行远端响应内容。
-- 地址快照下载保持 HTTPS 证书校验，并拒绝环回、私网、链路本地和元数据服务地址。
+- 地址快照下载及重定向仅允许 HTTPS，并保持证书校验；下载后的快照记录只接受白名单 `github.com` 的合法公网地址，拒绝环回、私网、链路本地和元数据服务地址。这是快照记录过滤，不是对下载源或重定向目标实际连接 IP 的防护。
 
 ## 日常操作
 
@@ -406,15 +406,28 @@ Git 原生锁和 `gc.log` 不自动删除。出现 `manual_intervention` 时先�
 | `interrupted`、`unknown`、`state_failed`、`check_failed` | 排除根因后，使用当前操作 ID 显式确认；仅通过 `fsck` 不足以自动恢复写入。 |
 | `rebuild_pending` | 等待独立重建及替换事务证据闭合，不能用手工确认冒充新副本已发布。 |
 
-若之前冻结，先通过受控容器重启完成新一轮启动检查。确认根因已解决、没有并发写入或未收尾任务后，在运行实例中读取当前记录，并使用其中的 `operation_id`：
+若之前冻结，先通过受控容器重启完成新一轮启动检查。确认根因已解决、没有并发写入或未收尾任务后，在运行实例中读取当前记录，按 `reason` 选择恢复入口：
 
 ```bash
 docker compose exec git-daemon cat /var/lib/git-daemon/state/gc/git/git.state
+```
+
+对于 `manual_intervention` 或 `environment`，处理根因后使用普通 `--repo` 入口进行恢复检查。首次 GC 预检查失败时尚未生成操作 UUID，记录可能为 `operation_id=none`；不能传入 `--recover none`，也不要自行生成 UUID：
+
+```bash
+docker compose exec git-daemon /usr/local/lib/git-mirror/git-mirror-gc.sh --repo git/git
+```
+
+存在写阻塞时，该入口先执行恢复检查；仓库健康、原生锁检查和实际写入探测通过后才可能解除阻塞，不会在同一次恢复检查中执行 GC。无写阻塞时，普通入口仍按到期条件执行 GC 检查。
+
+对于需要显式确认的 `interrupted`、`unknown`、`state_failed` 或 `check_failed`，使用当前记录中已核实的操作 UUID：
+
+```bash
 read -r -p '请输入已核实的当前 operation_id：' OPERATION_ID
 docker compose exec git-daemon /usr/local/lib/git-mirror/git-mirror-gc.sh --repo git/git --recover "$OPERATION_ID"
 ```
 
-该入口检查操作 ID、当前写阻塞、仓库健康、原生锁和实际写入条件；不会强制执行 GC，不绕过冻结或重试下限。`result=NOT_DUE` 可以表示恢复检查完成而未运行清理。读取恢复和写阻塞解除应分别核对；确认后仍有错误时保留诊断，不修改状态文件制造成功。
+显式确认入口检查操作 UUID 与当前记录一致、当前写阻塞、仓库健康、原生锁和实际写入条件；不会执行 GC，也不能代替 `rebuild_pending` 所需的替换事务证据。两种恢复方式均不绕过冻结或重试下限。`result=NOT_DUE` 可以表示恢复检查完成而未运行清理。读取恢复和写阻塞解除应分别核对；仍有错误时保留诊断，不修改状态文件制造成功。
 
 ## 停止与冻结
 
