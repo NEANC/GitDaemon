@@ -164,6 +164,7 @@ guard_runner_command() {
     local -a filter=(-u IT_FILTER) entry=(--integration)
     case "$mode" in
         o1) filter=(IT_FILTER=o1) ;;
+        c2) filter=(IT_FILTER=c2) ;;
         full) ;;
         probe) entry=(--live) ;;
         startup) entry=(--startup-integration) ;;
@@ -185,7 +186,7 @@ guard_main() {
         shift 2
     done
     [[ $RUN =~ ^[a-zA-Z0-9-]{1,10}$ && $RUNNER == gmtest && $E == /* && $source == /* && -n $image && -n $tools ]] || return 2
-    case "$mode" in probe|o1|full|startup) ;; *) return 2 ;; esac
+    case "$mode" in probe|o1|c2|full|startup) ;; *) return 2 ;; esac
     [[ $(id -u) == 0 ]] || return 77
     ip -4 addr show | grep -q 'inet 192.168.10.9/' || return 77
     [[ $E != /tmp/* && $E != /var/tmp/* && ! -e $E ]] || return 73
