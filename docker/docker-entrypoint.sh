@@ -133,7 +133,7 @@ run_task_best_effort() {
     mkfifo -m 600 "$directory/gate" || return 1
     exec {gate}<> "$directory/gate" || return 1
     (if declare -F gm_lock_release >/dev/null; then gm_lock_release container; fi
-        exec setsid bash -c 'gate=$1; shift; IFS= read -r -t 2 token <&"$gate" || exit 1; exec {gate}>&-; [[ $token == GO ]] || exit 1; exec "$@"' _ "$gate" "$@") &
+        exec setsid bash -c 'gate=$1; shift; IFS= read -r -t 2 token <&"$gate" || exit 1; exec {gate}>&-; [[ $token == GO0 ]] || exit 1; exec "$@"' _ "$gate" "$@") &
     GM_ENTRYPOINT_TASK=$!
     local -A direct=() current=()
     gm_process_identity "$GM_ENTRYPOINT_TASK" direct || true
@@ -160,7 +160,7 @@ run_task_best_effort() {
         return 1
     fi
     if [[ $GM_ENTRYPOINT_STOP == 0 && ${GM_LOCAL_FROZEN-} != yes ]]; then
-        printf 'GO\n' >&"$gate" || unsafe=1
+        printf 'GO%s\n' "$GM_ENTRYPOINT_STOP" >&"$gate" || unsafe=1
     fi
     exec {gate}>&-
     rm -f "$directory/gate" && rmdir "$directory" || unsafe=1
