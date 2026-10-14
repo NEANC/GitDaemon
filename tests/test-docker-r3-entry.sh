@@ -4,10 +4,11 @@ set -Eeuo pipefail
 HERE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$HERE/docker-network-guard.sh"
 failed=0
-for mode in o1 full probe; do
+for mode in o1 c2 full probe; do
     command=$(guard_runner_command "$mode" /source run /evidence product tools) || command=''
     case "$mode" in
         o1) expected='IT_FILTER=o1' ;;
+        c2) expected='IT_FILTER=c2' ;;
         full) expected='-u IT_FILTER' ;;
         probe) expected='--live' ;;
     esac
@@ -19,6 +20,22 @@ for mode in o1 full probe; do
         printf 'FAIL missing fixed integration runner: %s\n' "$mode"
         failed=1
     fi
+done
+for mode in o1 c2 full probe startup invalid 'c2 --live'; do
+    rc=0
+    (
+        # 在首个宿主权限检查处停止，不触及 Docker 或隔离规则。
+        id() { printf '10001\n'; }
+        guard_main --run-id contract --evidence-dir /evidence --source-dir /source --runner-user gmtest --mode "$mode" --product-image product --tools-image tools
+    ) || rc=$?
+    case "$mode" in o1|c2|full|probe|startup) expected=77 ;; *) expected=2 ;; esac
+    printf 'MODE=%s EXPECT=%s ACTUAL=%s\n' "$mode" "$expected" "$rc"
+    [[ $rc == "$expected" ]] || failed=1
+done
+for mode in invalid 'c2 --live'; do
+    rc=0
+    guard_runner_command "$mode" /source run /evidence product tools >/dev/null || rc=$?
+    [[ $rc == 2 ]] || failed=1
 done
 IT_SOURCE_ONLY=1 source "$HERE/test-docker-integration.sh"
 trap - EXIT
