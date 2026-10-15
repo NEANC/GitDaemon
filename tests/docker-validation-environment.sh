@@ -60,12 +60,13 @@ validation_socket_facts() {
     stat -Lc "%d %i %u %g $real" -- "$real" 2>/dev/null
 }
 
-# 排序后的仓库输入文件哈希清单摘要；排除 .git、文档目录、证据与虚拟环境。
+# 排序后的仓库输入文件哈希清单摘要；排除 .git、证据目录、虚拟环境与 docs/superpowers/。
 validation_source_digest() {
     local dir=$1
     ( CDPATH= cd -- "$dir" 2>/dev/null || exit 1
       find . -type f \
           -not -path './.git/*' -not -path './docs/superpowers/*' \
+          -not -path './evidence/*' \
           -not -path './.venv/*' -not -path './venv/*' -not -path './env/*' \
           -not -path '*/__pycache__/*' \
           -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1 )

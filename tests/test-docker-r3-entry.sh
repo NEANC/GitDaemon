@@ -32,12 +32,35 @@ for mode in full mapping-fallback mapping-direct mapping-probe; do
         failed=1
     fi
 done
-# full 必须让子入口再次复核延期请求，不能只靠父进程。
-command=$(guard_runner_command full /source run /evidence product tools /manifest /attestation /profile) || command=''
-if [[ $command != *'IT_DEFER_MAPPING'* ]]; then
-    printf 'FAIL full child defer check missing\n'
-    failed=1
-fi
+# full 子入口必须再次复核延期请求：以 IT_DEFER_MAPPING=1 实际运行生成的命令，行为级断言返回 2。
+defer_scratch=$(mktemp -d)
+mkdir -p "$defer_scratch/source/tests" "$defer_scratch/bin"
+cat > "$defer_scratch/source/tests/test-docker-network.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'runner-entry %s\n' "$*" >> "$RUNNER_ENTRY_LOG"
+exit 0
+STUB
+cat > "$defer_scratch/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$DOCKER_STUB_ID"
+STUB
+chmod +x "$defer_scratch/source/tests/test-docker-network.sh" "$defer_scratch/bin/docker"
+export DOCKER_STUB_ID=0123456789abcdef0123456789abcdef
+export RUNNER_ENTRY_LOG="$defer_scratch/runner-entry.log"
+printf 'daemon_id\t%s\n' "$DOCKER_STUB_ID" > "$defer_scratch/manifest.tsv"
+defer_command=$(guard_runner_command full "$defer_scratch/source" run "$defer_scratch/evidence" product tools \
+    "$defer_scratch/manifest.tsv" "$defer_scratch/attestation" "$defer_scratch/profile") || defer_command=''
+rc=0
+( PATH="$defer_scratch/bin:$PATH"; export IT_DEFER_MAPPING=1; eval "$defer_command" ) || rc=$?
+printf 'FULL_DEFER_EXIT=%s\n' "$rc"
+[[ $rc == 2 ]] || { printf 'FAIL full child defer rc=%s\n' "$rc"; failed=1; }
+[[ ! -s $defer_scratch/runner-entry.log ]] || { printf 'FAIL deferred run reached child entry\n'; failed=1; }
+rc=0
+( PATH="$defer_scratch/bin:$PATH"; eval "$defer_command" ) || rc=$?
+printf 'FULL_NODEFER_EXIT=%s\n' "$rc"
+[[ $rc == 0 ]] || { printf 'FAIL full child rc=%s\n' "$rc"; failed=1; }
+[[ -s $defer_scratch/runner-entry.log ]] || { printf 'FAIL child entry not reached\n'; failed=1; }
+rm -rf "$defer_scratch"
 # 旧非 mapping 模式新增三参可空；新路径缺参返回 2。
 for mode in o1 c2 probe full mapping-fallback mapping-direct mapping-probe; do
     rc=0

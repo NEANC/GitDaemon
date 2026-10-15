@@ -14,15 +14,36 @@ VALIDATION_TEST_PRODUCT_ID=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 VALIDATION_TEST_TOOLS_ID=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 VALIDATION_TEST_PROFILE_ID=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 
-# 冻结的源码摘要算法，独立计算期望值，不信任被测实现的输出。
-frozen_source_digest() {
+# 独立期望摘要：按显式文件清单排序后求哈希，不使用被测实现的排除表达式。
+frozen_list_digest() {
+    local dir=$1; shift
+    ( CDPATH= cd -- "$dir" || exit 1
+      printf '%s\0' "$@" | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1 )
+}
+
+# 样本不含应排除目录时的全量摘要；用于构造授权清单，不复制被测排除清单。
+frozen_all_files_digest() {
     local dir=$1
     ( CDPATH= cd -- "$dir" || exit 1
-      find . -type f \
-          -not -path './.git/*' -not -path './docs/superpowers/*' \
-          -not -path './.venv/*' -not -path './venv/*' -not -path './env/*' \
-          -not -path '*/__pycache__/*' \
-          -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1 )
+      find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1 )
+}
+
+# 构造同时含普通输入与全部应排除目录（.git、docs/superpowers、虚拟环境、证据）的样本源码树。
+build_excluded_source_sample() {
+    local dir=$1
+    mkdir -p "$dir/scripts" "$dir/tests" \
+        "$dir/.git/objects" "$dir/docs/superpowers/plans" \
+        "$dir/.venv/lib" "$dir/venv/bin" "$dir/env/share" \
+        "$dir/evidence/control" "$dir/tests/__pycache__" || return 1
+    printf 'impl-one\n' > "$dir/scripts/one.sh"
+    printf 'test-one\n' > "$dir/tests/test-one.sh"
+    printf 'leak-git\n' > "$dir/.git/objects/leak"
+    printf 'leak-docs\n' > "$dir/docs/superpowers/plans/leak.md"
+    printf 'leak-venv\n' > "$dir/.venv/lib/leak.py"
+    printf 'leak-venv2\n' > "$dir/venv/bin/leak"
+    printf 'leak-env\n' > "$dir/env/share/leak"
+    printf 'leak-evidence\n' > "$dir/evidence/control/leak"
+    printf 'leak-pycache\n' > "$dir/tests/__pycache__/leak.pyc"
 }
 
 # 覆盖全部宿主身份边界，使核验可在无 VM、无 Docker 的环境下执行。
@@ -37,12 +58,13 @@ setup_identity_boundaries() {
     validation_proc_owner() { printf '10001\n'; }
 }
 
-# 建立 PATH 替身：记录并阻断 Docker、iptables 与 ip 的全部副作用。
+# 建立 PATH 替身：记录并阻断 Docker、su、iptables 与 ip 的全部副作用。
 install_effect_stubs() {
     local scratch=$1 name
     mkdir -p "$scratch/bin"
     : > "$scratch/docker-calls"
     : > "$scratch/effect-calls"
+    : > "$scratch/business-start.log"
     cat > "$scratch/bin/docker" <<'CLI'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DOCKER_STUB_LOG"
@@ -59,15 +81,21 @@ printf '%s\n' "$*" >> "$EFFECT_STUB_LOG"
 exit 0
 STUB
     done
-    chmod +x "$scratch/bin/docker" "$scratch/bin/iptables" "$scratch/bin/iptables-save" "$scratch/bin/ip"
+    # 业务 start 由 guard 经 `su -s /bin/bash $RUNNER -c ...` 降权触发，记录每次调用。
+    cat > "$scratch/bin/su" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BUSINESS_START_LOG"
+exit 0
+STUB
+    chmod +x "$scratch/bin/docker" "$scratch/bin/iptables" "$scratch/bin/iptables-save" "$scratch/bin/ip" "$scratch/bin/su"
     printf '%s\n' "$VALIDATION_TEST_DAEMON" > "$scratch/daemon-id"
-    export DOCKER_STUB_LOG="$scratch/docker-calls" DOCKER_STUB_ID="$scratch/daemon-id" EFFECT_STUB_LOG="$scratch/effect-calls"
+    export DOCKER_STUB_LOG="$scratch/docker-calls" DOCKER_STUB_ID="$scratch/daemon-id" EFFECT_STUB_LOG="$scratch/effect-calls" BUSINESS_START_LOG="$scratch/business-start.log"
     export PATH="$scratch/bin:$PATH"
 }
 
 # 拒绝样本必须零副作用：无资源创建、无规则安装、无业务启动。
 assert_no_mutation() {
-    local scratch=$1
+    local scratch=$1 starts
     if grep -Eq 'create|run|compose|network' "$scratch/docker-calls" 2>/dev/null; then
         printf 'unexpected docker mutation:\n'
         cat "$scratch/docker-calls"
@@ -78,7 +106,9 @@ assert_no_mutation() {
         cat "$scratch/effect-calls"
         return 1
     fi
-    [[ ! -e $scratch/business.started ]]
+    starts=$(wc -l < "$scratch/business-start.log" 2>/dev/null || printf '0')
+    [[ $starts == 0 ]] || { printf 'business start count=%s\n' "$starts"; return 1; }
+    return 0
 }
 
 # 新建空白工作目录与源码目录。
@@ -96,7 +126,7 @@ prepare_manifest() {
     [[ -d $scratch/source ]] || return 1
     printf 'offline attestation\n' > "$scratch/offline.txt"
     attestation_digest=$(sha256sum "$scratch/offline.txt" | cut -d' ' -f1)
-    source_digest=$(frozen_source_digest "$scratch/source") || return 1
+    source_digest=$(frozen_all_files_digest "$scratch/source") || return 1
     manifest=$scratch/environment.tsv
     {
         printf 'schema_version\t1\n'
@@ -155,6 +185,29 @@ case_load_accepts_frozen_manifest() {
     validation_environment_load "$short" || rc=$?
     [[ $rc == 2 ]] || { printf 'malformed rc=%s\n' "$rc"; return 1; }
     rm -rf "$scratch"
+}
+
+# 源码摘要独立判据：应排除目录不影响摘要、普通输入文件被纳入，期望值由显式清单算出。
+case_source_digest_excludes_non_inputs() {
+    local root full clean expected actual_full actual_clean after
+    root=$(mktemp -d) || return 1
+    full=$root/full
+    clean=$root/clean
+    build_excluded_source_sample "$full" || return 1
+    mkdir -p "$clean/scripts" "$clean/tests" || return 1
+    printf 'impl-one\n' > "$clean/scripts/one.sh"
+    printf 'test-one\n' > "$clean/tests/test-one.sh"
+    expected=$(frozen_list_digest "$clean" './scripts/one.sh' './tests/test-one.sh') || return 1
+    actual_clean=$(validation_source_digest "$clean") || return 1
+    [[ $actual_clean == "$expected" ]] || { printf 'included digest expected=%s actual=%s\n' "$expected" "$actual_clean"; return 1; }
+    actual_full=$(validation_source_digest "$full") || return 1
+    [[ $actual_full == "$actual_clean" ]] || { printf 'excluded content changed digest full=%s clean=%s\n' "$actual_full" "$actual_clean"; return 1; }
+    printf 'impl-two\n' > "$full/scripts/two.sh"
+    after=$(validation_source_digest "$full") || return 1
+    [[ $after != "$actual_full" ]] || { printf 'added input file did not change digest\n'; return 1; }
+    expected=$(frozen_list_digest "$full" './scripts/one.sh' './scripts/two.sh' './tests/test-one.sh') || return 1
+    [[ $after == "$expected" ]] || { printf 'added input digest expected=%s actual=%s\n' "$expected" "$after"; return 1; }
+    rm -rf "$root"
 }
 
 # 未获批 VM：VM UUID 与当前宿主不符必须返回 77。
@@ -263,24 +316,26 @@ case_reject_expired_manifest() {
     rm -rf "$scratch"
 }
 
-# full 继承延期请求：任何资源操作前拒绝，且入口返回 2。
+# full 继承延期请求：非 root 下也必须在任何资源操作前拒绝，且入口返回 2。
 case_reject_defer_before_mutation() {
     local scratch rc=0
     scratch=$(new_scratch) || return 1
     install_effect_stubs "$scratch"
     (
+        id() { printf '10001\n'; }
         IT_DEFER_MAPPING=1
         guard_main --run-id contract --evidence-dir "$scratch/evidence" --source-dir "$scratch/source" \
             --runner-user gmtest --mode full --product-image product --tools-image tools \
             --environment-manifest "$scratch/environment.tsv" --offline-attestation "$scratch/offline.txt" \
             --mapping-profile "$scratch/profile.tsv"
     ) || rc=$?
-    [[ $rc == 2 ]] || { printf 'defer rc=%s\n' "$rc"; return 1; }
+    [[ $rc == 2 ]] || { printf 'non-root defer rc=%s\n' "$rc"; return 1; }
     [[ ! -e $scratch/evidence ]] || { printf 'evidence created before defer rejection\n'; return 1; }
     assert_no_mutation "$scratch" || return 1
     # 绑定参数必须被接受：无延期请求时不得退化为参数错误。
     rc=0
     (
+        id() { printf '10001\n'; }
         guard_main --run-id contract --evidence-dir "$scratch/evidence" --source-dir "$scratch/source" \
             --runner-user gmtest --mode full --product-image product --tools-image tools \
             --environment-manifest "$scratch/environment.tsv" --offline-attestation "$scratch/offline.txt" \
@@ -329,7 +384,7 @@ STUB
 }
 
 failed=0
-for name in load_accepts_frozen_manifest reject_unapproved_vm reject_stale_boot reject_runner_identity reject_remote_endpoint reject_socket_replacement reject_mutable_manifest reject_expired_manifest reject_defer_before_mutation same_vm_same_daemon; do
+for name in load_accepts_frozen_manifest source_digest_excludes_non_inputs reject_unapproved_vm reject_stale_boot reject_runner_identity reject_remote_endpoint reject_socket_replacement reject_mutable_manifest reject_expired_manifest reject_defer_before_mutation same_vm_same_daemon; do
     rc=0
     ( "case_$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

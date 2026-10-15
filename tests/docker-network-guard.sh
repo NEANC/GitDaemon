@@ -234,9 +234,9 @@ guard_main() {
         full|mapping-fallback|mapping-direct|mapping-probe)
             [[ -n $manifest && -n $attestation && -n $profile ]] || return 77 ;;
     esac
-    [[ $(id -u) == 0 ]] || return 77
-    # full 在父入口先拒绝继承的延期请求，子入口再次复核，不能只靠父进程。
+    # full 的延期请求属纯输入校验，先于 root 检查，避免延期语义与 root 耦合。
     if [[ $mode == full && ${IT_DEFER_MAPPING:-} == 1 ]]; then return 2; fi
+    [[ $(id -u) == 0 ]] || return 77
     case "$mode" in
         full)
             GUARD_SOURCE=$source GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
