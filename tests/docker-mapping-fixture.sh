@@ -455,6 +455,7 @@ MAPPING_SCENARIO_RE='^mapping-[a-z0-9-]{1,32}$'
 MAPPING_UPSTREAM_HOST='github.com'
 MAPPING_PROXY_HOST='gm-proxy'
 MAPPING_UPSTREAM_PORT=443
+MAPPING_DNS_PORT=53
 MAPPING_PROXY_ACCEPT_PORT=8443
 MAPPING_PROXY_REJECT_PORT=8444
 MAPPING_PROXY_AUTHORITY="$MAPPING_UPSTREAM_HOST:$MAPPING_UPSTREAM_PORT"
@@ -941,8 +942,10 @@ mapping_fixture_start() {
         -v "$(mapping_assets_volume):$root" --entrypoint /bin/bash "$tools_image" \
         -c "$proxy_cmd" >/dev/null || return "$MAPPING_FAILURE"
     # 受控 DNS：gm-proxy → X，github.com 与其他名称均不可解析，不递归外部。
+    # cap-drop ALL 下绑定 53 需同上游 443 一样下移非特权端口起点，否则真实环境无法监听。
     mapping_fixture_run "$scenario" dns -d --name "$(mapping_dns_container)" \
         $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_D" \
+        --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_DNS_PORT" \
         "$tools_image" $dns_args >/dev/null || return "$MAPPING_FAILURE"
     # 校准探针：无产品时以登记 probe 使用冻结地址 P，只读挂载公开 CA 卷。
     mapping_fixture_run "$scenario" probe -d --name "$(mapping_probe_container)" \

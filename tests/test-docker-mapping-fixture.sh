@@ -590,8 +590,50 @@ tls_docker() {
     return 0
 }
 
-# 建立本地替身目录与替换边界；容器内路径映射到替身目录，绝不触碰真实 daemon。
-tls_env() {
+# 本地资产生成边界替身：以本地 openssl 在替身资产目录内生成两条独立签发链。
+tls_local_asset_exec() {
+    MAPPING_ASSET_ROOT=$TLS_ASSETS MAPPING_UPSTREAM_HOST=$MAPPING_UPSTREAM_HOST \
+        MAPPING_PROXY_HOST=$MAPPING_PROXY_HOST MAPPING_UPSTREAM_HEALTH=$MAPPING_UPSTREAM_HEALTH \
+        sh -c "$1"
+}
+
+# CA 发布边界替身：按 -v 挂载解析卷归属，cat 语义从资产卷读源、目标写入客户端 CA 卷，
+# 使未替换的 mapping_fixture_ca_publish 真实逻辑可被端到端观测。
+tls_publish_docker() {
+    printf '%s\n' "$*" >> "$TLS_DIR/publish.calls"
+    local -a args=("$@")
+    local i entrypoint='' script='' src_dir='' out_dir='' target=''
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        case "${args[i]}" in
+            --entrypoint) entrypoint=${args[i + 1]} ;;
+            -v)
+                case "${args[i + 1]}" in
+                    "$(mapping_assets_volume):"*) src_dir=$TLS_ASSETS ;;
+                    "$(mapping_ca_volume):"*) out_dir=$TLS_DIR/ca ;;
+                esac
+                ;;
+            -c) script=${args[i + 1]} ;;
+        esac
+    done
+    case "$entrypoint" in
+        cat)
+            [[ -n $src_dir ]] || return 1
+            command cat -- "$src_dir/${args[${#args[@]} - 1]}" 2>/dev/null
+            ;;
+        /bin/sh)
+            [[ -n $out_dir && -n $script ]] || return 1
+            target=${script#*cat > \'}
+            target=${target%%\'*}
+            [[ -n $target ]] || return 1
+            mkdir -p "$(dirname -- "$out_dir/$target")" || return 1
+            command cat > "$out_dir/$target"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 本地替身基础环境：目录、账本、档案与本地资产生成/写入边界；不含 docker 与 CA 发布替换。
+tls_local_base() {
     TLS_DIR=$(mktemp -d)
     TLS_ASSETS=$TLS_DIR/assets
     mkdir -p "$TLS_ASSETS/upstream" "$TLS_ASSETS/proxy" "$TLS_DIR/ca" "$TLS_DIR/scenario" "$TLS_DIR/ledger"
@@ -600,18 +642,20 @@ tls_env() {
     RESOURCE_LEDGER_DIR=$TLS_DIR/ledger
     unset IT_EVIDENCE_DIR
     profile_write "$TLS_DIR/profile.tsv"
-    mapping_fixture_docker() { tls_docker "$@"; }
-    resource_docker() { tls_docker "$@"; }
-    # 资产生成以本地 openssl 执行；资产卷写入与 CA 发布同样落在替身目录。
-    mapping_fixture_asset_exec() {
-        MAPPING_ASSET_ROOT=$TLS_ASSETS MAPPING_UPSTREAM_HOST=$MAPPING_UPSTREAM_HOST \
-            MAPPING_PROXY_HOST=$MAPPING_PROXY_HOST MAPPING_UPSTREAM_HEALTH=$MAPPING_UPSTREAM_HEALTH \
-            sh -c "$1"
-    }
+    # 资产生成以本地 openssl 执行；资产卷写入同样落在替身目录。
+    mapping_fixture_asset_exec() { tls_local_asset_exec "$1"; }
     mapping_fixture_asset_write() {
         printf '%s' "$2" > "$TLS_ASSETS/$1" || return 1
         chmod 755 "$TLS_ASSETS/$1"
     }
+    return 0
+}
+
+# 建立本地替身目录与替换边界；容器内路径映射到替身目录，绝不触碰真实 daemon。
+tls_env() {
+    tls_local_base || return 1
+    mapping_fixture_docker() { tls_docker "$@"; }
+    resource_docker() { tls_docker "$@"; }
     mapping_fixture_ca_publish() {
         cp "$TLS_ASSETS/upstream/tls/ca.crt" "$TLS_DIR/ca/upstream-ca.crt" || return 1
         cp "$TLS_ASSETS/proxy/tls/ca.crt" "$TLS_DIR/ca/proxy-ca.crt" || return 1
@@ -634,6 +678,47 @@ tls_setup() {
         printf 'mapping_fixture_start failed\n'
         return 1
     }
+    return 0
+}
+
+# 校准探针替身：两端口探针成功并按 <grow|static> 决定计数是否增长；
+# 以全局记录场景目录与增长开关，避免依赖已返回函数的局部作用域。
+TLS_PROBE_GROW='grow'
+TLS_PROBE_SCENARIO=''
+tls_calibrate_probe_stubs() {
+    TLS_PROBE_SCENARIO=$1
+    TLS_PROBE_GROW=$2
+    mapping_proxy_probe_accept() {
+        local file
+        file=$(mapping_proxy_count_path "$TLS_SCENARIO_ID" "$MAPPING_PROXY_ACCEPT_PORT") || return 1
+        if [[ $TLS_PROBE_GROW == grow ]]; then
+            printf '%s\n' "$(( $(command cat -- "$file") + 1 ))" > "$file" || return 1
+        fi
+        printf 'mapping-upstream-ok\n' > "$TLS_PROBE_SCENARIO/proxy.probe-accept" || return 1
+        return 0
+    }
+    mapping_proxy_probe_reject() {
+        local file
+        file=$(mapping_proxy_count_path "$TLS_SCENARIO_ID" "$MAPPING_PROXY_REJECT_PORT") || return 1
+        if [[ $TLS_PROBE_GROW == grow ]]; then
+            printf '%s\n' "$(( $(command cat -- "$file") + 1 ))" > "$file" || return 1
+        fi
+        printf '403 Forbidden\n' > "$TLS_PROBE_SCENARIO/proxy.probe-reject" || return 1
+        return 0
+    }
+    return 0
+}
+
+# CONNECT 证据行写入：经真实登记边界落盘，authority 与拨号目的由调用方指定。
+tls_connect_log_write() {
+    local accept_authority=$1 accept_dial=$2 reject_authority=$3 reject_dial=$4
+    local accept_file reject_file log
+    accept_file=$(mapping_proxy_count_path "$TLS_SCENARIO_ID" "$MAPPING_PROXY_ACCEPT_PORT") || return 1
+    reject_file=$(mapping_proxy_count_path "$TLS_SCENARIO_ID" "$MAPPING_PROXY_REJECT_PORT") || return 1
+    log=$(mapping_proxy_log_path "$TLS_SCENARIO_ID") || return 1
+    : > "$log" || return 1
+    mapping_proxy_record "$accept_file" "$accept_authority" accept "$accept_dial" || return 1
+    mapping_proxy_record "$reject_file" "$reject_authority" reject "$reject_dial" || return 1
     return 0
 }
 
@@ -820,7 +905,7 @@ proxy_bad_count_fails() {
 
 # 客户端信任分离两条链：根证书互不相同、SAN 各自匹配、证书不得跨链验证、客户端卷只含公开 CA。
 client_trust_separates_two_ca() {
-    local failed=0 line extra fp_up fp_px up_ca px_ca
+    local failed=0 line extra fp_up fp_px up_ca px_ca rc=0 dns_line
     tls_setup || { printf 'tls setup failed\n'; return 1; }
     up_ca=$TLS_DIR/ca/upstream-ca.crt
     px_ca=$TLS_DIR/ca/proxy-ca.crt
@@ -842,7 +927,17 @@ client_trust_separates_two_ca() {
     [[ -f $TLS_ASSETS/upstream/tls/ca.key && -f $TLS_ASSETS/proxy/tls/ca.key ]] || { printf 'fixture CA keys missing\n'; failed=1; }
     [[ ! -e $TLS_DIR/ca/upstream-ca.key && ! -e $TLS_DIR/ca/proxy-ca.key ]] || { printf 'client CA volume carries a CA key\n'; failed=1; }
     [[ -x $TLS_ASSETS/proxy/proxy.sh ]] || { printf 'proxy script missing in asset volume\n'; failed=1; }
-    grep -q 'mapping_proxy_serve "\$@"' "$TLS_ASSETS/proxy/proxy.sh" || { printf 'proxy script does not reuse fixture body\n'; failed=1; }
+    # 行为断言：生成的代理脚本必须把参数交给夹具入口——非法模式应返回用法错误 2。
+    rc=0
+    bash "$TLS_ASSETS/proxy/proxy.sh" "$MAPPING_PROXY_ACCEPT_PORT" "$TLS_DIR/absent.crt" "$TLS_DIR/absent.key" \
+        "$TLS_DIR/scenario/accept.count" 140.82.112.11 bogus >/dev/null 2>&1 || rc=$?
+    printf 'PROXY_SCRIPT_USAGE_EXIT=%s\n' "$rc"
+    [[ $rc == 2 ]] || { printf 'proxy script did not delegate to fixture entrypoint\n'; failed=1; }
+    rc=0
+    bash "$TLS_ASSETS/proxy/proxy.sh" "$MAPPING_PROXY_ACCEPT_PORT" "$TLS_DIR/absent.crt" "$TLS_DIR/absent.key" \
+        "$TLS_DIR/scenario/accept.count" github.com accept >/dev/null 2>&1 || rc=$?
+    printf 'PROXY_SCRIPT_HOSTNAME_EXIT=%s\n' "$rc"
+    [[ $rc == 2 ]] || { printf 'proxy script forwarded a hostname upstream\n'; failed=1; }
     line=$(grep -m1 -- '--name gm-mtest-upstream' "$TLS_DIR/docker.calls") || failed=1
     printf 'UPSTREAM_RUN=%s\n' "$line"
     case "$line" in
@@ -880,6 +975,107 @@ client_trust_separates_two_ca() {
     grep -q -- "--address=/gm-proxy/140.82.112.12" "$TLS_DIR/docker.calls" || { printf 'controlled DNS mapping missing\n'; failed=1; }
     grep -q -- '--address=/#/' "$TLS_DIR/docker.calls" || { printf 'controlled DNS catch-all missing\n'; failed=1; }
     grep -q -- '--no-resolv' "$TLS_DIR/docker.calls" || { printf 'controlled DNS recurses upstream\n'; failed=1; }
+    # cap-drop ALL 下必须下移非特权端口起点，DNS 才能在 53 监听（与上游 443 同款 sysctl）。
+    dns_line=$(grep -m1 -- '--name gm-mtest-dns' "$TLS_DIR/docker.calls") || failed=1
+    printf 'DNS_RUN=%s\n' "$dns_line"
+    case "$dns_line" in
+        *"--sysctl net.ipv4.ip_unprivileged_port_start=$MAPPING_DNS_PORT"*) ;;
+        *) printf 'dns container cannot bind 53 under cap-drop ALL\n'; failed=1 ;;
+    esac
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 校准成功路径：探针成功且两端口计数增长、authority 精确相等 → 返回 0 并写出与计数一致的
+# proxy.before；探针成功但计数不增长时必须 80 且不得留下基线。
+proxy_calibrate_writes_baseline() {
+    local failed=0 rc=0 scenario_dir accept_file reject_file exp_accept exp_reject dial
+    tls_setup || { printf 'tls setup failed\n'; return 1; }
+    scenario_dir=$TLS_DIR/scenario
+    mapping_fixture_state_load || { printf 'fixture state unreadable\n'; return 1; }
+    accept_file=$(mapping_proxy_count_path "$TLS_SCENARIO_ID" "$MAPPING_PROXY_ACCEPT_PORT") || return 1
+    reject_file=$(mapping_proxy_count_path "$TLS_SCENARIO_ID" "$MAPPING_PROXY_REJECT_PORT") || return 1
+    printf '5\n' > "$accept_file"
+    printf '3\n' > "$reject_file"
+    dial="$MPF_UPSTREAM_IP:$MAPPING_UPSTREAM_PORT"
+    tls_calibrate_probe_stubs "$scenario_dir" grow
+    tls_connect_log_write "$MAPPING_PROXY_AUTHORITY" "$dial" "$MAPPING_PROXY_AUTHORITY" -
+    rc=0
+    mapping_proxy_calibrate "$scenario_dir" || rc=$?
+    printf 'CALIBRATE_SUCCESS_EXIT=%s\n' "$rc"
+    [[ $rc == 0 ]] || { printf 'calibration success path rejected: %s\n' "$rc"; failed=1; }
+    [[ -f $scenario_dir/proxy.before ]] || { printf 'proxy.before not written\n'; failed=1; }
+    exp_accept=$(command cat -- "$accept_file")
+    exp_reject=$(command cat -- "$reject_file")
+    printf 'PROXY_BEFORE=%s\n' "$(tr '\n' ' ' < "$scenario_dir/proxy.before")"
+    grep -qx $'accept\t'"$exp_accept" "$scenario_dir/proxy.before" || { printf 'baseline accept != probe count\n'; failed=1; }
+    grep -qx $'reject\t'"$exp_reject" "$scenario_dir/proxy.before" || { printf 'baseline reject != probe count\n'; failed=1; }
+    [[ $(mapping_proxy_baseline_total "$scenario_dir/proxy.before") == "$((exp_accept + exp_reject))" ]] \
+        || { printf 'baseline total != counter sum\n'; failed=1; }
+    # 反例：探针成功但计数不增长，校准必须 80 且不得写基线。
+    rm -f "$scenario_dir/proxy.before"
+    printf '7\n' > "$accept_file"
+    printf '2\n' > "$reject_file"
+    tls_calibrate_probe_stubs "$scenario_dir" static
+    rc=0
+    mapping_proxy_calibrate "$scenario_dir" || rc=$?
+    printf 'CALIBRATE_NO_GROWTH_EXIT=%s\n' "$rc"
+    [[ $rc == 80 ]] || { printf 'zero-increment calibration accepted: %s\n' "$rc"; failed=1; }
+    [[ ! -e $scenario_dir/proxy.before ]] || { printf 'baseline written without growth\n'; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# authority 判据可执行且精确：日志必须含精确 authority 的接受与拒绝各一行、拨号目的只能是
+# U:443；任一不匹配即校准 80，即使探针成功、计数增长。
+proxy_log_check_authority_exact() {
+    local failed=0 rc=0 scenario_dir spec auth dial
+    tls_setup || { printf 'tls setup failed\n'; return 1; }
+    scenario_dir=$TLS_DIR/scenario
+    mapping_fixture_state_load || { printf 'fixture state unreadable\n'; return 1; }
+    tls_calibrate_probe_stubs "$scenario_dir" grow
+    dial="$MPF_UPSTREAM_IP:$MAPPING_UPSTREAM_PORT"
+    tls_connect_log_write "$MAPPING_PROXY_AUTHORITY" "$dial" "$MAPPING_PROXY_AUTHORITY" -
+    mapping_proxy_log_check || { printf 'exact authority rejected\n'; failed=1; }
+    printf 'LOG_CHECK_EXACT_AUTHORITY=0\n'
+    for spec in \
+        'github.com:8443 140.82.112.11:443' \
+        'other.test:443 140.82.112.11:443' \
+        'github.com:443 140.82.112.99:443'; do
+        read -r auth dial <<< "$spec"
+        tls_connect_log_write "$auth" "$dial" "$MAPPING_PROXY_AUTHORITY" - || failed=1
+        if mapping_proxy_log_check; then printf 'authority judgement accepted mismatch: %s\n' "$spec"; failed=1; fi
+        printf 'LOG_CHECK_REJECT auth=%s dial=%s\n' "$auth" "$dial"
+        rc=0
+        mapping_proxy_calibrate "$scenario_dir" || rc=$?
+        printf 'CALIBRATE_MISMATCH_EXIT auth=%s dial=%s rc=%s\n' "$auth" "$dial" "$rc"
+        [[ $rc == 80 ]] || { printf 'mismatched authority still calibrated: %s\n' "$spec"; failed=1; }
+    done
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 真实 CA 发布逻辑（不替换 mapping_fixture_ca_publish）：客户端 CA 卷只出现公开证书，
+# 不含 PRIVATE KEY、不含 *.key，且无额外文件。
+ca_publish_excludes_private_key() {
+    local failed=0 extra
+    tls_local_base || return 1
+    mapping_profile_load "$TLS_DIR/profile.tsv" || { printf 'profile load failed\n'; return 1; }
+    mapping_fixture_docker() { tls_publish_docker "$@"; }
+    mapping_fixture_asset_exec "$(mapping_asset_script)" product || { printf 'asset script failed\n'; failed=1; }
+    [[ -f $TLS_ASSETS/upstream/tls/ca.key && -f $TLS_ASSETS/proxy/tls/ca.key ]] \
+        || { printf 'asset volume lacks CA keys\n'; failed=1; }
+    mapping_fixture_ca_publish product || { printf 'ca publish failed\n'; failed=1; }
+    printf 'PUBLISHED=%s\n' "$(ls -A "$TLS_DIR/ca" | tr '\n' ' ')"
+    extra=$(ls -A "$TLS_DIR/ca" | grep -v -x -e upstream-ca.crt -e proxy-ca.crt || true)
+    [[ -z $extra ]] || { printf 'client CA volume carries extra material: %s\n' "$extra"; failed=1; }
+    if compgen -G "$TLS_DIR/ca/*.key" >/dev/null; then printf 'client CA volume carries a .key file\n'; failed=1; fi
+    if grep -rlq 'PRIVATE KEY' "$TLS_DIR/ca" 2>/dev/null; then printf 'client CA volume carries a private key\n'; failed=1; fi
+    cmp -s "$TLS_ASSETS/upstream/tls/ca.crt" "$TLS_DIR/ca/upstream-ca.crt" \
+        || { printf 'published upstream CA is not the public cert\n'; failed=1; }
+    cmp -s "$TLS_ASSETS/proxy/tls/ca.crt" "$TLS_DIR/ca/proxy-ca.crt" \
+        || { printf 'published proxy CA is not the public cert\n'; failed=1; }
+    if grep -q -- '\.key' "$TLS_DIR/publish.calls" 2>/dev/null; then printf 'publish boundary read a private key path\n'; failed=1; fi
     rm -rf "$TLS_DIR"
     return "$failed"
 }
@@ -970,7 +1166,10 @@ MAPPING_TLS_TESTS='proxy_accept_dials_frozen_u
 proxy_reject_never_dials
 proxy_other_authority_never_dials
 proxy_bad_count_fails
+proxy_calibrate_writes_baseline
+proxy_log_check_authority_exact
 client_trust_separates_two_ca
+ca_publish_excludes_private_key
 wrong_proxy_ca
 wrong_proxy_san
 wrong_upstream_ca
