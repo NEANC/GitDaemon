@@ -36,7 +36,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch full_binds_mapping_group; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -368,6 +368,16 @@ contract_case() {
             grep -q 'MAPPING_SCENARIO_NOT_WIRED' "$scratch/out" || { printf 'fixed marker missing\n'; return 1; }
             [[ -z $(ls -A "$scratch/evidence/control") ]] || { printf 'mapping entry touched control plane\n'; return 1; }
             rm -rf "$scratch"
+            ;;
+        full_binds_mapping_group)
+            # full 入口绑定映射档案并清除旧过滤变量，且只出现唯一本地端点、不携带单项模式开关。
+            local cmd
+            cmd=$(guard_runner_command full /src run1 /ev img tools man att prof) || return 1
+            [[ $cmd == *'-u IT_FILTER'* ]] || { printf 'full did not clear IT_FILTER\n'; return 1; }
+            [[ $cmd == *'IT_MAPPING_PROFILE=prof'* ]] || { printf 'full did not bind mapping profile\n'; return 1; }
+            [[ $cmd == *'test-docker-network.sh'* && $cmd == *'--integration'* ]] || { printf 'full entry not fixed integration runner\n'; return 1; }
+            [[ $cmd != *'IT_MAPPING_SCENARIO='* ]] || { printf 'full leaked single mapping toggle\n'; return 1; }
+            [[ $(grep -o 'unix:///var/run/docker.sock' <<< "$cmd" | wc -l) == 1 ]] || { printf 'full endpoint not unique\n'; return 1; }
             ;;
     esac
 }

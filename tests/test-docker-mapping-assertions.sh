@@ -870,6 +870,22 @@ product_ready_requires_marker() {
     return "$failed"
 }
 
+# full 汇总槽位必须有真实断言支撑：两个正例 kind 与 DNS/TLS/隔离负例均被断言库接受，
+# 未知 kind/负例名被拒绝，正例集合恰为两项（与 mapping_full_accept 的字段一一对应）。
+full_summary_slots_supported() {
+    local slot case_name failed=0
+    for slot in mapping_fallback mapping_direct; do
+        mapping_assert_kind_valid "${slot#mapping_}" || { printf 'missing positive kind %s\n' "$slot"; failed=1; }
+    done
+    for case_name in dns-false-green wrong_upstream_ca isolation; do
+        mapping_assert_negative_valid "$case_name" || { printf 'missing negative case %s\n' "$case_name"; failed=1; }
+    done
+    mapping_assert_kind_valid probe && { printf 'probe wrongly accepted as positive kind\n'; failed=1; }
+    mapping_assert_negative_valid bogus && { printf 'unknown negative accepted\n'; failed=1; }
+    [[ $(printf '%s\n' $MAPPING_ASSERT_KINDS | wc -l) == 2 ]] || { printf 'positive kind set not exactly two\n'; failed=1; }
+    return "$failed"
+}
+
 MAPPING_ASSERTION_TESTS='fallback_requires_order_and_connect_growth
 direct_requires_own_baseline
 scenario_order_independent
@@ -890,7 +906,8 @@ negative_dns_false_green
 negative_unreachable_map_system
 negative_tls_names
 negative_isolation
-fixture_failure_is_80'
+fixture_failure_is_80
+full_summary_slots_supported'
 
 case "${1:-all}" in
     all) TESTS=$MAPPING_ASSERTION_TESTS ;;

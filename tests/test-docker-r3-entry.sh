@@ -32,35 +32,104 @@ for mode in full mapping-fallback mapping-direct mapping-probe; do
         failed=1
     fi
 done
-# full 子入口必须再次复核延期请求：以 IT_DEFER_MAPPING=1 实际运行生成的命令，行为级断言返回 2。
-defer_scratch=$(mktemp -d)
-mkdir -p "$defer_scratch/source/tests" "$defer_scratch/bin"
-cat > "$defer_scratch/source/tests/test-docker-network.sh" <<'STUB'
+# full 必须显式清除过滤变量：继承 IT_FILTER 时子入口实际读到空值。
+full_clears_filter() {
+    local scratch cmd rc=0 status=0
+    scratch=$(mktemp -d)
+    mkdir -p "$scratch/source/tests" "$scratch/bin"
+    cat > "$scratch/source/tests/test-docker-network.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'IT_FILTER=%s\n' "${IT_FILTER-}" >> "$RUNNER_ENTRY_LOG"
+exit 0
+STUB
+    cat > "$scratch/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$DOCKER_STUB_ID"
+STUB
+    chmod +x "$scratch/source/tests/test-docker-network.sh" "$scratch/bin/docker"
+    export DOCKER_STUB_ID=0123456789abcdef0123456789abcdef
+    export RUNNER_ENTRY_LOG="$scratch/runner-entry.log"
+    printf 'daemon_id\t%s\n' "$DOCKER_STUB_ID" > "$scratch/manifest.tsv"
+    cmd=$(guard_runner_command full "$scratch/source" run "$scratch/evidence" product tools \
+        "$scratch/manifest.tsv" "$scratch/attestation" "$scratch/profile") || cmd=''
+    ( PATH="$scratch/bin:$PATH"; export IT_FILTER=o1; eval "$cmd" ) || rc=$?
+    [[ $rc == 0 ]] || { printf 'FAIL full clears-filter rc=%s\n' "$rc"; status=1; }
+    grep -qx 'IT_FILTER=' "$scratch/runner-entry.log" || { printf 'FAIL full did not clear IT_FILTER\n'; status=1; }
+    rm -rf "$scratch"
+    return "$status"
+}
+
+# full 子入口必须再次复核延期请求：以 IT_DEFER_MAPPING=1 运行生成的命令返回 2，且未到达子入口。
+full_rejects_defer() {
+    local scratch cmd rc=0 status=0
+    scratch=$(mktemp -d)
+    mkdir -p "$scratch/source/tests" "$scratch/bin"
+    cat > "$scratch/source/tests/test-docker-network.sh" <<'STUB'
 #!/usr/bin/env bash
 printf 'runner-entry %s\n' "$*" >> "$RUNNER_ENTRY_LOG"
 exit 0
 STUB
-cat > "$defer_scratch/bin/docker" <<'STUB'
+    cat > "$scratch/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$DOCKER_STUB_ID"
 STUB
-chmod +x "$defer_scratch/source/tests/test-docker-network.sh" "$defer_scratch/bin/docker"
-export DOCKER_STUB_ID=0123456789abcdef0123456789abcdef
-export RUNNER_ENTRY_LOG="$defer_scratch/runner-entry.log"
-printf 'daemon_id\t%s\n' "$DOCKER_STUB_ID" > "$defer_scratch/manifest.tsv"
-defer_command=$(guard_runner_command full "$defer_scratch/source" run "$defer_scratch/evidence" product tools \
-    "$defer_scratch/manifest.tsv" "$defer_scratch/attestation" "$defer_scratch/profile") || defer_command=''
-rc=0
-( PATH="$defer_scratch/bin:$PATH"; export IT_DEFER_MAPPING=1; eval "$defer_command" ) || rc=$?
-printf 'FULL_DEFER_EXIT=%s\n' "$rc"
-[[ $rc == 2 ]] || { printf 'FAIL full child defer rc=%s\n' "$rc"; failed=1; }
-[[ ! -s $defer_scratch/runner-entry.log ]] || { printf 'FAIL deferred run reached child entry\n'; failed=1; }
-rc=0
-( PATH="$defer_scratch/bin:$PATH"; eval "$defer_command" ) || rc=$?
-printf 'FULL_NODEFER_EXIT=%s\n' "$rc"
-[[ $rc == 0 ]] || { printf 'FAIL full child rc=%s\n' "$rc"; failed=1; }
-[[ -s $defer_scratch/runner-entry.log ]] || { printf 'FAIL child entry not reached\n'; failed=1; }
-rm -rf "$defer_scratch"
+    chmod +x "$scratch/source/tests/test-docker-network.sh" "$scratch/bin/docker"
+    export DOCKER_STUB_ID=0123456789abcdef0123456789abcdef
+    export RUNNER_ENTRY_LOG="$scratch/runner-entry.log"
+    printf 'daemon_id\t%s\n' "$DOCKER_STUB_ID" > "$scratch/manifest.tsv"
+    cmd=$(guard_runner_command full "$scratch/source" run "$scratch/evidence" product tools \
+        "$scratch/manifest.tsv" "$scratch/attestation" "$scratch/profile") || cmd=''
+    ( PATH="$scratch/bin:$PATH"; export IT_DEFER_MAPPING=1; eval "$cmd" ) || rc=$?
+    [[ $rc == 2 ]] || { printf 'FAIL full rejects-defer rc=%s\n' "$rc"; status=1; }
+    [[ ! -s $scratch/runner-entry.log ]] || { printf 'FAIL deferred run reached child entry\n'; status=1; }
+    rm -rf "$scratch"
+    return "$status"
+}
+
+# full 子入口必须再次复核延期请求：以 IT_DEFER_MAPPING=1 实际运行生成的命令，行为级断言返回 2。
+full_rejects_defer || failed=1
+full_clears_filter || failed=1
+
+# compose up 必须 create → inspect/登记 → start：登记先于 start，且不转发 -d 与 --rm。
+compose_products_registered_before_start() {
+    local scratch log rc=0
+    scratch=$(mktemp -d)
+    log=$scratch/order
+    mkdir -p "$scratch/ledger"
+    : > "$log"
+    RESOURCE_LEDGER_DIR=$scratch/ledger
+    IT_RUN_ID=order
+    COMPOSE_VOLUME=gm-order-compose-data
+    RESOURCE_RUN=order
+    docker() {
+        local a verb=''
+        for a in "$@"; do case "$a" in create|ps|start) verb=$a ;; esac; done
+        case "${1:-}" in
+            compose)
+                case "$*" in *' -d'*|*' --rm'*|*' -v'*) printf 'FORBIDDEN %s\n' "$*" >> "$log" ;; esac
+                case "$verb" in
+                    create) printf 'create\n' >> "$log" ;;
+                    ps) printf 'cid1\n' ;;
+                    start) printf 'start\n' >> "$log" ;;
+                esac
+                ;;
+            inspect) printf 'volume\tgm-order-compose-data\n' ;;
+            volume) printf 'gm-order-compose-data\n' ;;
+        esac
+        return 0
+    }
+    resource_register() { printf 'register\t%s\t%s\n' "$1" "$2" >> "$log"; return 0; }
+    compose up -d --force-recreate || rc=$?
+    [[ $rc == 0 ]] || { printf 'FAIL compose up rc=%s\n' "$rc"; }
+    grep -q '^FORBIDDEN' "$log" && { printf 'FAIL compose forwarded -d/-v/--rm\n'; rc=1; }
+    [[ $(head -n 1 "$log") == create ]] || { printf 'FAIL compose did not create first\n'; rc=1; }
+    grep -q $'^register\tcontainer\tcid1$' "$log" || { printf 'FAIL compose container not registered\n'; rc=1; }
+    grep -q $'^register\tvolume\tgm-order-compose-data$' "$log" || { printf 'FAIL compose volume not registered\n'; rc=1; }
+    [[ $(tail -n 1 "$log") == start ]] || { printf 'FAIL compose did not start last\n'; rc=1; }
+    rm -rf "$scratch"
+    [[ $rc == 0 ]]
+}
+
 # 旧非 mapping 模式新增三参可空；新路径缺参返回 2。
 for mode in o1 c2 probe full mapping-fallback mapping-direct mapping-probe; do
     rc=0
@@ -89,7 +158,7 @@ for mode in invalid 'c2 --live'; do
 done
 IT_SOURCE_ONLY=1 source "$HERE/test-docker-integration.sh"
 trap - EXIT
-for group in network empty tz compose-publish compose-runtime https c2; do
+for group in network empty tz compose-publish compose-runtime https c2 mapping; do
     rc=0
     IT_FILTER=o1 integration_group_selected "$group" || rc=$?
     case "$group" in network|empty|tz|compose-publish) expected=0 ;; *) expected=1 ;; esac
@@ -97,11 +166,20 @@ for group in network empty tz compose-publish compose-runtime https c2; do
     [[ $rc == "$expected" ]] || failed=1
     rc=0
     IT_FILTER='' integration_group_selected "$group" || rc=$?
-    [[ $rc == 0 ]] || failed=1
+    [[ $rc == 0 ]] || { printf 'FAIL group=%s not selected when unfiltered rc=%s\n' "$group" "$rc"; failed=1; }
 done
+# 单项映射 mode 只选择映射组。
+rc=0
+IT_FILTER='' IT_MAPPING_SCENARIO=fallback integration_group_selected mapping || rc=$?
+[[ $rc == 0 ]] || { printf 'FAIL single-mode mapping not selected rc=%s\n' "$rc"; failed=1; }
+rc=0
+IT_FILTER='' IT_MAPPING_SCENARIO=fallback integration_group_selected https || rc=$?
+[[ $rc == 1 ]] || { printf 'FAIL single-mode selected legacy group rc=%s\n' "$rc"; failed=1; }
 rc=0
 IT_FILTER=c2 integration_group_selected empty || rc=$?
-[[ $rc == 0 ]] || failed=1
+[[ $rc == 0 ]] || { printf 'FAIL c2 empty not selected rc=%s\n' "$rc"; failed=1; }
+# compose 产物登记契约依赖 integration.sh 的 compose 包装器，故置于 source 之后。
+( compose_products_registered_before_start ) || { printf 'FAIL compose registration contract\n'; failed=1; }
 # 启动参数通过可执行 CLI 替身采集，不执行实际 Docker。
 scratch=$(mktemp -d)
 cat > "$scratch/docker" <<'CLI'

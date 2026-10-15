@@ -32,6 +32,10 @@ COMPOSE_TAG=it-$$
 COMPOSE_IMAGE=ghcr.io/neanc/git-daemon:$COMPOSE_TAG
 COMPOSE_PROJECT=gm-it-$$
 COMPOSE_VOLUME=gm-${IT_RUN_ID:-it-$$}-compose-data
+# Compose 产物的登记身份：容器与命名卷共用场景，角色区分。
+COMPOSE_SCENARIO=compose
+COMPOSE_ROLE_PRODUCT=product
+COMPOSE_ROLE_VOLUME=data
 COMPOSE_PORT=$((40000 + ($$ % 10000)))
 # 卷内配置层回归断言用的非默认值：容器内 daemon 必须实际生效这些值而非默认值。
 COMPOSE_VOL_CONFIG_ADDR=127.0.0.1
@@ -148,9 +152,20 @@ COMPOSE_ENV=()
 # 可选过滤：设置 IT_FILTER=c2 时只执行镜像静态检查与 C-2 有界停止场景，便于定向红绿取证；
 # 不设置时行为不变（执行完整套件）。
 IT_FILTER=${IT_FILTER-}
+# 新映射组接线参数：单项 mode 用 IT_MAPPING_SCENARIO 指定唯一场景，缺省（full）跑两场景与负例；
+# 档案、产品/工具镜像与夹具根目录由冻结清单注入。
+IT_MAPPING_SCENARIO=${IT_MAPPING_SCENARIO-}
+MAPPING_PROFILE=${IT_MAPPING_PROFILE-}
+MAPPING_PRODUCT_IMAGE=${MAPPING_PRODUCT_IMAGE:-${IT_PRODUCT_IMAGE:-$IMAGE}}
+MAPPING_TOOLS_IMAGE=${MAPPING_TOOLS_IMAGE:-${IT_TOOLS_IMAGE:-}}
 
 # o1 使用明确场景白名单；c2 保留历史共享空卷与 TZ 前置。
+# 单项映射 mode 只选择映射组，不跑旧业务组，也不能作为 full 结论。
 integration_group_selected() {
+    if [[ -n $IT_MAPPING_SCENARIO ]]; then
+        [[ $1 == mapping ]] && return 0
+        return 1
+    fi
     case "${IT_FILTER:-}:$1" in
         :*) return 0 ;;
         o1:network|o1:empty|o1:tz|o1:compose-publish) return 0 ;;
@@ -193,6 +208,8 @@ services:
     restart: "no"
     labels:
       gitdaemon.run: "$IT_RUN_ID"
+      gitdaemon.scenario: "$COMPOSE_SCENARIO"
+      gitdaemon.role: "$COMPOSE_ROLE_PRODUCT"
     dns:
       - $IT_DNS_IP
     sysctls:
@@ -215,6 +232,8 @@ volumes:
     name: $COMPOSE_VOLUME
     labels:
       gitdaemon.run: "$IT_RUN_ID"
+      gitdaemon.scenario: "$COMPOSE_SCENARIO"
+      gitdaemon.role: "$COMPOSE_ROLE_VOLUME"
 networks:
   default:
     external: true
@@ -272,8 +291,54 @@ compose_production_restart_policy() {
 }
 
 # 统一以测试项目名与 override 文件调用 compose，保证所有子命令作用域一致。
+# compose up 改走 create → inspect/登记 → start：启动前完成登记，禁止隐式附加匿名卷与自动删除。
 compose() {
+    if [[ ${1:-} == up ]]; then
+        compose_create_register_start "$@"
+        return $?
+    fi
     docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_OVERRIDE" "$@"
+}
+
+# compose up 的显式生命周期：先 create（剥离 -d/--detach），登记容器与命名卷，再 start。
+compose_create_register_start() {
+    local arg
+    local -a create_args=()
+    shift
+    while (( $# )); do
+        arg=$1; shift
+        case "$arg" in
+            -d|--detach) ;;
+            *) create_args+=("$arg") ;;
+        esac
+    done
+    docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_OVERRIDE" \
+        create "${create_args[@]}" || return $?
+    compose_register_products || return $?
+    docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_OVERRIDE" start || return $?
+    return 0
+}
+
+# 登记 compose 产物：容器按完整 ID、命名卷按名称；出现隐式匿名卷立即拒绝启动。
+compose_register_products() {
+    local ledger id anon
+    local -a ids=()
+    ledger=$(resource_ledger_dir) || { resource_ledger_notice compose; return 2; }
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=${IT_RUN_ID:-}
+    while IFS= read -r id; do
+        [[ -n $id ]] && ids+=("$id")
+    done < <(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_OVERRIDE" ps -aq)
+    [[ ${#ids[@]} -gt 0 ]] || return 2
+    for id in "${ids[@]}"; do
+        anon=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' "$id" 2>/dev/null \
+            | grep -E '^[0-9a-f]{64}$' || true)
+        [[ -z $anon ]] || { printf 'compose 隐式附加匿名卷：%s\n' "$id" >&2; return 2; }
+        resource_register container "$id" "$COMPOSE_SCENARIO" "$COMPOSE_ROLE_PRODUCT" || return 2
+    done
+    if docker volume inspect -f '{{.Name}}' "$COMPOSE_VOLUME" >/dev/null 2>&1; then
+        resource_register volume "$COMPOSE_VOLUME" "$COMPOSE_SCENARIO" "$COMPOSE_ROLE_VOLUME" || return 2
+    fi
+    return 0
 }
 
 # docker CLI 与守护进程均可用才算可用。
@@ -303,8 +368,9 @@ cleanup() {
         docker rm -f "$name" || clean=2
     done
     if [[ $clean == 0 && -f ${COMPOSE_OVERRIDE:-} ]]; then
+        # 不带 -v：命名卷删除统一走资源账本登记身份（下方卷循环），保留删除回执。
         IMAGE_TAG=$COMPOSE_TAG REPOS=$TEST_REPO \
-            compose down -v --remove-orphans || clean=2
+            compose down --remove-orphans || clean=2
     fi
     ids=$(docker volume ls -q --filter "label=gitdaemon.run=$IT_RUN_ID") || clean=2
     for name in $ids; do docker volume rm "$name" || clean=2; done
@@ -1399,14 +1465,103 @@ check_gated() {
 check_https_sync() { check_gated FIXTURE_READY "$@"; }
 check_proxy_sync() { check_gated PROXY_READY "$@"; }
 
-# 仅显式选择时延期依赖新增 NAT 的真实映射成功断言，不计为通过。
+# 独立映射场景断言：直接运行本场景生命周期并按退出码归类到断言/夹具计数。
+# 不再依赖 PROXY_READY，也不再累加 DEFERRED；拒绝与延期都不再掩盖真实映射结果。
 check_mapping_sync() {
-    if [[ ${IT_DEFER_MAPPING:-0} == 1 ]]; then
-        DEFERRED=$((${DEFERRED:-0} + 1))
-        printf 'DEFER %s：用户延期新增 NAT 及依赖的真实 mapping 成功验证\n' "$1"
-        return 0
-    fi
-    check_proxy_sync "$@"
+    local label=$1 kind=${2:-} dir rc=0
+    [[ $# == 2 && -n $kind ]] || return 2
+    CHECKS=$((CHECKS + 1))
+    dir=$IT_EVIDENCE_DIR/control/mapping-$kind
+    mapping_scenario_run "$kind" "$dir" || rc=$?
+    case "$rc" in
+        0) printf '[PASS] %s\n' "$label" ;;
+        1) printf '[FAIL] %s\n' "$label"; FAILURES=$((FAILURES + 1)) ;;
+        *) printf '[FIXTURE-FAIL] %s（退出码 %s）\n' "$label" "$rc"; FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1)) ;;
+    esac
+    return 0
+}
+
+# 独立映射负例：三层退出由 mapping_negative_run 承担；夹具失败计入夹具计数，判定未拒绝即断言失败。
+check_mapping_negative() {
+    local label=$1 case_name=${2:-} kind=${3:-} dir rc=0
+    [[ $# == 3 && -n $case_name && -n $kind ]] || return 2
+    CHECKS=$((CHECKS + 1))
+    dir=$IT_EVIDENCE_DIR/control/mapping-neg-$case_name-$kind
+    mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
+    case "$rc" in
+        0) printf '[PASS] %s\n' "$label" ;;
+        1) printf '[FAIL] %s\n' "$label"; FAILURES=$((FAILURES + 1)) ;;
+        *) printf '[FIXTURE-FAIL] %s（退出码 %s）\n' "$label" "$rc"; FIXTURE_FAILURES=$((FIXTURE_FAILURES + 1)) ;;
+    esac
+    return 0
+}
+
+# 私网组唯一注册点：代理成功/证据与 system 两项；原私网 mapping 两项已迁至独立映射组，不再注册。
+integration_register_proxy_group() {
+    check_proxy_sync 'HTTPS 代理：配置 PROXY_URL 时真实同步成功（代理路径）' fixture_proxy_path_succeeds
+    check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT 且计数增加' fixture_proxy_connect_evidence
+    check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
+    check_proxy_sync '传输顺序：非 proxy 系统 DNS 直连尝试不增加代理计数' fixture_system_direct_leaves_proxy_untouched
+}
+
+# 单项映射 mode 只选对应场景；full（未指定）时两场景都跑。
+integration_mapping_scenarios() {
+    case "${IT_MAPPING_SCENARIO:-}" in
+        '') printf '%s\n' fallback direct ;;
+        fallback) printf '%s\n' fallback ;;
+        direct) printf '%s\n' direct ;;
+        *) return 1 ;;
+    esac
+}
+
+# 新映射组唯一注册点：正例两项（单项 mode 只注册对应场景）+ DNS/TLS/隔离负例（仅 full）。
+# 单项 mode 因此不能作为 full 结论：其汇总缺少另一正例与全部负例分组。
+integration_register_mapping_group() {
+    local kind
+    local -a kinds=()
+    while IFS= read -r kind; do kinds+=("$kind"); done < <(integration_mapping_scenarios)
+    [[ ${#kinds[@]} -gt 0 ]] || return 1
+    for kind in "${kinds[@]}"; do
+        case "$kind" in
+            fallback) check_mapping_sync '映射场景：代理拒绝后动态地址映射成功（独立生命周期）' fallback ;;
+            direct) check_mapping_sync '映射场景：纯映射直连不经过代理（独立生命周期）' direct ;;
+        esac
+    done
+    [[ -z $IT_MAPPING_SCENARIO ]] || return 0
+    check_mapping_negative '映射负例：DNS 假绿被映射判定器拒绝（fallback）' dns-false-green fallback
+    check_mapping_negative '映射负例：DNS 假绿被映射判定器拒绝（direct）' dns-false-green direct
+    check_mapping_negative '映射负例：代理/上游证书篡改被 TLS 层拒绝（fallback）' wrong_upstream_ca fallback
+    check_mapping_negative '映射负例：代理/上游证书篡改被 TLS 层拒绝（direct）' wrong_upstream_ca direct
+    check_mapping_negative '映射负例：额外网络附件被配置审计拒绝（fallback）' isolation fallback
+    check_mapping_negative '映射负例：额外网络附件被配置审计拒绝（direct）' isolation direct
+}
+
+# 全量验收汇总判定：字段 failures/fixture_failures/deferred/primary_exit/cleanup_exit/residual_count
+# 必须为 0；mapping_fallback/mapping_direct/system_fallback/system_direct/dns_negatives/tls_negatives/
+# isolation_negatives 必须为 PASS；缺项、重复键、未知形状或非约定取值一律返回 1。
+mapping_full_accept() {
+    local file=${1:-} line key value
+    local -A seen=()
+    local -a zero_fields=(failures fixture_failures deferred primary_exit cleanup_exit residual_count)
+    local -a pass_fields=(mapping_fallback mapping_direct system_fallback system_direct
+        dns_negatives tls_negatives isolation_negatives)
+    [[ -n $file && -f $file && ! -L $file && -r $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        [[ $line == *$'\t'* ]] || return 1
+        key=${line%%$'\t'*}
+        value=${line#*$'\t'}
+        [[ -n $key && -n $value && $value != *$'\t'* ]] || return 1
+        [[ -z ${seen[$key]:-} ]] || return 1
+        seen[$key]=$value
+    done < "$file"
+    for key in "${zero_fields[@]}"; do
+        [[ ${seen[$key]:-} == 0 ]] || return 1
+    done
+    for key in "${pass_fields[@]}"; do
+        [[ ${seen[$key]:-} == PASS ]] || return 1
+    done
+    return 0
 }
 check_auth_sync() { check_gated AUTH_READY "$@"; }
 check_auth_prod() { check_gated AUTH_PROD_READY "$@"; }
@@ -1664,8 +1819,9 @@ fixture_branch_scoped_sync() {
 # 停止并删除测试 compose 项目、网络与测试作用域卷，并移除本脚本附加的镜像标签；无残留。
 compose_teardown() {
     docker rm -f "$TLS_FIXTURE_NAME" >/dev/null 2>&1 || true
+    # 不带 -v：命名卷由下方显式删除走资源账本，避免绕过登记身份的删除。
     IMAGE_TAG=$COMPOSE_TAG REPOS=$TEST_REPO \
-        compose down -v --remove-orphans >/dev/null 2>&1 || true
+        compose down --remove-orphans >/dev/null 2>&1 || true
     docker volume rm -f "$COMPOSE_VOLUME" >/dev/null 2>&1 || true
     docker image rm -f "$COMPOSE_IMAGE" >/dev/null 2>&1 || true
     return 0
@@ -1730,17 +1886,9 @@ fixture_record_proxy_baseline() {
     fixture_record_count "$TEST_ROOT/proxy-baseline"
 }
 
-# 在产品卷内预置映射路径与代理路径的输入：
-# 一是合法公开地址快照（值为夹具容器在该隔离网络上的地址，请求只在 Docker 网络内到达夹具）；
-# 二是仅用于信任测试代理 CA 的全局 Git 配置（http.proxySSLCAInfo），不关闭任何 TLS 校验。
+# 在产品卷内预置私网组输入：仅用于信任测试代理 CA 的全局 Git 配置（http.proxySSLCAInfo），
+# 不关闭任何 TLS 校验。合法映射快照改由独立映射场景写入真实公网格式地址，此处不再写伪合法私网快照。
 fixture_prepare_proxy_inputs() {
-    local ip
-    ip=$(bash "$FIXTURE_SCRIPT" upstream-ip "$FIXTURE_NAME") || return 1
-    [[ -n $ip ]] || return 1
-    printf '%s\n' '# FORMAT=1' '# SOURCE=https://fixture.invalid/hosts' \
-        '# FETCHED=2026-01-01T00:00:00+0000' '# DIGEST=sha256:fixture' '# COUNT=1' "$ip github.com" | \
-        docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
-        -c "umask 022; mkdir -p $FIXTURE_MOUNT/hosts; cat > $FIXTURE_SNAPSHOT" || return 1
     printf '[http]\n\tproxySSLCAInfo = %s\n' "$FIXTURE_PRODUCT_CA" | \
         docker run --rm -i --user 10001:10001 -v "$FIXTURE_PROD_VOL:$FIXTURE_MOUNT" --entrypoint /bin/sh "$IMAGE" \
         -c "umask 022; mkdir -p $FIXTURE_MOUNT/fixture; cat > $FIXTURE_GITCONFIG" || return 1
@@ -1760,7 +1908,7 @@ fixture_exec_sync_scenario() {
 # 代理成功路径：配置 PROXY_URL 时真实同步成功，日志记录使用配置代理，且代理侧计数确实增加。
 fixture_proxy_path_succeeds() {
     local out before after
-    out=$(fixture_exec_sync_scenario "$FIXTURE_PROXY_URL" "$([[ ${IT_DEFER_MAPPING:-0} == 1 ]] && printf no || printf yes)" "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
+    out=$(fixture_exec_sync_scenario "$FIXTURE_PROXY_URL" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
     printf '%s\n' "$out" > "$TEST_ROOT/proxy-run-output"
     fixture_record_count "$TEST_ROOT/proxy-after-run"
     [[ $out == *'同步传输路径：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
@@ -1781,24 +1929,8 @@ fixture_proxy_connect_evidence() {
     return 0
 }
 
-# 传输顺序：可达但拒绝 CONNECT 的代理失败后回退到动态地址映射。
-# 代理端点可达且会计数，故本场景计数增长证明代理尝试确实发生（不是「不可达故无从计数」）；
-# 随后的映射请求成功且不经代理（若经代理会被同一端点以 403 拒绝而失败）。
-fixture_proxy_failure_falls_back_to_mapping() {
-    local out before after
-    before=$(fixture_connect_count)
-    out=$(fixture_exec_sync_scenario "$FIXTURE_REJECT_PROXY" yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
-    after=$(fixture_connect_count)
-    printf '%s\n' "$out" > "$TEST_ROOT/proxy-mapping-output"
-    printf '%s\n' "$before" > "$TEST_ROOT/proxy-mapping-before"
-    printf '%s\n' "$after" > "$TEST_ROOT/proxy-mapping-after"
-    [[ $out == *'传输失败：配置的 HTTPS 代理'* ]] || { printf '%s\n' "$out" >&2; return 1; }
-    [[ $out == *'同步传输路径：直连加动态地址映射'* ]] || { printf '%s\n' "$out" >&2; return 1; }
-    (( after > before )) || { printf '可达拒绝代理未被计数（before=%s after=%s）\n' "$before" "$after" >&2; return 1; }
-    return 0
-}
-
 # 传输顺序：可达但拒绝 CONNECT 的代理失败且无映射时回退到直连系统 DNS。
+# 原私网 mapping 两项（代理拒绝后回退映射、纯映射直连）已迁至独立映射组，不再在此注册。
 fixture_proxy_failure_falls_back_to_system() {
     local out before after
     before=$(fixture_connect_count)
@@ -1813,30 +1945,7 @@ fixture_proxy_failure_falls_back_to_system() {
     return 0
 }
 
-# 非 proxy 尝试不经过代理：先确证计数机制在有代理尝试时确实增长（两次拒绝代理回退场景各增一次），
-# 再以无 PROXY_URL 的纯直连映射场景证明同步成功而计数零增长。因同一映射传输在拒绝代理场景中
-# 也未令计数增长，故「计数可能增长却未增长」可区分地证明直连旁路了代理，而非代理不可达。
-fixture_direct_attempts_leave_proxy_untouched() {
-    local out before after mapping system m_before m_after s_after
-    mapping=$(cat "$TEST_ROOT/proxy-mapping-output" 2>/dev/null) || mapping=
-    system=$(cat "$TEST_ROOT/proxy-system-output" 2>/dev/null) || system=
-    [[ $mapping == *'同步传输路径：直连加动态地址映射'* ]] || return 1
-    [[ $system == *'同步传输路径：直连系统 DNS'* ]] || return 1
-    m_before=$(fixture_read_count "$TEST_ROOT/proxy-mapping-before")
-    m_after=$(fixture_read_count "$TEST_ROOT/proxy-mapping-after")
-    s_after=$(fixture_read_count "$TEST_ROOT/proxy-system-after")
-    (( m_after > m_before )) || { printf '拒绝代理回退未计数（%s→%s）\n' "$m_before" "$m_after" >&2; return 1; }
-    (( s_after > m_after )) || { printf '拒绝代理回退未计数（%s→%s）\n' "$m_after" "$s_after" >&2; return 1; }
-    before=$(fixture_connect_count)
-    out=$(fixture_exec_sync_scenario '' yes "$FIXTURE_REPO") || { printf '%s\n' "$out" >&2; return 1; }
-    after=$(fixture_connect_count)
-    printf '%s\n' "$out" > "$TEST_ROOT/proxy-direct-output"
-    [[ $out == *'同步传输路径：直连加动态地址映射'* ]] || { printf '%s\n' "$out" >&2; return 1; }
-    [[ $before == "$after" ]] || { printf '直连尝试后代理计数变化（%s→%s）\n' "$before" "$after" >&2; return 1; }
-    return 0
-}
-
-# 系统 DNS 直连仍独立验证成功与代理计数不变，不依赖延期的映射结果。
+# 系统 DNS 直连仍独立验证成功与代理计数不变，不依赖映射结果。
 fixture_system_direct_leaves_proxy_untouched() {
     local out before after rejected_before rejected_after
     rejected_before=$(fixture_read_count "$TEST_ROOT/proxy-system-before")
@@ -2758,6 +2867,11 @@ fi
 # docker 完全不可用（CLI 缺失或守护进程不可达）才整体跳过并返回 77。
 [[ ${IT_NETWORK_GUARD_READY:-} == 1 && $(id -u) != 0 ]] || exit 77
 case "$IT_FILTER" in ''|o1|c2) ;; *) exit 64 ;; esac
+# full 明确禁止延期映射请求：继承 IT_DEFER_MAPPING=1 时在任何资源操作前拒绝，不静默清零。
+if [[ ${IT_DEFER_MAPPING:-0} == 1 ]]; then
+    printf 'FAIL：拒绝 IT_DEFER_MAPPING=1 延期映射请求\n' >&2
+    exit 2
+fi
 if ! docker_available; then
     printf 'SKIP：docker 不可用，未执行\n'
     exit 77
@@ -3017,15 +3131,10 @@ check_https_sync 'TLS 夹具：指定分支同步仅保留所选分支' fixture_
 S8_BASE=$FIXTURE_FAILURES
 fixture_step 'HTTPS 代理：启动 TLS 终结的 CONNECT 代理' fixture_start_proxy
 fixture_step 'HTTPS 代理：经代理取到静态 info/refs（就绪）' fixture_wait_proxy
-fixture_step 'HTTPS 代理：预置公开地址快照与代理 CA 信任配置' fixture_prepare_proxy_inputs
+fixture_step 'HTTPS 代理：预置代理 CA 信任配置' fixture_prepare_proxy_inputs
 fixture_step 'HTTPS 代理：记录代理基线计数' fixture_record_proxy_baseline
 if [[ $FIXTURE_FAILURES == $S8_BASE ]]; then PROXY_READY=1; fi
-check_proxy_sync 'HTTPS 代理：配置 PROXY_URL 时真实同步成功（代理路径）' fixture_proxy_path_succeeds
-check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT 且计数增加' fixture_proxy_connect_evidence
-check_mapping_sync '传输顺序：代理可达但拒绝 CONNECT 后回退到动态地址映射' fixture_proxy_failure_falls_back_to_mapping
-check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
-check_mapping_sync '传输顺序：非 proxy 映射直连尝试不增加代理计数' fixture_direct_attempts_leave_proxy_untouched
-check_proxy_sync '传输顺序：非 proxy 系统 DNS 直连尝试不增加代理计数' fixture_system_direct_leaves_proxy_untouched
+integration_register_proxy_group
 
 # 场景 S10：正式镜像内地址快照内容级校验与证书失败（多地址/拒绝/空/超限/主备/原子替换/错误证书/系统文件）。
 # 端点与内容文件属测试私有夹具；夹具未就绪记独立夹具失败并阻止依赖断言；断言读真实卷内快照字节。
@@ -3067,6 +3176,14 @@ check_auth_prod '凭据隔离：合成 Token 访问受认证夹具成功' fixtur
 check_auth_prod '凭据隔离：常驻 daemon 进程环境不含 Token' fixture_daemon_env_excludes_token
 check_auth_sync '凭据夹具：真实 Git 客户端无凭据访问被拒绝（鉴权非空转）' fixture_auth_requires_token
 fixture_step '凭据夹具：释放产品地址和上游别名' fixture_release_shared_endpoints "$AUTH_PROD" "$AUTH_UP"
+fi
+
+# 新映射组（独立 internal 网络 + 双 CA 直拨代理）：full 跑正例与 DNS/TLS/隔离负例；
+# 单项 mode 只选对应场景，其汇总缺少另一正例与全部负例，不能作为 full 结论。
+if integration_group_selected mapping; then
+    source "$ROOT/tests/docker-mapping-assertions.sh"
+    export MAPPING_PROFILE MAPPING_PRODUCT_IMAGE MAPPING_TOOLS_IMAGE
+    integration_register_mapping_group
 fi
 
 # 场景 S11 前置：强杀重建相关产品改动的定向行为用例（无需 Compose），
