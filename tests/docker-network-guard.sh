@@ -201,7 +201,8 @@ guard_runner_command() {
                 script+=$'\n''[[ ${IT_DEFER_MAPPING:-} != 1 ]] || exit 2'
             else
                 # 单项 mapping 模式各自独立入口，不跑旧业务断言；未接线时由入口 fail-closed。
-                extra=(IT_MAPPING=1 IT_MAPPING_PROFILE="$profile")
+                # 单项 mode 与集成入口共用 IT_MAPPING_SCENARIO：据此只选择对应场景，绝不退化为 full。
+                extra=(IT_MAPPING=1 IT_MAPPING_SCENARIO="${mode#mapping-}" IT_MAPPING_PROFILE="$profile")
                 net="gm-$run-m-net"
                 routing="--$mode"
             fi

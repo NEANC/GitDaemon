@@ -91,15 +91,19 @@ full_rejects_defer || failed=1
 full_clears_filter || failed=1
 
 # compose up 必须 create → inspect/登记 → start：登记先于 start，且不转发 -d 与 --rm。
+# 替身让 ps -aq 回短 ID、inspect 回与之不同的完整 ID、卷 inspect 回与入参不同的完整 Name，
+# 从而真正守护「登记用完整 ID / 完整 Name」这条不变式（短 ID 会在清理时账本核验失败）。
 compose_products_registered_before_start() {
     local scratch log rc=0
+    local want_id=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    local want_volume=gm-order-compose-data
     scratch=$(mktemp -d)
     log=$scratch/order
     mkdir -p "$scratch/ledger"
     : > "$log"
     RESOURCE_LEDGER_DIR=$scratch/ledger
     IT_RUN_ID=order
-    COMPOSE_VOLUME=gm-order-compose-data
+    COMPOSE_VOLUME=$scratch-requested-compose-data
     RESOURCE_RUN=order
     docker() {
         local a verb=''
@@ -113,8 +117,13 @@ compose_products_registered_before_start() {
                     start) printf 'start\n' >> "$log" ;;
                 esac
                 ;;
-            inspect) printf 'volume\tgm-order-compose-data\n' ;;
-            volume) printf 'gm-order-compose-data\n' ;;
+            inspect)
+                case "$*" in
+                    *'{{.Id}}'*) printf '%s\n' "$want_id" ;;
+                    *) printf 'volume\t%s\n' "$want_volume" ;;
+                esac
+                ;;
+            volume) printf '%s\n' "$want_volume" ;;
         esac
         return 0
     }
@@ -123,11 +132,48 @@ compose_products_registered_before_start() {
     [[ $rc == 0 ]] || { printf 'FAIL compose up rc=%s\n' "$rc"; }
     grep -q '^FORBIDDEN' "$log" && { printf 'FAIL compose forwarded -d/-v/--rm\n'; rc=1; }
     [[ $(head -n 1 "$log") == create ]] || { printf 'FAIL compose did not create first\n'; rc=1; }
-    grep -q $'^register\tcontainer\tcid1$' "$log" || { printf 'FAIL compose container not registered\n'; rc=1; }
-    grep -q $'^register\tvolume\tgm-order-compose-data$' "$log" || { printf 'FAIL compose volume not registered\n'; rc=1; }
+    grep -q $'^register\tcontainer\t'"$want_id"'$' "$log" || { printf 'FAIL compose container not registered by full id\n'; rc=1; }
+    grep -q $'^register\tcontainer\tcid1$' "$log" && { printf 'FAIL compose container registered by short id\n'; rc=1; }
+    grep -q $'^register\tvolume\t'"$want_volume"'$' "$log" || { printf 'FAIL compose volume not registered by full name\n'; rc=1; }
+    grep -q $'^register\tvolume\t'"$COMPOSE_VOLUME"'$' "$log" && { printf 'FAIL compose volume registered by raw input\n'; rc=1; }
     [[ $(tail -n 1 "$log") == start ]] || { printf 'FAIL compose did not start last\n'; rc=1; }
     rm -rf "$scratch"
     [[ $rc == 0 ]]
+}
+
+# 单项 mode 变量契约：入口命令必须携带 IT_MAPPING_SCENARIO=<对应场景>，且据此在 integration.sh
+# 中只选映射组、只注册对应场景、不注册 full 组（双场景 + 负例）；probe 不是集成场景，须 fail-closed。
+single_mode_binds_one_scenario() {
+    local mode scenario cmd calls rc=0
+    for mode in mapping-fallback mapping-direct mapping-probe; do
+        scenario=${mode#mapping-}
+        cmd=$(guard_runner_command "$mode" /source run /evidence product tools /manifest /attestation /profile) || cmd=''
+        [[ $cmd == *"IT_MAPPING_SCENARIO=$scenario"* ]] \
+            || { printf 'FAIL mode=%s missing IT_MAPPING_SCENARIO=%s\n' "$mode" "$scenario"; rc=1; }
+    done
+    calls=$TEST_ROOT/single-mode-calls
+    for scenario in fallback direct; do
+        : > "$calls"
+        check_mapping_sync() { printf 'mapping\t%s\n' "${2:-}" >> "$calls"; }
+        check_mapping_negative() { printf 'negative\t%s\t%s\n' "${2:-}" "${3:-}" >> "$calls"; }
+        local IT_MAPPING_SCENARIO=$scenario
+        integration_group_selected mapping || { printf 'FAIL %s not mapping group\n' "$scenario"; rc=1; }
+        integration_group_selected https && { printf 'FAIL %s selected legacy group\n' "$scenario"; rc=1; }
+        integration_register_mapping_group || { printf 'FAIL %s register failed\n' "$scenario"; rc=1; }
+        grep -qx $'mapping\t'"$scenario" "$calls" || { printf 'FAIL %s did not register own scenario\n' "$scenario"; rc=1; }
+        [[ $(grep -c $'^mapping\t' "$calls") == 1 ]] || { printf 'FAIL %s registered extra scenario\n' "$scenario"; rc=1; }
+        grep -q $'^negative\t' "$calls" && { printf 'FAIL %s registered full negatives\n' "$scenario"; rc=1; }
+    done
+    : > "$calls"
+    check_mapping_sync() { printf 'mapping\t%s\n' "${2:-}" >> "$calls"; }
+    check_mapping_negative() { printf 'negative\t%s\t%s\n' "${2:-}" "${3:-}" >> "$calls"; }
+    local IT_MAPPING_SCENARIO=probe
+    integration_group_selected mapping || { printf 'FAIL probe not mapping group\n'; rc=1; }
+    integration_group_selected https && { printf 'FAIL probe selected legacy group\n'; rc=1; }
+    if integration_register_mapping_group; then printf 'FAIL probe registration not fail-closed\n'; rc=1; fi
+    [[ ! -s $calls ]] || { printf 'FAIL probe registered scenarios/negatives\n'; rc=1; }
+    IT_MAPPING_SCENARIO=''
+    return "$rc"
 }
 
 # 旧非 mapping 模式新增三参可空；新路径缺参返回 2。
@@ -168,13 +214,8 @@ for group in network empty tz compose-publish compose-runtime https c2 mapping; 
     IT_FILTER='' integration_group_selected "$group" || rc=$?
     [[ $rc == 0 ]] || { printf 'FAIL group=%s not selected when unfiltered rc=%s\n' "$group" "$rc"; failed=1; }
 done
-# 单项映射 mode 只选择映射组。
-rc=0
-IT_FILTER='' IT_MAPPING_SCENARIO=fallback integration_group_selected mapping || rc=$?
-[[ $rc == 0 ]] || { printf 'FAIL single-mode mapping not selected rc=%s\n' "$rc"; failed=1; }
-rc=0
-IT_FILTER='' IT_MAPPING_SCENARIO=fallback integration_group_selected https || rc=$?
-[[ $rc == 1 ]] || { printf 'FAIL single-mode selected legacy group rc=%s\n' "$rc"; failed=1; }
+# 单项 mode 只选对应场景、不退化为 full 组（变量契约 + 注册行为）。
+single_mode_binds_one_scenario || { printf 'FAIL single-mode scenario contract\n'; failed=1; }
 rc=0
 IT_FILTER=c2 integration_group_selected empty || rc=$?
 [[ $rc == 0 ]] || { printf 'FAIL c2 empty not selected rc=%s\n' "$rc"; failed=1; }

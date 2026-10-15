@@ -319,9 +319,10 @@ compose_create_register_start() {
     return 0
 }
 
-# 登记 compose 产物：容器按完整 ID、命名卷按名称；出现隐式匿名卷立即拒绝启动。
+# 登记 compose 产物：容器先 inspect 取完整 ID、命名卷取完整 Name；出现隐式匿名卷立即拒绝启动。
+# 账本核验要求身份等于 {{.Id}}/{{.Name}}，而 compose ps -aq 可能给短 ID，故登记前必须归一化。
 compose_register_products() {
-    local ledger id anon
+    local ledger id full name anon
     local -a ids=()
     ledger=$(resource_ledger_dir) || { resource_ledger_notice compose; return 2; }
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=${IT_RUN_ID:-}
@@ -330,13 +331,16 @@ compose_register_products() {
     done < <(docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_OVERRIDE" ps -aq)
     [[ ${#ids[@]} -gt 0 ]] || return 2
     for id in "${ids[@]}"; do
-        anon=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' "$id" 2>/dev/null \
+        full=$(docker inspect -f '{{.Id}}' "$id") || return 2
+        [[ -n $full ]] || return 2
+        anon=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' "$full" 2>/dev/null \
             | grep -E '^[0-9a-f]{64}$' || true)
-        [[ -z $anon ]] || { printf 'compose 隐式附加匿名卷：%s\n' "$id" >&2; return 2; }
-        resource_register container "$id" "$COMPOSE_SCENARIO" "$COMPOSE_ROLE_PRODUCT" || return 2
+        [[ -z $anon ]] || { printf 'compose 隐式附加匿名卷：%s\n' "$full" >&2; return 2; }
+        resource_register container "$full" "$COMPOSE_SCENARIO" "$COMPOSE_ROLE_PRODUCT" || return 2
     done
-    if docker volume inspect -f '{{.Name}}' "$COMPOSE_VOLUME" >/dev/null 2>&1; then
-        resource_register volume "$COMPOSE_VOLUME" "$COMPOSE_SCENARIO" "$COMPOSE_ROLE_VOLUME" || return 2
+    name=$(docker volume inspect -f '{{.Name}}' "$COMPOSE_VOLUME" 2>/dev/null) || name=''
+    if [[ -n $name ]]; then
+        resource_register volume "$name" "$COMPOSE_SCENARIO" "$COMPOSE_ROLE_VOLUME" || return 2
     fi
     return 0
 }
