@@ -36,7 +36,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch full_binds_mapping_group; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -365,8 +365,47 @@ contract_case() {
             mkdir -p "$scratch/evidence/control"
             IT_EVIDENCE_DIR=$scratch/evidence bash "$HERE/test-docker-network.sh" --mapping-probe > "$scratch/out" 2>&1 || entry_rc=$?
             [[ $entry_rc != 0 ]] || { printf 'unwired mapping entry succeeded\n'; return 1; }
-            grep -q 'MAPPING_SCENARIO_NOT_WIRED' "$scratch/out" || { printf 'fixed marker missing\n'; return 1; }
+            grep -q 'MAPPING_PROBE_NOT_WIRED' "$scratch/out" || { printf 'fixed marker missing\n'; return 1; }
             [[ -z $(ls -A "$scratch/evidence/control") ]] || { printf 'mapping entry touched control plane\n'; return 1; }
+            rm -rf "$scratch"
+            ;;
+        single_mapping_entry_runs_one_scenario)
+            # 单场景入口接线到集成入口：只按所属场景设置 IT_MAPPING_SCENARIO 并运行一次集成，
+            # 不产生 full 汇总；probe 入口保持 fail-closed 且不运行集成。
+            local scratch rc=0 mode record
+            scratch=$(mktemp -d)
+            record=$scratch/integration-scenario
+            mkdir -p "$scratch/evidence/control"
+            : > "$scratch/evidence/control/start"
+            id() { printf '10001\n'; }
+            bash() {
+                case "$1" in
+                    *test-docker-integration.sh)
+                        printf '%s\n' "${IT_MAPPING_SCENARIO:-}" > "$INTEGRATION_RECORD"
+                        return 0
+                        ;;
+                    *) command bash "$@" ;;
+                esac
+            }
+            export -f id bash
+            INTEGRATION_RECORD=$record
+            export INTEGRATION_RECORD
+            for mode in fallback direct; do
+                : > "$record"
+                rc=0
+                IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
+                    command bash "$HERE/test-docker-network.sh" "--mapping-$mode" > "$scratch/out-$mode" 2>&1 || rc=$?
+                [[ $rc == 0 ]] || { printf 'single mapping entry %s exit=%s\n' "$mode" "$rc"; cat "$scratch/out-$mode"; return 1; }
+                [[ $(command cat "$record") == "$mode" ]] || { printf 'entry %s ran scenario %s\n' "$mode" "$(command cat "$record")"; return 1; }
+                [[ ! -e $scratch/evidence/control/mapping-full-summary.tsv ]] \
+                    || { printf 'single entry %s produced a full summary\n' "$mode"; return 1; }
+            done
+            : > "$record"
+            rc=0
+            IT_EVIDENCE_DIR=$scratch/evidence command bash "$HERE/test-docker-network.sh" --mapping-probe > "$scratch/out-probe" 2>&1 || rc=$?
+            [[ $rc != 0 ]] || { printf 'probe entry succeeded while unwired\n'; return 1; }
+            grep -q 'MAPPING_PROBE_NOT_WIRED' "$scratch/out-probe" || { printf 'probe marker missing\n'; return 1; }
+            [[ ! -s $record ]] || { printf 'probe entry ran the integration\n'; return 1; }
             rm -rf "$scratch"
             ;;
         full_binds_mapping_group)
@@ -381,25 +420,52 @@ contract_case() {
             ;;
     esac
 }
+# 降权 runner 握手：登记 PID、等待启动许可、离开管理员私有工作目录。
+runner_handshake() {
+    trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    printf '%s\n' "$$" > "$IT_EVIDENCE_DIR/control/runner.pid"
+    while [[ ! -f $IT_EVIDENCE_DIR/control/start ]]; do
+        [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
+        sleep 0.1
+    done
+    [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
+    # 降权后切换到可访问的源码目录，不继承管理员的私有工作目录。
+    cd -- "$HERE/.." || exit $?
+}
+
+# 集成运行：单项 mode 由 IT_MAPPING_SCENARIO 只选对应场景；full 结束后对集成写出的九字段汇总
+# 运行判定器，汇总不完整（单项/过滤运行）即非零，绝不把部分证据当作 full 结论。
+runner_integration() {
+    local rc=0 judge=0
+    [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
+    bash "$HERE/test-docker-integration.sh" || rc=$?
+    if [[ -z ${IT_MAPPING_SCENARIO:-} && -z ${IT_FILTER:-} ]]; then
+        source "$HERE/docker-mapping-assertions.sh"
+        integration_full_accept "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv" || judge=$?
+    fi
+    (( rc == 0 )) || exit "$rc"
+    exit "$judge"
+}
+
 case "${1:-}" in
     --contracts) contracts ;;
-    --mapping-fallback|--mapping-direct|--mapping-probe)
-        # 单项 mapping 场景本体由后续项接线；未接线时以固定标记 fail-closed，绝不静默成功。
-        printf 'MAPPING_SCENARIO_NOT_WIRED=%s\n' "${1#--}" >&2
+    --mapping-fallback|--mapping-direct)
+        # 单场景映射入口接线到集成入口：按所属场景设置 IT_MAPPING_SCENARIO，只运行对应场景。
+        IT_MAPPING_SCENARIO=${1#--mapping-}
+        export IT_MAPPING_SCENARIO
+        runner_handshake
+        runner_integration
+        ;;
+    --mapping-probe)
+        # 实机 probe（IPAM/internal/双层 TLS/bridge netfilter）留待实机验收项接线；
+        # 未接线前固定 fail-closed，绝不静默成功，也不产生控制面副作用。
+        printf 'MAPPING_PROBE_NOT_WIRED=%s\n' probe >&2
         exit 70
         ;;
     --live|--integration|--startup-integration)
-        trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
-        trap 'exit 143' TERM
-        trap 'exit 130' INT
-        printf '%s\n' "$$" > "$IT_EVIDENCE_DIR/control/runner.pid"
-        while [[ ! -f $IT_EVIDENCE_DIR/control/start ]]; do
-            [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
-            sleep 0.1
-        done
-        [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
-        # 降权后切换到可访问的源码目录，不继承管理员的私有工作目录。
-        cd -- "$HERE/.." || exit $?
+        runner_handshake
         if [[ $1 == --live ]]; then
             source "$HERE/docker-network-fixture.sh"
             network_probe
@@ -408,8 +474,7 @@ case "${1:-}" in
             bash "$HERE/test-docker-startup-integration.sh"
         else
             # 子进程保留自己的清理 trap，外层握手 runner 独立采集退出码。
-            [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
-            bash "$HERE/test-docker-integration.sh"
+            runner_integration
         fi
         ;;
     *) printf 'usage: %s --contracts|--live\n' "$0" >&2; exit 2 ;;

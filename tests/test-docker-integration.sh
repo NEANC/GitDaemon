@@ -158,6 +158,11 @@ IT_MAPPING_SCENARIO=${IT_MAPPING_SCENARIO-}
 MAPPING_PROFILE=${IT_MAPPING_PROFILE-}
 MAPPING_PRODUCT_IMAGE=${MAPPING_PRODUCT_IMAGE:-${IT_PRODUCT_IMAGE:-$IMAGE}}
 MAPPING_TOOLS_IMAGE=${MAPPING_TOOLS_IMAGE:-${IT_TOOLS_IMAGE:-}}
+# 全量验收汇总字段：延期计数按必需分组是否真实执行推导，退出与残留字段取自本脚本自身清理结果。
+IT_DEFERRED=0
+IT_PRIMARY_EXIT=0
+IT_CLEANUP_EXIT=0
+IT_RESIDUAL_COUNT=0
 
 # o1 使用明确场景白名单；c2 保留历史共享空卷与 TZ 前置。
 # 单项映射 mode 只选择映射组，不跑旧业务组，也不能作为 full 结论。
@@ -173,6 +178,9 @@ integration_group_selected() {
         *) return 1 ;;
     esac
 }
+
+# 必需映射分组未真实执行（单项 mode 或旧过滤选择）即记为延期：full 判定不得据此通过。
+if [[ -n $IT_MAPPING_SCENARIO ]] || ! integration_group_selected mapping; then IT_DEFERRED=1; fi
 
 # 阶段 C-2 有界停止场景：独立命名网络 + 「快速失败/挂起」TCP 端点夹具 + 共享 PID 命名空间的采样侧车。
 # 夹具在 443 上接受后立即关闭（使首次同步/首次刷新快速失败，容器能进入就绪）；
@@ -383,6 +391,12 @@ cleanup() {
     if [[ $clean == 0 && -n ${TEST_ROOT:-} && -d $TEST_ROOT && ! -L $TEST_ROOT ]]; then
         rm -rf -- "$TEST_ROOT" || clean=2
     fi
+    # 全量验收汇总字段：先统计本轮 label 残留（不确定即记清理失败），再写状态与汇总 TSV。
+    IT_PRIMARY_EXIT=$primary
+    IT_RESIDUAL_COUNT=$(integration_residual_count) || { IT_RESIDUAL_COUNT=1; clean=2; }
+    [[ $IT_RESIDUAL_COUNT == 0 ]] || clean=2
+    IT_CLEANUP_EXIT=$clean
+    integration_full_summary_write "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv" || clean=2
     printf 'INTEGRATION_PRIMARY_EXIT=%s\nINTEGRATION_CLEANUP_EXIT=%s\nTEST_ROOT=%s\nCOMPOSE_IMAGE=%s\n' \
         "$primary" "$clean" "$TEST_ROOT" "$COMPOSE_IMAGE" > "$IT_EVIDENCE_DIR/control/integration-status.txt" || clean=2
     if (( primary != 0 )); then exit "$primary"; fi
@@ -1469,6 +1483,32 @@ check_gated() {
 check_https_sync() { check_gated FIXTURE_READY "$@"; }
 check_proxy_sync() { check_gated PROXY_READY "$@"; }
 
+# full 汇总槽位状态：按断言真实执行结果记录；未执行的槽位保持缺席，汇总判定据此拒绝。
+declare -A IT_SLOT_DONE=() IT_SLOT_FAIL=()
+
+integration_slot_pass() { IT_SLOT_DONE[$1]=$(( ${IT_SLOT_DONE[$1]:-0} + 1 )); }
+
+integration_slot_fail() {
+    IT_SLOT_DONE[$1]=$(( ${IT_SLOT_DONE[$1]:-0} + 1 ))
+    IT_SLOT_FAIL[$1]=$(( ${IT_SLOT_FAIL[$1]:-0} + 1 ))
+}
+
+# 按断言退出码登记槽位：0 记通过，其余（判定失败或夹具失败）一律记失败。
+integration_slot_record() {
+    if [[ ${2:-} == 0 ]]; then integration_slot_pass "$1"; else integration_slot_fail "$1"; fi
+    return 0
+}
+
+# 负例名称到 full 汇总槽位的映射；未知名称拒绝。
+integration_negative_slot() {
+    case "${1:-}" in
+        dns-false-green) printf 'dns_negatives\n' ;;
+        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) printf 'tls_negatives\n' ;;
+        isolation) printf 'isolation_negatives\n' ;;
+        *) return 1 ;;
+    esac
+}
+
 # 独立映射场景断言：直接运行本场景生命周期并按退出码归类到断言/夹具计数。
 # 不再依赖 PROXY_READY，也不再累加 DEFERRED；拒绝与延期都不再掩盖真实映射结果。
 check_mapping_sync() {
@@ -1477,6 +1517,7 @@ check_mapping_sync() {
     CHECKS=$((CHECKS + 1))
     dir=$IT_EVIDENCE_DIR/control/mapping-$kind
     mapping_scenario_run "$kind" "$dir" || rc=$?
+    integration_slot_record "mapping_$kind" "$rc"
     case "$rc" in
         0) printf '[PASS] %s\n' "$label" ;;
         1) printf '[FAIL] %s\n' "$label"; FAILURES=$((FAILURES + 1)) ;;
@@ -1487,11 +1528,13 @@ check_mapping_sync() {
 
 # 独立映射负例：三层退出由 mapping_negative_run 承担；夹具失败计入夹具计数，判定未拒绝即断言失败。
 check_mapping_negative() {
-    local label=$1 case_name=${2:-} kind=${3:-} dir rc=0
+    local label=$1 case_name=${2:-} kind=${3:-} dir rc=0 slot
     [[ $# == 3 && -n $case_name && -n $kind ]] || return 2
+    slot=$(integration_negative_slot "$case_name") || return 2
     CHECKS=$((CHECKS + 1))
     dir=$IT_EVIDENCE_DIR/control/mapping-neg-$case_name-$kind
     mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
+    integration_slot_record "$slot" "$rc"
     case "$rc" in
         0) printf '[PASS] %s\n' "$label" ;;
         1) printf '[FAIL] %s\n' "$label"; FAILURES=$((FAILURES + 1)) ;;
@@ -1500,12 +1543,69 @@ check_mapping_negative() {
     return 0
 }
 
+# system 两项的 full 槽位：断言真实执行且没有新增断言/夹具失败才记通过；被夹具门控跳过即记失败。
+check_proxy_slot() {
+    local slot=$1 label=$2 failures_before=$FAILURES fixtures_before=$FIXTURE_FAILURES
+    shift 2
+    check_proxy_sync "$label" "$@"
+    if (( FAILURES == failures_before && FIXTURE_FAILURES == fixtures_before )); then
+        integration_slot_pass "$slot"
+    else
+        integration_slot_fail "$slot"
+    fi
+    return 0
+}
+
+# 集成结束路径的全量验收汇总：写出六零值字段 + 七个 PASS 槽位，供 runner 末尾判定消费。
+# 槽位 MISSING 表示该分组未真实执行；三个退出/残留字段取自本脚本自身清理结果。
+integration_full_summary_write() {
+    local file=${1:-} slot
+    local -a slots=(mapping_fallback mapping_direct system_fallback system_direct
+        dns_negatives tls_negatives isolation_negatives)
+    [[ -n $file ]] || return 1
+    {
+        printf 'failures\t%s\n' "$FAILURES"
+        printf 'fixture_failures\t%s\n' "$FIXTURE_FAILURES"
+        printf 'deferred\t%s\n' "$IT_DEFERRED"
+        printf 'primary_exit\t%s\n' "$IT_PRIMARY_EXIT"
+        printf 'cleanup_exit\t%s\n' "$IT_CLEANUP_EXIT"
+        printf 'residual_count\t%s\n' "$IT_RESIDUAL_COUNT"
+        for slot in "${slots[@]}"; do
+            if (( ${IT_SLOT_FAIL[$slot]:-0} > 0 )); then
+                printf '%s\tFAIL\n' "$slot"
+            elif (( ${IT_SLOT_DONE[$slot]:-0} > 0 )); then
+                printf '%s\tPASS\n' "$slot"
+            else
+                printf '%s\tMISSING\n' "$slot"
+            fi
+        done
+    } > "$file.tmp" || return 1
+    mv -- "$file.tmp" "$file" || return 1
+    return 0
+}
+
+# 本脚本拥有的产物残留计数：只统计本轮 label 的容器与命名卷（网络由 guard 生命周期删除）。
+# 任一查询失败返回 2，绝不把不确定结果当作零残留。
+integration_residual_count() {
+    local kind list total=0
+    for kind in container volume; do
+        case "$kind" in
+            container) list=$(docker ps -aq --filter "label=gitdaemon.run=$IT_RUN_ID" 2>/dev/null) || return 2 ;;
+            *) list=$(docker volume ls -q --filter "label=gitdaemon.run=$IT_RUN_ID" 2>/dev/null) || return 2 ;;
+        esac
+        [[ -n ${list//[[:space:]]/} ]] || continue
+        total=$((total + $(printf '%s\n' $list | wc -l)))
+    done
+    printf '%s\n' "$total"
+}
+
 # 私网组唯一注册点：代理成功/证据与 system 两项；原私网 mapping 两项已迁至独立映射组，不再注册。
+# system 两项同时登记 full 汇总槽位，使 full 判定依赖真实执行结果而非固定阈值。
 integration_register_proxy_group() {
     check_proxy_sync 'HTTPS 代理：配置 PROXY_URL 时真实同步成功（代理路径）' fixture_proxy_path_succeeds
     check_proxy_sync 'HTTPS 代理：代理侧观测到 github.com:443 的 CONNECT 且计数增加' fixture_proxy_connect_evidence
-    check_proxy_sync '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
-    check_proxy_sync '传输顺序：非 proxy 系统 DNS 直连尝试不增加代理计数' fixture_system_direct_leaves_proxy_untouched
+    check_proxy_slot system_fallback '传输顺序：代理可达但拒绝 CONNECT 且无映射时回退到直连系统 DNS' fixture_proxy_failure_falls_back_to_system
+    check_proxy_slot system_direct '传输顺序：非 proxy 系统 DNS 直连尝试不增加代理计数' fixture_system_direct_leaves_proxy_untouched
 }
 
 # 单项映射 mode 只选对应场景；full（未指定）时两场景都跑。
@@ -1540,33 +1640,8 @@ integration_register_mapping_group() {
     check_mapping_negative '映射负例：额外网络附件被配置审计拒绝（direct）' isolation direct
 }
 
-# 全量验收汇总判定：字段 failures/fixture_failures/deferred/primary_exit/cleanup_exit/residual_count
-# 必须为 0；mapping_fallback/mapping_direct/system_fallback/system_direct/dns_negatives/tls_negatives/
-# isolation_negatives 必须为 PASS；缺项、重复键、未知形状或非约定取值一律返回 1。
-mapping_full_accept() {
-    local file=${1:-} line key value
-    local -A seen=()
-    local -a zero_fields=(failures fixture_failures deferred primary_exit cleanup_exit residual_count)
-    local -a pass_fields=(mapping_fallback mapping_direct system_fallback system_direct
-        dns_negatives tls_negatives isolation_negatives)
-    [[ -n $file && -f $file && ! -L $file && -r $file ]] || return 1
-    while IFS= read -r line || [[ -n $line ]]; do
-        [[ -n $line ]] || continue
-        [[ $line == *$'\t'* ]] || return 1
-        key=${line%%$'\t'*}
-        value=${line#*$'\t'}
-        [[ -n $key && -n $value && $value != *$'\t'* ]] || return 1
-        [[ -z ${seen[$key]:-} ]] || return 1
-        seen[$key]=$value
-    done < "$file"
-    for key in "${zero_fields[@]}"; do
-        [[ ${seen[$key]:-} == 0 ]] || return 1
-    done
-    for key in "${pass_fields[@]}"; do
-        [[ ${seen[$key]:-} == PASS ]] || return 1
-    done
-    return 0
-}
+# 全量验收汇总判定 mapping_full_accept 由 docker-mapping-assertions.sh 提供：runner 结束路径
+# 消费集成写出的九字段汇总，并由独立契约测试覆盖缺项/重复项/非零字段三类拒绝。
 check_auth_sync() { check_gated AUTH_READY "$@"; }
 check_auth_prod() { check_gated AUTH_PROD_READY "$@"; }
 check_hosts_content() { check_gated HOSTS_READY "$@"; }
@@ -2873,6 +2948,7 @@ fi
 case "$IT_FILTER" in ''|o1|c2) ;; *) exit 64 ;; esac
 # full 明确禁止延期映射请求：继承 IT_DEFER_MAPPING=1 时在任何资源操作前拒绝，不静默清零。
 if [[ ${IT_DEFER_MAPPING:-0} == 1 ]]; then
+    IT_DEFERRED=1
     printf 'FAIL：拒绝 IT_DEFER_MAPPING=1 延期映射请求\n' >&2
     exit 2
 fi
@@ -3209,5 +3285,5 @@ c2_run_scenario timedhosts 1 TERM
 c2_run_scenario timedhosts 1 INT
 fi
 
-printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s；显式延期：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES" "${DEFERRED:-0}"
+printf '容器实机集成检查：%s；断言失败：%s；夹具失败：%s；显式延期：%s\n' "$CHECKS" "$FAILURES" "$FIXTURE_FAILURES" "$IT_DEFERRED"
 [[ $FAILURES == 0 && $FIXTURE_FAILURES == 0 ]]

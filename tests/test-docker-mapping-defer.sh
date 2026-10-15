@@ -100,7 +100,86 @@ mapping_full_accept_contract() {
     return "$rc"
 }
 
-for name in registration_moves_only_two_mapping_checks single_mapping_mode_is_independent mapping_full_accept_contract; do
+# 运行时生产者：集成结束路径写出的九字段汇总必须真实反映断言与槽位结果，并被判定器接受/拒绝。
+# 汇总由 integration_full_summary_write 生成（不是手工拼装样本），判定由 mapping_full_accept 执行。
+full_summary_producer_contract() {
+    local file=$TEST_ROOT/producer/summary.tsv rc=0 k
+    local -a slots=(mapping_fallback mapping_direct system_fallback system_direct
+        dns_negatives tls_negatives isolation_negatives)
+    mkdir -p "$TEST_ROOT/producer"
+    FAILURES=0 FIXTURE_FAILURES=0
+    IT_DEFERRED=0 IT_PRIMARY_EXIT=0 IT_CLEANUP_EXIT=0 IT_RESIDUAL_COUNT=0
+    IT_SLOT_DONE=() IT_SLOT_FAIL=()
+    for k in "${slots[@]}"; do integration_slot_pass "$k"; done
+    integration_full_summary_write "$file" || { printf 'FAIL 汇总写出失败\n'; return 1; }
+    [[ $(wc -l < "$file") == 13 ]] || { printf 'FAIL 汇总字段数 %s != 13\n' "$(wc -l < "$file")"; rc=1; }
+    mapping_full_accept "$file" || { printf 'FAIL 运行期汇总未被接受\n'; rc=1; }
+    integration_full_accept "$file" >/dev/null || { printf 'FAIL runner 判定拒绝了通过汇总\n'; rc=1; }
+    # 断言失败计数非零：判定器必须拒绝。
+    FAILURES=1
+    integration_full_summary_write "$file" || rc=1
+    if mapping_full_accept "$file"; then printf 'FAIL 非零断言汇总被接受\n'; rc=1; fi
+    FAILURES=0
+    # 槽位缺席（单项 mode 或过滤运行）：判定器必须拒绝。
+    IT_SLOT_DONE=() IT_SLOT_FAIL=()
+    integration_full_summary_write "$file" || rc=1
+    if integration_full_accept "$file" >/dev/null 2>&1; then printf 'FAIL 缺槽位汇总被接受\n'; rc=1; fi
+    # 槽位失败：判定器必须拒绝。
+    for k in "${slots[@]}"; do integration_slot_pass "$k"; done
+    integration_slot_fail tls_negatives
+    integration_full_summary_write "$file" || rc=1
+    if mapping_full_accept "$file"; then printf 'FAIL 失败槽位汇总被接受\n'; rc=1; fi
+    # 延期计数非零同样拒绝（该计数派生自必需映射分组是否真实执行）。
+    IT_SLOT_DONE=() IT_SLOT_FAIL=()
+    for k in "${slots[@]}"; do integration_slot_pass "$k"; done
+    IT_DEFERRED=1
+    integration_full_summary_write "$file" || rc=1
+    if mapping_full_accept "$file"; then printf 'FAIL 延期汇总被接受\n'; rc=1; fi
+    IT_DEFERRED=0
+    return "$rc"
+}
+
+# runner 结束路径：--integration 先运行集成，再对九字段汇总运行判定器；
+# 汇总被拒（缺槽位等）时 runner 必须非零，通过汇总必须为 0，绝不把部分证据当作 full 结论。
+integration_runner_judges_summary() {
+    local scratch failed=0 rc=0
+    scratch=$(mktemp -d)
+    mkdir -p "$scratch/evidence/control"
+    : > "$scratch/evidence/control/start"
+    # 集成脚本替身：按 INTEGRATION_VERDICT 写出一份通过或缺失槽位的汇总后返回 0。
+    bash() {
+        case "$1" in
+            *test-docker-integration.sh)
+                if [[ ${INTEGRATION_VERDICT:-pass} == pass ]]; then
+                    full_summary_write "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv"
+                else
+                    full_summary_write "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv" drop mapping_direct
+                fi
+                return 0
+                ;;
+            *) command bash "$@" ;;
+        esac
+    }
+    id() { printf '10001\n'; }
+    export -f bash full_summary_write id
+    rc=0
+    INTEGRATION_VERDICT=pass IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
+        command bash "$HERE/test-docker-network.sh" --integration > "$scratch/pass.out" 2>&1 || rc=$?
+    printf 'RUNNER_FULL_PASS rc=%s\n' "$rc"
+    [[ $rc == 0 ]] || { printf 'FAIL runner rejected a passing summary\n'; cat "$scratch/pass.out"; failed=1; }
+    rc=0
+    INTEGRATION_VERDICT=drop IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
+        command bash "$HERE/test-docker-network.sh" --integration > "$scratch/drop.out" 2>&1 || rc=$?
+    printf 'RUNNER_FULL_REJECT rc=%s\n' "$rc"
+    [[ $rc != 0 ]] || { printf 'FAIL runner accepted an incomplete summary\n'; failed=1; }
+    grep -q 'MAPPING_FULL_ACCEPT=REJECT' "$scratch/drop.out" \
+        || { printf 'FAIL reject marker missing\n'; failed=1; }
+    rm -rf "$scratch"
+    return "$failed"
+}
+
+for name in registration_moves_only_two_mapping_checks single_mapping_mode_is_independent mapping_full_accept_contract \
+    full_summary_producer_contract integration_runner_judges_summary; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
