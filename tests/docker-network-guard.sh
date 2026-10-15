@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # 授权宿主专属规则外层；不接受任意业务命令。
 set -Eeuo pipefail
+GUARD_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# 环境授权库与 guard 同目录；新路径缺参或缺库时由入口拒绝，不创建任何资源。
+[[ ! -f $GUARD_DIR/docker-validation-environment.sh ]] || source "$GUARD_DIR/docker-validation-environment.sh"
 OWN_RULES=() OWN_CHAINS=()
 PENDING_SIGNAL=0
+GUARD_BOUND=0
+GUARD_SOURCE=''
+GUARD_MANIFEST=''
+GUARD_ATTESTATION=''
+GUARD_PROFILE=''
 # 仅在所有权登记及启动握手安全点处理可捕获信号。
 guard_signal_checkpoint() {
     if (( PENDING_SIGNAL != 0 )); then exit "$PENDING_SIGNAL"; fi
@@ -38,11 +46,11 @@ guard_rule() {
     printf '%s|%s\n' "$table" "$*" >> "$E/rules.owned"
     guard_signal_checkpoint
 }
-# 实际以普通宿主用户调用 Docker，记录 su 直接状态。
+# 实际以普通宿主用户调用 Docker，记录 su 直接状态；清除继承的 Docker 覆盖。
 guard_gm() {
     local cmd rc=0
     printf -v cmd '%q ' "$@"
-    su -s /bin/bash "$RUNNER" -c "$cmd" || rc=$?
+    su -s /bin/bash "$RUNNER" -c "unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; $cmd" || rc=$?
     printf 'SU_EXIT=%s\n' "$rc" >> "$E/su-status.log"
     return "$rc"
 }
@@ -51,12 +59,19 @@ guard_write_recovery() {
     {
         printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
         printf 'RUN=%q\nRUNNER=%q\n' "$RUN" "$RUNNER"
+        printf 'SOURCE=%q\nMANIFEST=%q\nATTESTATION=%q\n' "$GUARD_SOURCE" "$GUARD_MANIFEST" "$GUARD_ATTESTATION"
         declare -p OWN_RULES OWN_CHAINS
         declare -f guard_remove_rules
         cat <<'RECOVERY'
 # 管理员须先确认本轮 runner 已停止，再显式授权恢复。
 [[ ${1:-} == --runner-stopped ]] || exit 64
 [[ $(id -u) == 0 ]] || exit 77
+# 绑定路径必须先复核同一 VM/runner/socket/daemon，再触碰任何对象。
+if [[ -n $MANIFEST ]]; then
+    [[ -n $SOURCE ]] || exit 77
+    source "$SOURCE/tests/docker-validation-environment.sh" || exit 77
+    validation_environment_verify "$MANIFEST" "$ATTESTATION" || exit 77
+fi
 # 通过普通宿主用户删除每个重新枚举到的精确对象。
 recover_remove() {
     local command
@@ -81,7 +96,7 @@ RECOVERY
 }
 # 清理前先保存输入关联的容器状态、日志与规则计数。
 guard_cleanup() {
-    local primary=$? clean=0 item ids kind residual isolated=1
+    local primary=$? clean=0 item ids kind residual isolated=1 bound=1
     trap '' TERM INT
     trap - EXIT
     set +e
@@ -94,26 +109,36 @@ guard_cleanup() {
         wait "$CHILD"; printf 'SETSID_WAIT_EXIT=%s\n' "$?" >> "$E/exit-status.txt"
     fi
     iptables-save -c > "$E/rules-before-cleanup.txt" || clean=2
-    ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
-    for item in $ids; do
-        docker inspect "$item" > "$E/inspect-$item.json" || clean=2
-        docker logs "$item" > "$E/container-$item.log" 2>&1 || clean=2
-        guard_gm docker rm -f "$item" || { clean=2; isolated=0; }
-    done
-    for kind in network volume; do
-        ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+    # 绑定路径先复核同一 VM/runner/socket/daemon；漂移时保留隔离，不触碰未知端点。
+    if [[ $GUARD_BOUND == 1 ]]; then
+        validation_environment_verify "$GUARD_MANIFEST" "$GUARD_ATTESTATION" || bound=0
+    fi
+    if (( bound == 0 )); then
+        printf 'ENVIRONMENT_DRIFT=1\nRUN=%s\n' "$RUN" >> "$E/recovery.txt"
+        clean=2
+        isolated=0
+    else
+        ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
         for item in $ids; do
-            guard_gm docker "$kind" rm "$item" || { clean=2; isolated=0; }
+            docker inspect "$item" > "$E/inspect-$item.json" || clean=2
+            docker logs "$item" > "$E/container-$item.log" 2>&1 || clean=2
+            guard_gm docker rm -f "$item" || { clean=2; isolated=0; }
         done
-    done
-    residual=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
-    printf '%s\n' "$residual" > "$E/residual-containers.txt"
-    [[ -z $residual ]] || { clean=2; isolated=0; }
-    for kind in network volume; do
-        residual=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
-        printf '%s\n' "$residual" > "$E/residual-${kind}s.txt"
+        for kind in network volume; do
+            ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+            for item in $ids; do
+                guard_gm docker "$kind" rm "$item" || { clean=2; isolated=0; }
+            done
+        done
+        residual=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+        printf '%s\n' "$residual" > "$E/residual-containers.txt"
         [[ -z $residual ]] || { clean=2; isolated=0; }
-    done
+        for kind in network volume; do
+            residual=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
+            printf '%s\n' "$residual" > "$E/residual-${kind}s.txt"
+            [[ -z $residual ]] || { clean=2; isolated=0; }
+        done
+    fi
     if [[ -f $E/control/integration-status.txt ]]; then
         grep -qx 'INTEGRATION_CLEANUP_EXIT=0' "$E/control/integration-status.txt" || { clean=2; isolated=0; }
     fi
@@ -158,14 +183,30 @@ guard_close_calibration() {
     for ((i=0;i<CAL_START;i++)); do keep+=("${OWN_RULES[i]}"); done
     OWN_RULES=("${keep[@]}")
 }
-# 生成固定入口命令；full 显式清除继承过滤，不能接收任意业务命令。
+# 生成固定入口命令；新路径由子入口独立复核本地 daemon，full 由子入口再查延期请求。
 guard_runner_command() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6
-    local -a filter=(-u IT_FILTER) entry=(--integration)
+    local manifest=${7:-} attestation=${8:-} profile=${9:-}
+    local script=''
+    [[ $# -le 9 ]] || return 2
+    local -a filter=(-u IT_FILTER) entry=(--integration) extra=()
     case "$mode" in
         o1) filter=(IT_FILTER=o1) ;;
         c2) filter=(IT_FILTER=c2) ;;
-        full) ;;
+        full|mapping-fallback|mapping-direct|mapping-probe)
+            [[ -n $manifest && -n $attestation && -n $profile ]] || return 2
+            extra=(IT_MAPPING_PROFILE="$profile")
+            script='set -e'
+            [[ $mode != full ]] || script+=$'\n''[[ ${IT_DEFER_MAPPING:-} != 1 ]] || exit 2'
+            script+=$'\n''endpoint=unix:///var/run/docker.sock'
+            script+=$'\n''daemon=$(grep "^daemon_id" "$2" | cut -f2)'
+            script+=$'\n''[[ -n $daemon ]] || exit 77'
+            script+=$'\n''actual=$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker --host "$endpoint" info -f '"'"'{{.ID}}'"'"')'
+            script+=$'\n''[[ $actual == "$daemon" ]] || exit 77'
+            script+=$'\n''exec bash "$1/tests/test-docker-network.sh" --integration'
+            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="gm-$run-net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
+            return 0
+            ;;
         probe) entry=(--live) ;;
         startup) entry=(--startup-integration) ;;
         *) return 2 ;;
@@ -174,21 +215,44 @@ guard_runner_command() {
 }
 # 固定入口解析、宿主预检、规则安装以及降权执行。
 guard_main() {
-    local mode='' source='' image='' tools='' existing table chain parent bridge seq request token pid command rc=0 ids routes resources links rules
+    local mode='' source='' image='' tools='' manifest='' attestation='' profile='' existing table chain parent bridge seq request token pid command rc=0 ids routes resources links rules
     RUN='' E='' RUNNER=''
     while (( $# )); do
         [[ $# -ge 2 ]] || return 2
         case "$1" in
             --run-id) RUN=$2 ;; --evidence-dir) E=$2 ;; --source-dir) source=$2 ;;
             --runner-user) RUNNER=$2 ;; --mode) mode=$2 ;; --product-image) image=$2 ;; --tools-image) tools=$2 ;;
+            --environment-manifest) manifest=$2 ;; --offline-attestation) attestation=$2 ;; --mapping-profile) profile=$2 ;;
             *) return 2 ;;
         esac
         shift 2
     done
     [[ $RUN =~ ^[a-zA-Z0-9-]{1,10}$ && $RUNNER == gmtest && $E == /* && $source == /* && -n $image && -n $tools ]] || return 2
-    case "$mode" in probe|o1|c2|full|startup) ;; *) return 2 ;; esac
+    case "$mode" in probe|o1|c2|full|startup|mapping-fallback|mapping-direct|mapping-probe) ;; *) return 2 ;; esac
+    # 新 full/mapping 路径必须绑定环境授权清单，缺参即拒绝。
+    case "$mode" in
+        full|mapping-fallback|mapping-direct|mapping-probe)
+            [[ -n $manifest && -n $attestation && -n $profile ]] || return 77 ;;
+    esac
     [[ $(id -u) == 0 ]] || return 77
-    ip -4 addr show | grep -q 'inet 192.168.10.9/' || return 77
+    # full 在父入口先拒绝继承的延期请求，子入口再次复核，不能只靠父进程。
+    if [[ $mode == full && ${IT_DEFER_MAPPING:-} == 1 ]]; then return 2; fi
+    case "$mode" in
+        full)
+            GUARD_SOURCE=$source GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
+            validation_environment_verify "$manifest" "$attestation" || return $?
+            GUARD_BOUND=1
+            ;;
+        mapping-fallback|mapping-direct|mapping-probe)
+            GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
+            validation_environment_verify "$manifest" "$attestation" || return $?
+            # mapping 拒绝证据与独立网络尚未接入，不得安装旧业务网规则。
+            return 77
+            ;;
+        *)
+            ip -4 addr show | grep -q 'inet 192.168.10.9/' || return 77
+            ;;
+    esac
     [[ $E != /tmp/* && $E != /var/tmp/* && ! -e $E ]] || return 73
     [[ $(id -u "$RUNNER") != 0 ]] || return 77
     BR=g$RUN WBR=w$RUN CHAIN=G$RUN EARLY=E$RUN RETURN=R$RUN SEEN=S$RUN
@@ -248,7 +312,7 @@ guard_main() {
     guard_rule raw -A "$EARLY" -d 172.30.244.0/24 -j DROP
     guard_rule raw -A "$RETURN" -d 172.30.243.0/24 -j DROP
     iptables-save -c > "$E/rules-ready.txt"
-    command=$(guard_runner_command "$mode" "$source" "$RUN" "$E" "$image" "$tools")
+    command=$(guard_runner_command "$mode" "$source" "$RUN" "$E" "$image" "$tools" "$manifest" "$attestation" "$profile")
     printf -v command 'su -s /bin/bash %q -c %q; rc=$?; printf "BUSINESS_SU_EXIT=%%s\\n" "$rc" > %q; exit "$rc"' "$RUNNER" "$command" "$E/business-su-status.txt"
     setsid bash -c "$command" > "$E/run.log" 2>&1 &
     CHILD=$!

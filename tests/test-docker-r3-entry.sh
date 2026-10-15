@@ -4,12 +4,11 @@ set -Eeuo pipefail
 HERE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$HERE/docker-network-guard.sh"
 failed=0
-for mode in o1 c2 full probe; do
+for mode in o1 c2 probe; do
     command=$(guard_runner_command "$mode" /source run /evidence product tools) || command=''
     case "$mode" in
         o1) expected='IT_FILTER=o1' ;;
         c2) expected='IT_FILTER=c2' ;;
-        full) expected='-u IT_FILTER' ;;
         probe) expected='--live' ;;
     esac
     if [[ $command != *"$expected"* ]]; then
@@ -21,14 +20,42 @@ for mode in o1 c2 full probe; do
         failed=1
     fi
 done
-for mode in o1 c2 full probe startup invalid 'c2 --live'; do
+# 新 full/mapping 路径必须带齐绑定参数，且命令内只出现唯一本地端点。
+for mode in full mapping-fallback mapping-direct mapping-probe; do
+    command=$(guard_runner_command "$mode" /source run /evidence product tools /manifest /attestation /profile) || command=''
+    if [[ $command != *'-u IT_FILTER'* || $command != *'test-docker-network.sh'* ]]; then
+        printf 'FAIL bound mode=%s actual=%s\n' "$mode" "$command"
+        failed=1
+    fi
+    if [[ $(grep -o 'unix:///var/run/docker.sock' <<< "$command" | wc -l) != 1 ]]; then
+        printf 'FAIL mode=%s endpoint not unique: %s\n' "$mode" "$command"
+        failed=1
+    fi
+done
+# full 必须让子入口再次复核延期请求，不能只靠父进程。
+command=$(guard_runner_command full /source run /evidence product tools /manifest /attestation /profile) || command=''
+if [[ $command != *'IT_DEFER_MAPPING'* ]]; then
+    printf 'FAIL full child defer check missing\n'
+    failed=1
+fi
+# 旧非 mapping 模式新增三参可空；新路径缺参返回 2。
+for mode in o1 c2 probe full mapping-fallback mapping-direct mapping-probe; do
+    rc=0
+    guard_runner_command "$mode" /source run /evidence product tools '' '' '' >/dev/null || rc=$?
+    case "$mode" in
+        o1|c2|probe) expected=0 ;;
+        *) expected=2 ;;
+    esac
+    [[ $rc == "$expected" ]] || { printf 'FAIL mode=%s optionality rc=%s\n' "$mode" "$rc"; failed=1; }
+done
+for mode in o1 c2 full probe startup mapping-fallback mapping-direct mapping-probe invalid 'c2 --live'; do
     rc=0
     (
         # 在首个宿主权限检查处停止，不触及 Docker 或隔离规则。
         id() { printf '10001\n'; }
         guard_main --run-id contract --evidence-dir /evidence --source-dir /source --runner-user gmtest --mode "$mode" --product-image product --tools-image tools
     ) || rc=$?
-    case "$mode" in o1|c2|full|probe|startup) expected=77 ;; *) expected=2 ;; esac
+    case "$mode" in o1|c2|full|probe|startup|mapping-fallback|mapping-direct|mapping-probe) expected=77 ;; *) expected=2 ;; esac
     printf 'MODE=%s EXPECT=%s ACTUAL=%s\n' "$mode" "$expected" "$rc"
     [[ $rc == "$expected" ]] || failed=1
 done
