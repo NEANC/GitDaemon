@@ -466,6 +466,17 @@ MAPPING_CLIENT_PROXY_CA="$MAPPING_CA_MOUNT/proxy-ca.crt"
 MAPPING_ASSET_VOLUME_ROLE='assets'
 MAPPING_CA_VOLUME_ROLE='ca'
 MAPPING_SAFE_OPTIONS='--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges --sysctl net.ipv6.conf.all.disable_ipv6=1'
+# 上游 U:443 连接取证与上游 Git 助手：serve.sh 逐连接记录 requests.log；
+# git 助手在服务目录内初始化并推进受控 dumb HTTP 仓库，供 refs/HEAD 预期读取。
+MAPPING_UPSTREAM_OWNER='gitdaemon'
+MAPPING_UPSTREAM_REPO='fixture'
+MAPPING_UPSTREAM_PATH="$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git"
+MAPPING_UPSTREAM_REF='refs/heads/main'
+MAPPING_UPSTREAM_REQUESTS="$MAPPING_FIXTURE_MOUNT/upstream/requests.log"
+MAPPING_UPSTREAM_SERVE_LOG="$MAPPING_FIXTURE_MOUNT/upstream/serve.log"
+# 受控 DNS 的假绿开关：默认留空；仅安全负例显式设置后，指定名称才解析到指定地址。
+MAPPING_DNS_FAKE_HOST=''
+MAPPING_DNS_FAKE_IP=''
 MAPPING_FAILURE=80
 MAPPING_USAGE=2
 
@@ -857,6 +868,7 @@ mapping_assets_prepare() {
     mapping_assets_volumes_create "$ledger" || return "$MAPPING_FAILURE"
     script=$(mapping_asset_script) || return "$MAPPING_FAILURE"
     mapping_fixture_asset_exec "$script" "$product_image" || return "$MAPPING_FAILURE"
+    mapping_fixture_asset_write 'upstream/serve.sh' "$(mapping_upstream_serve_script)" "$product_image" || return "$MAPPING_FAILURE"
     mapping_fixture_asset_write 'proxy/proxy.sh' "$(mapping_proxy_script)" "$product_image" || return "$MAPPING_FAILURE"
     mapping_fixture_ca_publish "$product_image" || return "$MAPPING_FAILURE"
     mapping_fixture_state_write run_id "$MP_RUN_ID" || return "$MAPPING_FAILURE"
@@ -866,12 +878,99 @@ mapping_assets_prepare() {
 }
 
 # 受控 DNS 参数：gm-proxy 指向 X，其余（含 github.com）不解析，且不递归外部。
+# 仅当假绿开关被显式设置时，才额外把指定名称解析到指定地址（安全负例专用）。
 mapping_dns_daemon_args() {
-    local profile=${1:-}
+    local profile=${1:-} fake=''
     mapping_profile_load "$profile" || return 1
+    if [[ -n ${MAPPING_DNS_FAKE_HOST:-} && -n ${MAPPING_DNS_FAKE_IP:-} ]]; then
+        fake="--address=/$MAPPING_DNS_FAKE_HOST/$MAPPING_DNS_FAKE_IP"
+    fi
     printf '%s\n' dnsmasq --keep-in-foreground --no-resolv --no-hosts \
-        "--address=/$MAPPING_PROXY_HOST/$MP_X" '--address=/#/' \
+        "--address=/$MAPPING_PROXY_HOST/$MP_X" '--address=/#/' $fake \
         --log-queries --log-facility=- --pid-file= --user=git-daemon
+}
+
+# 上游服务脚本：逐连接接受一次并记录 requests.log，供 U:443 实际连接计数取证。
+# 以 -naccept 1 循环使每次接受的连接恰好落一行证据，不依赖外部递归。
+mapping_upstream_serve_script() {
+    cat <<'MAPPING_SERVE'
+set -u
+R=${MAPPING_ASSET_ROOT:?}
+cd "$R/upstream/web" || exit 1
+: > "$R/upstream/requests.log"
+while :; do
+    openssl s_server -quiet -naccept 1 -accept 443 \
+        -cert "$R/upstream/tls/srv.crt" -key "$R/upstream/tls/srv.key" -WWW \
+        >"$R/upstream/serve.log" 2>&1
+    printf '%s\n' connection >> "$R/upstream/requests.log"
+done
+MAPPING_SERVE
+}
+
+# 上游 U:443 实际连接计数：经 docker exec 读取 requests.log，缺失或损坏一律非零，
+# 绝不默认为零，从而拒绝「未取到上游连接证据」的空跑。
+mapping_upstream_evidence_count() {
+    local scenario=${1:-} raw
+    mapping_scenario_valid "$scenario" || return 1
+    raw=$(mapping_fixture_docker exec "$(mapping_upstream_container)" \
+        sh -c "wc -l < '$MAPPING_UPSTREAM_REQUESTS'" 2>/dev/null) || return 1
+    mapping_proxy_count_strict "$raw"
+}
+
+# 上游 Git 助手脚本：在资产卷内的 dumb HTTP 服务目录初始化并推进受控仓库。
+# 变量经 env 注入，不写入镜像；助手只在容器内运行。
+mapping_upstream_git_script() {
+    cat <<'MAPPING_GIT'
+set -eu
+R=${MAPPING_ASSET_ROOT:?}
+repo="$R/upstream/web/${MAPPING_UPSTREAM_PATH:?}"
+action=${1:-}
+case "$action" in
+    init)
+        mkdir -p "$repo"
+        git init -q --bare "$repo"
+        git --git-dir="$repo" symbolic-ref HEAD "${MAPPING_UPSTREAM_REF:?}"
+        ;;
+    commit)
+        msg=${2:-}
+        [ -n "$msg" ] || exit 2
+        work=$(mktemp -d)
+        git clone -q "$repo" "$work"
+        printf '%s\n' "$msg" > "$work/commit.txt"
+        git -C "$work" add commit.txt
+        git -C "$work" -c user.email=fixture@example.invalid -c user.name=fixture \
+            commit -q -m "$msg"
+        git -C "$work" push -q origin "HEAD:${MAPPING_UPSTREAM_REF:?}"
+        rm -rf "$work"
+        git --git-dir="$repo" update-server-info
+        git --git-dir="$repo" rev-parse "${MAPPING_UPSTREAM_REF:?}"
+        ;;
+    refs)
+        git --git-dir="$repo" for-each-ref --format='%(objectname)%09%(refname)'
+        ;;
+    head)
+        git --git-dir="$repo" rev-parse "${MAPPING_UPSTREAM_REF:?}"
+        ;;
+    update)
+        git --git-dir="$repo" update-server-info
+        ;;
+    *) exit 2 ;;
+esac
+exit 0
+MAPPING_GIT
+}
+
+# 上游 Git 助手执行边界：网络 none、UID 10001，只挂资产卷，绝不联网、不触真实 daemon 之外资源。
+mapping_upstream_git_run() {
+    local image=${1:-} action=${2:-} msg=${3:-} script
+    [[ -n $image && -n $action ]] || return 1
+    script=$(mapping_upstream_git_script) || return 1
+    printf '%s' "$script" | mapping_fixture_docker run --rm -i --user 10001:10001 --network none \
+        -e "MAPPING_ASSET_ROOT=$MAPPING_ASSET_ROOT" \
+        -e "MAPPING_UPSTREAM_PATH=$MAPPING_UPSTREAM_PATH" \
+        -e "MAPPING_UPSTREAM_REF=$MAPPING_UPSTREAM_REF" \
+        -v "$(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+        -s "$action" ${msg:+"$msg"}
 }
 
 # 夹具前置核验：映射网络与两个资产卷必须已存在且身份相符。
@@ -886,9 +985,9 @@ mapping_fixture_precheck() {
     return 0
 }
 
-# 夹具容器统一经登记边界创建并启动：create 返回身份 → 登记 → start。
+# 夹具容器统一经登记边界创建（不启动）：create 返回身份 → 登记；失败即非零。
 # 参数：<场景> <角色> <docker create 其余参数...>
-mapping_fixture_run() {
+mapping_fixture_create() {
     local scenario=${1:-} role=${2:-} id
     shift 2
     [[ -n $scenario && -n $role ]] || return 1
@@ -901,6 +1000,15 @@ mapping_fixture_run() {
         --label "gitdaemon.role=$role" "$@" || return 1
     id=$RESOURCE_CREATED_ID
     [[ -n $id ]] || return 1
+    printf '%s\n' "$id"
+}
+
+# 夹具容器统一经登记边界创建并启动：create 返回身份 → 登记 → start。
+# 参数：<场景> <角色> <docker create 其余参数...>
+mapping_fixture_run() {
+    local scenario=${1:-} role=${2:-} id
+    shift 2
+    id=$(mapping_fixture_create "$scenario" "$role" "$@") || return 1
     mapping_fixture_docker start "$id" >/dev/null || return 1
     printf '%s\n' "$id"
 }
@@ -932,7 +1040,7 @@ mapping_fixture_start() {
         $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_U" \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_UPSTREAM_PORT" \
         -v "$(mapping_assets_volume):$root:ro" --entrypoint /bin/sh "$tools_image" \
-        -c "cd $root/upstream/web && exec openssl s_server -quiet -accept $MAPPING_UPSTREAM_PORT -cert $root/upstream/tls/srv.crt -key $root/upstream/tls/srv.key -WWW" \
+        -c "exec $root/upstream/serve.sh" \
         >/dev/null || return "$MAPPING_FAILURE"
     # 代理：固定地址 X；接受/拒绝端口各用独立计数文件，同一进程不并发读改同一文件。
     proxy_cmd="$root/proxy/proxy.sh $MAPPING_PROXY_ACCEPT_PORT $root/proxy/tls/srv.crt $root/proxy/tls/srv.key $accept_count $MP_U accept &"
