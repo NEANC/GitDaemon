@@ -22,9 +22,11 @@ contract_guard_driver() {
     }
     iptables-save() { return 0; }
     iptables() { printf '%s\n' "$*" >> "$SCRATCH/rules"; }
+    # 资源账本边界沿用同一 docker 身份替身，避免触碰真实 daemon。
+    resource_docker() { docker "$@"; }
     su() { sleep 0.1; bash -c 'id() { printf "10001\n"; }; export -f id; eval "$1"' _ "${@: -1}"; }
     setsid() { "$@"; }
-    export -f docker su
+    export -f docker su resource_docker
     local driver_pid=$BASHPID injected=0
     set -T
     # DEBUG 在实际命令执行前同步送 TERM，精确命中调用成功后及后台 PID 登记前。
@@ -95,22 +97,22 @@ contract_case() {
                         (
                             OWN_RULES=('raw|-I PREROUTING -i gcontract -j Econtract')
                             OWN_CHAINS=('raw|Econtract')
-                            # 文件计数跨命令替换保留，区分初次枚举与最终核验。
+                            GUARD_SOURCE=$(cd "$HERE/.." && pwd)
+                            # 任一故障都让目标 kind 的枚举失败或暴露未登记对象，账本必须拒绝清理。
                             docker() {
-                                local target=$1 n=0
+                                local target=$1
                                 [[ $target != ps ]] || target=container
                                 if [[ $1 == ps || ${2:-} == ls ]]; then
-                                    [[ ! -f $E/$target.count ]] || read -r n < "$E/$target.count"
-                                    n=$((n + 1)); printf '%s\n' "$n" > "$E/$target.count"
                                     if [[ $target == "$fault_kind" ]]; then
-                                        [[ $phase != enumerate || $n != 1 ]] || return 9
-                                        [[ $phase != residual-query || $n != 2 ]] || return 9
-                                        if [[ $phase == delete && $n == 1 || $phase == residual && $n == 2 ]]; then printf '%s-owned\n' "$target"; fi
+                                        [[ $phase != enumerate ]] || return 9
+                                        [[ $phase != residual-query ]] || return 9
+                                        printf '%s-owned\n' "$target"
                                     fi
                                 fi
                                 return 0
                             }
-                            # 删除负例即便后续枚举为空，也必须保持本次隔离。
+                            # 资源账本边界沿用同一身份替身，避免触碰真实 daemon。
+                            resource_docker() { docker "$@"; }
                             guard_gm() { return 9; }
                             iptables-save() { return 0; }
                             # 若误撤规则则留下标记，同时保留真正的恢复函数正文。
@@ -126,20 +128,17 @@ contract_case() {
                         bash -n "$E/recover.sh" || return 1
                         grep -Fq 'gcontract' "$E/recover.sh" || return 1
                         grep -Fq 'Econtract' "$E/recover.sh" || return 1
-                        # 人工恢复未确认 runner 停止时不得操作；查询失败不得撤规则。
+                        # 人工恢复未确认 runner 停止时不得操作；确认后查询失败仍不得撤规则。
                         actual=0
                         bash "$E/recover.sh" >/dev/null 2>&1 || actual=$?
                         [[ $actual == 64 ]] || return 1
+                        mkdir -p "$E/bin"
+                        printf '#!/usr/bin/env bash\nexit 9\n' > "$E/bin/docker"
+                        chmod +x "$E/bin/docker"
                         (
-                            # 恢复脚本的外部边界保证失败在资源查询，而非权限检查。
-                            id() { printf '0\n'; }
-                            docker() { return 9; }
-                            iptables() { printf 'removed\n' > "$E/removed"; }
-                            export E
-                            export -f id docker iptables
                             actual=0
-                            bash "$E/recover.sh" --runner-stopped || actual=$?
-                            [[ $actual == 9 && ! -e $E/removed ]]
+                            PATH="$E/bin:$PATH" bash "$E/recover.sh" --runner-stopped >/dev/null 2>&1 || actual=$?
+                            [[ $actual == 2 && ! -e $E/removed ]]
                         ) || return 1
                         printf 'cleanup fault=%s primary=%s cleanup=2 exit=%s PASS\n' "$fault" "$primary" "$expected"
                         rm -rf "$E"

@@ -2,30 +2,42 @@
 # 共享 Docker 启动边界；所有夹具命令使用同一受控网络和安全默认值。
 source "$(dirname -- "${BASH_SOURCE[0]}")/docker-network-fixture.sh"
 
-# 局部删除前保存原件，正常不存在可跳过，真实错误写入跨进程状态。
+# 有账本时登记具名资源（卷/网络）；无登记目录保持既有行为，不登记不存在的对象。
+docker_register_named() {
+    local kind=$1 identity=$2 ledger_dir
+    [[ -n $identity ]] || return 0
+    ledger_dir=$(resource_ledger_dir) || return 0
+    RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+    resource_register "$kind" "$identity" "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-$kind}"
+}
+
+# 局部删除统一走资源账本：按登记身份与所有权标签交叉验证后精确删除，禁止先删再核验。
 integration_remove() {
-    local kind=$1 item ids identity destination rc=0
+    local kind=$1 item identity ledger_dir destination rc=0
     shift
+    ledger_dir=$(resource_ledger_dir) || return 0
     for item in "$@"; do
         [[ $item != -* && -n $item ]] || continue
-        if [[ $kind == container ]]; then
-            ids=$(command docker ps -aq --filter "id=$item") || return $?
-            if [[ -z $ids ]]; then ids=$(command docker ps -aq --filter "name=^/$item$") || return $?; fi
-        else
-            ids=$(command docker volume ls -q --filter "name=^$item$") || return $?
-        fi
-        [[ -n $ids ]] || continue
-        if [[ $kind == container ]]; then
-            identity=$(command docker inspect -f '{{.Id}}' "$item") || return $?
-            destination=$IT_EVIDENCE_DIR/control/deleted/$identity
-            mkdir -p "$destination" || return $?
-            command docker inspect "$item" > "$destination/inspect.json" || return $?
-            command docker logs "$item" > "$destination/container.log" 2>&1 || return $?
-            command docker rm -f "$item" || rc=$?
-        else
-            command docker volume rm "$item" || rc=$?
-        fi
+        case "$kind" in
+            container)
+                identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || continue
+                [[ -n $identity ]] || continue
+                destination=$IT_EVIDENCE_DIR/control/deleted/$identity
+                mkdir -p "$destination" || return $?
+                command docker inspect "$item" > "$destination/inspect.json" || return $?
+                command docker logs "$item" > "$destination/container.log" 2>&1 || return $?
+                ;;
+            network) identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || continue ;;
+            volume) identity=$item ;;
+            *) continue ;;
+        esac
+        [[ -n $identity ]] || continue
+        RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+        resource_remove "$kind" "$identity" || rc=$?
     done
+    if (( rc != 0 )); then
+        printf 'DELETE=%s EXIT=%s\n' "$kind" "$rc" >> "$IT_EVIDENCE_DIR/control/integration-failures.log" || return 2
+    fi
     return "$rc"
 }
 
@@ -82,6 +94,12 @@ integration_helper_run() {
     destination=$IT_EVIDENCE_DIR/control/helpers/$id
     mkdir -p "$destination" || return $?
     command docker inspect "$id" > "$destination/inspect.json" || return $?
+    # 启动前完成登记；登记失败立即停止，绝不启动未登记对象。
+    local ledger_dir
+    if ledger_dir=$(resource_ledger_dir); then
+        RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+        resource_register container "$id" "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-helper}" || return 2
+    fi
     if [[ $detached == 1 ]]; then
         command docker start "$id" >/dev/null || return $?
         integration_helper_policy "$id" || policy=$?
@@ -100,7 +118,14 @@ integration_helper_run() {
         printf 'HELPER=%s POLICY_EXIT=%s\n' "$id" "$policy" >> "$IT_EVIDENCE_DIR/control/integration-failures.log"
         return 2
     fi
-    if [[ $remove == 1 ]]; then docker rm "$id" >/dev/null || return 2; fi
+    if [[ $remove == 1 ]]; then
+        if [[ -n ${ledger_dir:-} ]]; then
+            RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+            resource_remove container "$id" || return 2
+        else
+            docker rm "$id" >/dev/null || return 2
+        fi
+    fi
     if [[ $detached == 1 ]]; then printf '%s\n' "$id"; fi
     return "$rc"
 }
@@ -112,12 +137,22 @@ docker() {
     local -a args=() safe=(--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges)
     if [[ $sub == volume && ${2:-} == create ]]; then
         shift 2
-        command docker volume create --label "gitdaemon.run=$IT_RUN_ID" "$@"
-        return $?
+        local vname=''
+        vname=$(command docker volume create --label "gitdaemon.run=$IT_RUN_ID" "$@") || return $?
+        docker_register_named volume "$vname" || return 2
+        printf '%s\n' "$vname"
+        return 0
     fi
-    if [[ $sub == rm || $sub == volume && ${2:-} == rm ]]; then
+    if [[ $sub == network && ${2:-} == create ]]; then
+        local nid=''
+        nid=$(command docker "$@") || return $?
+        docker_register_named network "$nid" || return 2
+        printf '%s\n' "$nid"
+        return 0
+    fi
+    if [[ $sub == rm || ( ( $sub == volume || $sub == network ) && ${2:-} == rm ) ]]; then
         if [[ $sub == rm ]]; then shift; integration_remove container "$@" || rc=$?
-        else shift 2; integration_remove volume "$@" || rc=$?; fi
+        else shift 2; integration_remove "$sub" "$@" || rc=$?; fi
         if (( rc != 0 )); then
             printf 'DELETE=%s EXIT=%s\n' "$*" "$rc" >> "$IT_EVIDENCE_DIR/control/integration-failures.log" || return 2
         fi
@@ -163,7 +198,29 @@ docker() {
             --label "gitdaemon.run=$IT_RUN_ID" "${safe[@]}" --network "$network" "${args[@]}" -- "$@"
         return $?
     fi
-    if [[ $entry == 1 ]]; then args+=(--entrypoint "$entrypoint"); fi
+    # 有账本时改为 create→登记→start，启动前完成登记；无登记目录时保持既有 run 语义。
+    local ledger_dir
+    if ledger_dir=$(resource_ledger_dir); then
+        local cid rc=0
+        local -a cargs=("${safe[@]}" --network "$network" "${args[@]}" \
+            --label "gitdaemon.run=$IT_RUN_ID" \
+            --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
+            --label "gitdaemon.role=${IT_ROLE:-product}")
+        cid=$(command docker create "${cargs[@]}" "$image" "$@") || return $?
+        RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+        resource_register container "$cid" "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-product}" || return 2
+        if [[ $detached == 1 ]]; then
+            command docker start "$cid" >/dev/null || return $?
+            printf '%s\n' "$cid"
+        else
+            command docker start -a "$cid" || rc=$?
+        fi
+        if [[ $remove == 1 ]]; then
+            RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+            resource_remove container "$cid" || return 2
+        fi
+        return "$rc"
+    fi
     if [[ $detached == 1 ]]; then args+=(-d); fi
     if [[ $remove == 1 ]]; then args+=(--rm); fi
     command docker run --label "gitdaemon.run=$IT_RUN_ID" "${safe[@]}" --network "$network" "${args[@]}" "$image" "$@"

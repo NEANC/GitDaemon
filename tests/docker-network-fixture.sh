@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # 普通用户网络夹具；宿主特权操作全部留在固定外层。
+FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# 资源账本库与夹具同目录；登记与精确删除统一走该库。
+[[ ! -f $FIXTURE_DIR/docker-resource-ledger.sh ]] || source "$FIXTURE_DIR/docker-resource-ledger.sh"
 SAFE=(--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges)
 NETSAFE=(--sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv4.ip_unprivileged_port_start=0)
 CONTROL_SEQ=0
@@ -27,9 +30,40 @@ network_control() {
     done
     return 75
 }
-# 以统一安全参数启动具名容器，不创建匿名卷。
+# 以统一安全参数创建容器；有账本时改为 create→登记→start，短命容器显式 remove。
+# 无登记目录时保持既有 run 语义（旧契约模式），不引入不可登记的自动删除。
 network_run() {
-    IT_NETWORK_LIBRARY_RUN=1 docker run --label "gitdaemon.run=$IT_RUN_ID" "${SAFE[@]}" "$@"
+    local ledger_dir='' detached=0 remove=0 id rc=0
+    if ! ledger_dir=$(resource_ledger_dir); then
+        IT_NETWORK_LIBRARY_RUN=1 docker run --label "gitdaemon.run=$IT_RUN_ID" "${SAFE[@]}" "$@"
+        return $?
+    fi
+    local -a cargs=("${SAFE[@]}" \
+        --label "gitdaemon.run=$IT_RUN_ID" \
+        --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
+        --label "gitdaemon.role=${IT_ROLE:-fixture}")
+    while (( $# )); do
+        case "$1" in
+            -d|--detach) detached=1 ;;
+            --rm) remove=1 ;;
+            *) cargs+=("$1") ;;
+        esac
+        shift
+    done
+    id=$(IT_NETWORK_LIBRARY_RUN=1 docker create "${cargs[@]}") || return $?
+    RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+    resource_register container "$id" "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-fixture}" || return 2
+    if (( detached == 1 )); then
+        IT_NETWORK_LIBRARY_RUN=1 docker start "$id" >/dev/null || return $?
+        printf '%s\n' "$id"
+    else
+        IT_NETWORK_LIBRARY_RUN=1 docker start -a "$id" || rc=$?
+    fi
+    if (( remove == 1 )); then
+        RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+        resource_remove container "$id" || return 2
+    fi
+    return "$rc"
 }
 # 把实际信任路径与对应的独立只读卷关联，拒绝数据卷或路径逃逸。
 assert_container_trust_configuration() {
@@ -98,9 +132,14 @@ network_fixture_start() {
     done
     network_calibrate_dns || return $?
 }
-# 停止仅属于本轮的资源；异常外层还会以清单兜底。
+# 停止仅属于本轮的资源；有登记账本时走双向交叉验证的精确清理，异常外层仍以清单兜底。
 network_fixture_stop() {
-    local id ids status=0
+    local id ids status=0 ledger_dir
+    if ledger_dir=$(resource_ledger_dir); then
+        RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
+        resource_cleanup "$ledger_dir" || status=$?
+        return "$status"
+    fi
     ids=$(docker ps -aq --filter "label=gitdaemon.run=$IT_RUN_ID") || return $?
     for id in $ids; do docker stop -t 1 "$id" || status=1; done
     return "$status"

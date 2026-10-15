@@ -2,8 +2,9 @@
 # 授权宿主专属规则外层；不接受任意业务命令。
 set -Eeuo pipefail
 GUARD_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# 环境授权库与 guard 同目录；新路径缺参或缺库时由入口拒绝，不创建任何资源。
+# 环境授权库与资源账本库与 guard 同目录；缺库时由入口拒绝，不创建任何资源。
 [[ ! -f $GUARD_DIR/docker-validation-environment.sh ]] || source "$GUARD_DIR/docker-validation-environment.sh"
+[[ ! -f $GUARD_DIR/docker-resource-ledger.sh ]] || source "$GUARD_DIR/docker-resource-ledger.sh"
 OWN_RULES=() OWN_CHAINS=()
 PENDING_SIGNAL=0
 GUARD_BOUND=0
@@ -54,14 +55,20 @@ guard_gm() {
     printf 'SU_EXIT=%s\n' "$rc" >> "$E/su-status.log"
     return "$rc"
 }
-# 为本次失败生成独立恢复脚本；先成功清空标签资源，再撤销当前精确规则。
+# 为本次失败生成独立恢复脚本；冻结账本及库哈希，只按登记账本精确恢复。
+# 恢复脚本复用同一资源库，先复核同一 VM/runner/socket/daemon 并要求 runner 已停止。
 guard_write_recovery() {
+    local ledger_dir=$E/control/resources lib_hash='' ledger_hash=''
+    lib_hash=$(sha256sum "$GUARD_DIR/docker-resource-ledger.sh" 2>/dev/null | cut -d' ' -f1)
+    [[ ! -f $ledger_dir/ledger.tsv ]] || ledger_hash=$(sha256sum "$ledger_dir/ledger.tsv" | cut -d' ' -f1)
     {
         printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
         printf 'RUN=%q\nRUNNER=%q\n' "$RUN" "$RUNNER"
         printf 'SOURCE=%q\nMANIFEST=%q\nATTESTATION=%q\n' "$GUARD_SOURCE" "$GUARD_MANIFEST" "$GUARD_ATTESTATION"
+        printf 'LEDGER_DIR=%q\nLIB_HASH=%q\nLEDGER_HASH=%q\n' "$ledger_dir" "$lib_hash" "$ledger_hash"
         declare -p OWN_RULES OWN_CHAINS
         declare -f guard_remove_rules
+        resource_recovery_embed
         cat <<'RECOVERY'
 # 管理员须先确认本轮 runner 已停止，再显式授权恢复。
 [[ ${1:-} == --runner-stopped ]] || exit 64
@@ -72,29 +79,21 @@ if [[ -n $MANIFEST ]]; then
     source "$SOURCE/tests/docker-validation-environment.sh" || exit 77
     validation_environment_verify "$MANIFEST" "$ATTESTATION" || exit 77
 fi
-# 通过普通宿主用户删除每个重新枚举到的精确对象。
-recover_remove() {
-    local command
-    printf -v command '%q ' docker "$@"
-    su -s /bin/bash "$RUNNER" -c "$command"
-}
-ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN")
-for item in $ids; do recover_remove rm -f "$item"; done
-for kind in network volume; do
-    ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN")
-    for item in $ids; do recover_remove "$kind" rm "$item"; done
-done
-ids=$(docker ps -aq --filter "label=gitdaemon.run=$RUN")
-[[ -z $ids ]]
-for kind in network volume; do
-    ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN")
-    [[ -z $ids ]]
-done
+# 冻结库哈希：只加载经核验的同一库，不复制旧 label-only 删除逻辑。
+[[ -n $SOURCE && -f $SOURCE/tests/docker-resource-ledger.sh && -n $LIB_HASH ]] || exit 77
+[[ $(sha256sum "$SOURCE/tests/docker-resource-ledger.sh" | cut -d' ' -f1) == "$LIB_HASH" ]] || exit 77
+# 冻结账本：内容与生成时刻一致才允许继续。
+if [[ -n $LEDGER_HASH ]]; then
+    [[ -f $LEDGER_DIR/ledger.tsv ]] || exit 77
+    [[ $(sha256sum "$LEDGER_DIR/ledger.tsv" | cut -d' ' -f1) == "$LEDGER_HASH" ]] || exit 77
+fi
+RESOURCE_LEDGER_DIR=$LEDGER_DIR RESOURCE_RUN=$RUN
+resource_cleanup "$LEDGER_DIR" || exit 2
 guard_remove_rules
 RECOVERY
     } > "$E/recover.sh"
 }
-# 清理前先保存输入关联的容器状态、日志与规则计数。
+# 清理前先保存输入关联的容器状态、日志与规则计数；删除统一走资源账本交叉验证。
 guard_cleanup() {
     local primary=$? clean=0 item ids kind residual isolated=1 bound=1
     trap '' TERM INT
@@ -122,14 +121,13 @@ guard_cleanup() {
         for item in $ids; do
             docker inspect "$item" > "$E/inspect-$item.json" || clean=2
             docker logs "$item" > "$E/container-$item.log" 2>&1 || clean=2
-            guard_gm docker rm -f "$item" || { clean=2; isolated=0; }
         done
-        for kind in network volume; do
-            ids=$(docker "$kind" ls -q --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
-            for item in $ids; do
-                guard_gm docker "$kind" rm "$item" || { clean=2; isolated=0; }
-            done
-        done
+        # 精确删除：交叉验证通过与登记身份/标签、卷身份摘要一致才删除；差异即停止。
+        RESOURCE_LEDGER_DIR=$E/control/resources RESOURCE_RUN=$RUN
+        if ! resource_cleanup "$E/control/resources"; then
+            clean=2
+            isolated=0
+        fi
         residual=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
         printf '%s\n' "$residual" > "$E/residual-containers.txt"
         [[ -z $residual ]] || { clean=2; isolated=0; }
@@ -146,7 +144,7 @@ guard_cleanup() {
     if (( isolated )); then
         guard_remove_rules || clean=2
     else
-        printf 'ISOLATION_RETAINED=1\nRUN=%s\nRecovery: confirm runner stopped, then run bash recover.sh --runner-stopped as the authorized host administrator. The script re-queries only label gitdaemon.run=%s and requires empty resources before reversing the embedded active rule/chain manifest. Never flush global tables.\n' "$RUN" "$RUN" >> "$E/recovery.txt"
+        printf 'ISOLATION_RETAINED=1\nRUN=%s\nRecovery: confirm runner stopped, then run bash recover.sh --runner-stopped as the authorized host administrator. The script loads the frozen ledger and library, re-verifies the same VM/runner/socket/daemon, cross-checks registered identities against ownership labels and requires empty resources before reversing the embedded active rule/chain manifest. Never flush global tables.\n' "$RUN" >> "$E/recovery.txt"
         guard_write_recovery || clean=2
     fi
     iptables-save -c > "$E/rules-after-cleanup.txt" || clean=2
@@ -237,9 +235,11 @@ guard_main() {
     # full 的延期请求属纯输入校验，先于 root 检查，避免延期语义与 root 耦合。
     if [[ $mode == full && ${IT_DEFER_MAPPING:-} == 1 ]]; then return 2; fi
     [[ $(id -u) == 0 ]] || return 77
+    # 恢复脚本需要用同一源码目录核验资源库；所有模式统一登记。
+    GUARD_SOURCE=$source
     case "$mode" in
         full)
-            GUARD_SOURCE=$source GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
+            GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
             validation_environment_verify "$manifest" "$attestation" || return $?
             GUARD_BOUND=1
             ;;
