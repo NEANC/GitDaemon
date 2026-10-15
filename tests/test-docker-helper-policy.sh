@@ -19,7 +19,7 @@ command() {
             case "$*" in
                 *'.NetworkMode'*) printf 'gm-helper-net\n' ;;
                 *'.Config.User'*) printf '10001:10001 true false [ALL] [no-new-privileges]\n' ;;
-                *'.Config.Labels'*) printf 'helper\n' ;;
+                *'.Config.Labels'*) printf 'helper\thelper\thelper\n' ;;
                 *'.Id'*) printf 'helper-id\n' ;;
                 *'.NetworkSettings.Networks'*) printf 'gm-helper-net \n' ;;
                 *'.HostConfig.Dns'*) printf '[172.30.243.53]\n' ;;

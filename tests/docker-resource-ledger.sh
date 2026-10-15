@@ -23,6 +23,11 @@ resource_ledger_dir() {
     return 1
 }
 
+# 账本目录不可解析时的固定可观测标记：保留兼容回退，但绝不静默丢弃登记能力。
+resource_ledger_notice() {
+    printf 'RESOURCE_LEDGER_UNAVAILABLE caller=%s\n' "${1:-unknown}" >&2
+}
+
 # 本轮运行标识：登记记录与 label 枚举共用同一值。
 resource_run() {
     printf '%s\n' "${RESOURCE_RUN:-${IT_RUN_ID:-}}"
@@ -165,7 +170,7 @@ resource_ledger_load() {
     return 0
 }
 
-# 逐对象实时核验身份与全部所有权 label，卷另核身份摘要；任何不符返回 2。
+# 逐对象实时核验身份与全部所有权 label，卷另核身份摘要；标签缺失或漂移均返回 2。
 resource_verify_object() {
     local kind=$1 identity=$2 scenario=$3 role=$4 digest=$5
     local current labels run scenario_now role_now
@@ -173,8 +178,8 @@ resource_verify_object() {
     [[ $current == "$identity" ]] || return 2
     labels=$(resource_inspect_labels "$kind" "$identity") || return 2
     IFS=$'\t' read -r run scenario_now role_now <<< "$labels"
-    [[ -z $scenario_now || $scenario_now == "$scenario" ]] || return 2
-    [[ -z $role_now || $role_now == "$role" ]] || return 2
+    [[ $scenario_now == "$scenario" ]] || return 2
+    [[ $role_now == "$role" ]] || return 2
     if [[ $kind == volume ]]; then
         current=$(resource_volume_digest "$identity") || return 2
         [[ $current == "$digest" ]] || return 2
@@ -191,9 +196,11 @@ resource_register_body() {
     [[ -n $run ]] || return 2
     if ! labels=$(resource_inspect_labels "$kind" "$identity"); then return 2; fi
     IFS=$'\t' read -r run_label obj_scenario obj_role <<< "$labels"
+    # 三 label 必须齐备：运行标识一致，场景与角色非空且与入参一致，缺失一律拒绝登记。
     [[ $run_label == "$run" ]] || return 2
-    [[ -z $obj_scenario || $obj_scenario == "$scenario" ]] || return 2
-    [[ -z $obj_role || $obj_role == "$role" ]] || return 2
+    [[ -n $scenario && -n $role ]] || return 2
+    [[ $obj_scenario == "$scenario" ]] || return 2
+    [[ $obj_role == "$role" ]] || return 2
     if ! hash=$(resource_inspect_hash "$identity"); then return 2; fi
     if [[ $kind == volume ]]; then
         if ! digest=$(resource_volume_digest "$identity"); then return 2; fi
@@ -225,6 +232,34 @@ resource_register() {
     trap 'sig=143' TERM
     trap 'sig=130' INT
     resource_register_body "$kind" "$identity" "$scenario" "$role" || rc=$?
+    if [[ -n $prev_term ]]; then eval "$prev_term"; else trap - TERM; fi
+    if [[ -n $prev_int ]]; then eval "$prev_int"; else trap - INT; fi
+    (( rc == 0 )) || return "$rc"
+    if (( sig != 0 )); then exit "$sig"; fi
+    return 0
+}
+
+# 创建并登记：创建前布防 TERM/INT，登记落盘后恢复 trap 并按信号退出，
+# 覆盖「创建返回」到「登记落盘」之间的窗口。调用形如 <kind> <scenario> <role> -- <创建命令...>，
+# 创建命令须输出对象身份并写入 RESOURCE_CREATED_ID；创建失败原样返回，登记失败返回 2。
+resource_create_register() {
+    local kind=$1 scenario=$2 role=$3
+    shift 3
+    [[ ${1:-} != -- ]] || shift
+    local rc=0 sig=0 prev_term prev_int
+    RESOURCE_CREATED_ID=''
+    prev_term=$(trap -p TERM)
+    prev_int=$(trap -p INT)
+    trap 'sig=143' TERM
+    trap 'sig=130' INT
+    RESOURCE_CREATED_ID=$("$@") || rc=$?
+    if (( rc == 0 )); then
+        if [[ -n $RESOURCE_CREATED_ID ]]; then
+            resource_register_body "$kind" "$RESOURCE_CREATED_ID" "$scenario" "$role" || rc=$?
+        else
+            rc=2
+        fi
+    fi
     if [[ -n $prev_term ]]; then eval "$prev_term"; else trap - TERM; fi
     if [[ -n $prev_int ]]; then eval "$prev_int"; else trap - INT; fi
     (( rc == 0 )) || return "$rc"

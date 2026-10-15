@@ -215,29 +215,56 @@ case_registered_delete_is_idempotent() {
     rm -rf "$S"
 }
 
-# 跨创建与登记的 TERM 必须在安全点处理：登记仍落盘，随后按信号退出。
+# 创建返回与登记之间的窗口必须由信号延后覆盖：TERM 与 INT 都须在登记落盘后按信号退出。
 case_signal_between_create_and_register() {
-    ledger_setup
-    install_docker_double
-    declare_object container c1 r1 fixture product
-    # 标签查询阻塞，确定性地在创建与登记之间收到 TERM；登记落盘后才退出。
-    M_BLOCK[c1]=$S/label-block
-    : > "$S/label-block"
-    ( resource_register container c1 fixture product ) > "$S/out" 2>&1 &
-    local pid=$! rc=0 i
-    for ((i=0;i<100;i++)); do [[ -f $S/label-entered ]] && break; sleep 0.05; done
-    kill -TERM "$pid" 2>/dev/null
-    sleep 0.3
-    rm -f "$S/label-block"
-    wait "$pid" || rc=$?
-    printf 'register_exit=%s\n' "$rc"
-    [[ $rc == 143 ]] || return 1
-    grep -q $'^1\tregister\tcontainer\tc1\t' "$RESOURCE_LEDGER_DIR/ledger.tsv" || { printf 'register record missing\n'; return 1; }
-    local clean=0
-    resource_cleanup "$RESOURCE_LEDGER_DIR" 2>/dev/null || clean=$?
-    printf 'cleanup_after_signal=%s\n' "$clean"
-    [[ $clean == 0 && $(wc -l < "$DELETE_CALLS") == 1 ]] || return 1
-    rm -rf "$S"
+    local sig expected rc=0 pid i
+    set -m
+    for sig in TERM INT; do
+        ledger_setup
+        local scratch=$S
+        mkdir -p "$scratch/control"
+        IT_RUN_ID=r1 IT_NETWORK=gm-r1-net IT_DNS_IP=172.30.243.53 IT_NETWORK_GUARD_READY=1
+        IT_TOOLS_IMAGE=tools IT_PRODUCT_IMAGE=product
+        : > "$scratch/create-block"
+        # create 替身：对象已创建、身份返回前阻塞；信号在创建与登记之间到达，由资源库延后到登记落盘后。
+        command() {
+            [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+            shift
+            local call=$*
+            printf '%s\n' "$call" >> "$scratch/docker.calls"
+            case "$1" in
+                create)
+                    : > "$scratch/create-entered"
+                    while [[ -f $scratch/create-block ]]; do sleep 0.05; done
+                    printf 'cid1\n'
+                    ;;
+                inspect)
+                    case "$call" in
+                        *gitdaemon.run*) printf 'r1\tr1\tproduct\n' ;;
+                        *'{{.Id}}'*) printf 'cid1\n' ;;
+                        *) printf '{}\n' ;;
+                    esac
+                    ;;
+                start) : ;;
+            esac
+            return 0
+        }
+        ( docker run --network none product true ) > "$scratch/out" 2>&1 &
+        pid=$!
+        for ((i=0;i<100;i++)); do [[ -f $scratch/create-entered ]] && break; sleep 0.05; done
+        kill -"$sig" "$pid" 2>/dev/null
+        sleep 0.3
+        rm -f "$scratch/create-block"
+        rc=0
+        wait "$pid" || rc=$?
+        if [[ $sig == TERM ]]; then expected=143; else expected=130; fi
+        printf 'signal=%s exit=%s\n' "$sig" "$rc"
+        [[ $rc == "$expected" ]] || { printf 'signal %s exit mismatch\n' "$sig"; return 1; }
+        grep -q $'^1\tregister\tcontainer\tcid1\tr1\tr1\tproduct\t' "$RESOURCE_LEDGER_DIR/ledger.tsv" \
+            || { printf 'register record missing after %s\n' "$sig"; return 1; }
+        rm -rf "$S"
+    done
+    return 0
 }
 
 # 清理前必须重新核验同一 VM/runner/socket/daemon；漂移时保留隔离、零删除、零撤规则。
@@ -395,6 +422,111 @@ case_register_failure_blocks_start() {
     rm -rf "$S"
 }
 
+# 三 label 缺失即拒绝登记：对象缺少 scenario/role 时登记返回 2 且不写账本。
+case_register_requires_three_labels() {
+    ledger_setup
+    install_docker_double
+    declare_object container c1 r1 fixture product
+    local rc=0
+    M_SCEN[c1]=''
+    resource_register container c1 fixture product 2>/dev/null || rc=$?
+    printf 'empty_scenario_register=%s\n' "$rc"
+    [[ $rc == 2 ]] || return 1
+    rc=0
+    M_SCEN[c1]=fixture M_ROLE[c1]=''
+    resource_register container c1 fixture product 2>/dev/null || rc=$?
+    printf 'empty_role_register=%s\n' "$rc"
+    [[ $rc == 2 ]] || return 1
+    [[ ! -s $RESOURCE_LEDGER_DIR/ledger.tsv ]] || { printf 'unexpected ledger record\n'; return 1; }
+    rm -rf "$S"
+}
+
+# 辅助容器创建必须携带三 label，登记后标签漂移同样被差异检测拒绝且零删除。
+case_helper_registers_three_labels() {
+    ledger_setup
+    local scratch=$S rc=0 clean=0
+    mkdir -p "$scratch/control"
+    IT_EVIDENCE_DIR=$scratch IT_RUN_ID=helper IT_NETWORK=gm-helper-net IT_DNS_IP=172.30.243.53 IT_NETWORK_GUARD_READY=1
+    IT_TOOLS_IMAGE=tools IT_PRODUCT_IMAGE=product
+    command() {
+        [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+        shift
+        printf '%s\n' "$*" >> "$scratch/docker.calls"
+        case "$1" in
+            create) printf 'helper-id\n' ;;
+            inspect)
+                case "$*" in
+                    *gitdaemon.run*) printf 'helper\thelper\thelper\n' ;;
+                    *'{{.Id}}'*) printf 'helper-id\n' ;;
+                    *'.NetworkMode'*) printf 'gm-helper-net\n' ;;
+                    *'.Config.User'*) printf '10001:10001 true false [ALL] [no-new-privileges]\n' ;;
+                    *'.NetworkSettings.Networks'*) printf 'gm-helper-net \n' ;;
+                    *'.HostConfig.Dns'*) printf '[172.30.243.53]\n' ;;
+                    *'.Sysctls'*) printf '1\n' ;;
+                    *'.ExtraHosts'*) printf '[] []\n' ;;
+                    *'.Mounts'*) printf 'volume gm-helper-ca\n' ;;
+                    *) printf '{}\n' ;;
+                esac ;;
+            network) printf 'false\n' ;;
+            logs) printf 'HELPER_UID=10001:10001\n' ;;
+            start) return 0 ;;
+        esac
+        return 0
+    }
+    integration_helper_run 0 0 git image -- ls-remote https://example.invalid/x || rc=$?
+    printf 'helper_run_exit=%s\n' "$rc"
+    [[ $rc == 0 ]] || return 1
+    grep -q -- '--label gitdaemon.scenario=helper' "$scratch/docker.calls" \
+        || { printf 'helper create missing scenario label\n'; return 1; }
+    grep -q -- '--label gitdaemon.role=helper' "$scratch/docker.calls" \
+        || { printf 'helper create missing role label\n'; return 1; }
+    grep -q $'register\tcontainer\thelper-id\thelper\thelper\thelper\t' "$RESOURCE_LEDGER_DIR/ledger.tsv" \
+        || { printf 'ledger missing helper three labels\n'; return 1; }
+    # 切换为账本替身并让标签漂移：差异检测对辅助容器同样拒绝且零删除。
+    install_docker_double
+    RESOURCE_RUN=helper
+    declare_object container helper-id helper other helper
+    resource_cleanup "$RESOURCE_LEDGER_DIR" 2>/dev/null || clean=$?
+    printf 'helper_cleanup_after_drift=%s\n' "$clean"
+    [[ $clean == 2 ]] || return 1
+    assert_no_delete_no_rule || return 1
+    rm -rf "$S"
+}
+
+# 账本不可解析时必须留下固定可观测标记，绝不静默回退到旧语义。
+case_ledger_gate_is_observable() {
+    ledger_setup
+    unset RESOURCE_LEDGER_DIR IT_EVIDENCE_DIR
+    local scratch=$S rc=0
+    mkdir -p "$scratch/control"
+    IT_RUN_ID=gate IT_NETWORK=gm-gate-net IT_DNS_IP=172.30.243.53 IT_NETWORK_GUARD_READY=1
+    IT_TOOLS_IMAGE=tools IT_PRODUCT_IMAGE=product
+    command() {
+        [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+        shift
+        printf '%s\n' "$*" >> "$scratch/docker.calls"
+        return 0
+    }
+    docker run --network none product true 2>"$scratch/err-run" || rc=$?
+    grep -qx 'RESOURCE_LEDGER_UNAVAILABLE caller=run' "$scratch/err-run" \
+        || { printf 'run gate not observable\n'; return 1; }
+    rc=0
+    docker volume create gm-gate-data 2>"$scratch/err-volume" || rc=$?
+    grep -qx 'RESOURCE_LEDGER_UNAVAILABLE caller=volume-create' "$scratch/err-volume" \
+        || { printf 'volume gate not observable\n'; return 1; }
+    rc=0
+    network_run --network none product true 2>"$scratch/err-network" || rc=$?
+    grep -qx 'RESOURCE_LEDGER_UNAVAILABLE caller=network_run' "$scratch/err-network" \
+        || { printf 'network_run gate not observable\n'; return 1; }
+    rc=0
+    docker rm -f owned 2>"$scratch/err-remove" || rc=$?
+    grep -qx 'RESOURCE_LEDGER_UNAVAILABLE caller=integration-remove' "$scratch/err-remove" \
+        || { printf 'remove gate not observable\n'; return 1; }
+    printf 'remove_without_ledger_exit=%s\n' "$rc"
+    [[ $rc == 2 ]] || return 1
+    rm -rf "$S"
+}
+
 failed=0
 for name in \
     unregistered_same_label_is_not_deleted \
@@ -408,7 +540,10 @@ for name in \
     difference_sample_keeps_primary_and_isolation \
     cleanup_fault_matrix \
     sigkill_recovery_requires_stopped_and_refuses_stray \
-    register_failure_blocks_start; do
+    register_failure_blocks_start \
+    register_requires_three_labels \
+    helper_registers_three_labels \
+    ledger_gate_is_observable; do
     rc=0
     ( "case_$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

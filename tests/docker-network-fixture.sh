@@ -31,10 +31,11 @@ network_control() {
     return 75
 }
 # 以统一安全参数创建容器；有账本时改为 create→登记→start，短命容器显式 remove。
-# 无登记目录时保持既有 run 语义（旧契约模式），不引入不可登记的自动删除。
+# 无登记目录时保持既有 run 语义（旧契约模式），但必须留下可观测标记，绝不静默回退。
 network_run() {
     local ledger_dir='' detached=0 remove=0 id rc=0
     if ! ledger_dir=$(resource_ledger_dir); then
+        resource_ledger_notice network_run
         IT_NETWORK_LIBRARY_RUN=1 docker run --label "gitdaemon.run=$IT_RUN_ID" "${SAFE[@]}" "$@"
         return $?
     fi
@@ -50,9 +51,10 @@ network_run() {
         esac
         shift
     done
-    id=$(IT_NETWORK_LIBRARY_RUN=1 docker create "${cargs[@]}") || return $?
     RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
-    resource_register container "$id" "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-fixture}" || return 2
+    resource_create_register container "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-fixture}" -- \
+        command docker create "${cargs[@]}" || return 2
+    id=$RESOURCE_CREATED_ID
     if (( detached == 1 )); then
         IT_NETWORK_LIBRARY_RUN=1 docker start "$id" >/dev/null || return $?
         printf '%s\n' "$id"
