@@ -5,6 +5,8 @@ HERE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$HERE/docker-network-guard.sh"
 source "$HERE/docker-network-fixture.sh"
 source "$HERE/docker-integration-startup.sh"
+# 负例注入（真实替换客户端 CA / 服务端叶证书）由断言库提供，本文件的行为断言直接执行该真实代码。
+source "$HERE/docker-mapping-assertions.sh"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -444,6 +446,10 @@ mapping_network_create_registers() {
     grep -q -- '--label gitdaemon.run=mtest' "$scratch/create.calls" || { printf 'missing run label\n'; failed=1; }
     grep -q -- '--label gitdaemon.scenario=mapping' "$scratch/create.calls" || { printf 'missing scenario label\n'; failed=1; }
     grep -q -- '--label gitdaemon.role=network' "$scratch/create.calls" || { printf 'missing role label\n'; failed=1; }
+    # 独立 internal bridge：缺 --internal 时隔离完全依赖 guard 规则，属规格要求的固定形态。
+    grep -q -- '--internal' "$scratch/create.calls" || { printf 'mapping network is not internal\n'; failed=1; }
+    grep -q -- '--ipv6=false' "$scratch/create.calls" || { printf 'mapping network enables IPv6\n'; failed=1; }
+    grep -q -- 'gm-mtest-m-net$' "$scratch/create.calls" || { printf 'network name is not the last argument\n'; failed=1; }
     grep -q $'register\tnetwork\tnetid-new\tmtest\tmapping\tnetwork\t' "$dir/ledger.tsv" || { printf 'ledger record missing\n'; failed=1; }
     grep -qx $'network_id\tnetid-new' "$dir/mapping-network.tsv" || { printf 'state id missing\n'; failed=1; }
     # 创建返回空身份：network ID 核验失败即拒绝，且不写账本。
@@ -734,6 +740,44 @@ tls_make_leaf() {
     return 0
 }
 
+# 负例注入的本地执行边界：容器挂载点映射到替身目录，脚本正文（openssl 生成与写入）原样执行，
+# 使「注入确实替换了文件」可被本地行为断言观测，而不依赖替身直接改写同步退出码。
+tls_negative_injection_docker() {
+    local -a args=("$@")
+    local i entrypoint='' script='' caname='' which='' host='' use_ca=''
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        case "${args[i]}" in
+            --entrypoint) entrypoint=${args[i + 1]} ;;
+            -e)
+                case "${args[i + 1]}" in
+                    MAPPING_NEG_CANAME=*) caname=${args[i + 1]#*=} ;;
+                    MAPPING_NEG_WHICH=*) which=${args[i + 1]#*=} ;;
+                    MAPPING_NEG_HOST=*) host=${args[i + 1]#*=} ;;
+                esac
+                ;;
+            -v)
+                case "${args[i + 1]}" in
+                    *":$MAPPING_CA_MOUNT") use_ca=1 ;;
+                esac
+                ;;
+        esac
+    done
+    [[ $entrypoint == /bin/sh ]] || return 1
+    script=$(command cat) || return 1
+    printf '%s\n' "$script" >> "$TLS_DIR/neg.scripts"
+    if [[ $use_ca == 1 ]]; then
+        # 只把容器内 /ca 挂载点换成替身 CA 目录，注入脚本其余内容原样执行。
+        local mapped=${script//\/ca\//$TLS_DIR/ca/}
+        MAPPING_NEG_CANAME=$caname sh -c "$mapped" 2> "$TLS_DIR/inject.err" \
+            || { printf 'CA injection script failed: %s\n' "$(tr '\n' '|' < "$TLS_DIR/inject.err")"; return 1; }
+        return 0
+    fi
+    MAPPING_ASSET_ROOT=$TLS_ASSETS MAPPING_NEG_WHICH=$which MAPPING_NEG_HOST=${host:-other-host.invalid} \
+        sh -c "$script" 2> "$TLS_DIR/inject.err" \
+        || { printf 'SAN injection script failed: %s\n' "$(tr '\n' '|' < "$TLS_DIR/inject.err")"; return 1; }
+    return 0
+}
+
 # 四类 TLS 负例的接线与判据：分层判定必须可区分，且失败层不得被校准认作成功。
 tls_negative_case() {
     local expect_verdict=$1 grow=$2 probe_fail=$3
@@ -768,6 +812,84 @@ tls_negative_case() {
     mapping_proxy_calibrate "$scenario_dir" || rc=$?
     printf 'CALIBRATE_EXIT=%s\n' "$rc"
     [[ $rc == 80 ]] || { printf 'failed TLS layer still calibrated: %s\n' "$rc"; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 上游连接取证必须落在独立可写卷：资产卷对上游只读，requests.log/serve.log 若仍写在资产卷
+# 则在只读文件系统上重定向失败、证据永不生成。断言挂载、登记与计数读取路径三处一致。
+upstream_evidence_volume_writable() {
+    local failed=0 line script rc=0
+    tls_setup || { printf 'tls setup failed\n'; return 1; }
+    line=$(grep -m1 -- '--name gm-mtest-upstream' "$TLS_DIR/docker.calls") || { printf 'upstream run missing\n'; return 1; }
+    printf 'UPSTREAM_EVIDENCE_RUN=%s\n' "$line"
+    case "$line" in
+        *"-v gm-mtest-mapping-assets:$MAPPING_ASSET_ROOT:ro"*) ;;
+        *) printf 'upstream asset volume is not read-only\n'; failed=1 ;;
+    esac
+    case "$line" in
+        *"-v gm-mtest-mapping-evidence:$MAPPING_EVIDENCE_MOUNT "*) ;;
+        *) printf 'upstream lacks the writable evidence volume\n'; failed=1 ;;
+    esac
+    case "$line" in
+        *"$MAPPING_EVIDENCE_MOUNT:ro"*) printf 'evidence volume mounted read-only\n'; failed=1 ;;
+    esac
+    [[ $MAPPING_UPSTREAM_REQUESTS == "$MAPPING_EVIDENCE_MOUNT/requests.log" ]] \
+        || { printf 'evidence count path is not on the rw volume: %s\n' "$MAPPING_UPSTREAM_REQUESTS"; failed=1; }
+    grep -q $'register\tvolume\tgm-mtest-mapping-evidence\tmtest\tmapping\tevidence\t' "$TLS_DIR/ledger/ledger.tsv" \
+        || { printf 'evidence volume not registered\n'; failed=1; }
+    # 生成的服务脚本必须只向证据卷写入；只读资产卷上的写重定向会失败并让循环空转。
+    script=$(mapping_upstream_serve_script) || { printf 'serve script generation failed\n'; return 1; }
+    [[ $script == *'E=${MAPPING_EVIDENCE_ROOT:?}'* ]] || { printf 'serve script ignores the evidence root\n'; failed=1; }
+    [[ $script != *'$R/upstream/requests.log'* && $script != *'$R/upstream/serve.log'* ]] \
+        || { printf 'serve script writes into the read-only asset volume\n'; failed=1; }
+    # 计数读取的是 rw 路径，且文件缺失时返回非零而不是默认 0。
+    mapping_upstream_evidence_count "$TLS_SCENARIO_ID" || rc=$?
+    printf 'UPSTREAM_EVIDENCE_EXIT=%s\n' "$rc"
+    [[ $rc != 0 ]] || { printf 'missing evidence file was accepted as a count\n'; failed=1; }
+    grep -q "wc -l < '$MAPPING_EVIDENCE_MOUNT/requests.log'" "$TLS_DIR/docker.calls" \
+        || { printf 'evidence count does not read the rw path\n'; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 负例注入必须真实替换文件：客户端 CA 被换成不受信根、服务端叶证书被换成错 SAN 叶证书，
+# 且真实校验链在相应 TLS 层失败（不能只靠替身把同步置为失败冒充拒绝）。
+negative_injection_replaces_files() {
+    local failed=0 before_fp after_fp srv_before srv_after
+    tls_setup || { printf 'tls setup failed\n'; return 1; }
+    # 负例注入按产品镜像执行脚本；夹具契约里显式给出与 tls_setup 一致的产品镜像。
+    MAPPING_PRODUCT_IMAGE=product
+    mapping_fixture_docker() { tls_negative_injection_docker "$@"; }
+    before_fp=$(mapping_cert_fingerprint "$TLS_DIR/ca/upstream-ca.crt") || failed=1
+    mapping_negative_wrong_ca upstream-ca.crt || { printf 'wrong CA injection failed\n'; return 1; }
+    after_fp=$(mapping_cert_fingerprint "$TLS_DIR/ca/upstream-ca.crt") || failed=1
+    printf 'NEG_CA_FP before=%s after=%s\n' "$before_fp" "$after_fp"
+    [[ -n $after_fp && $after_fp != "$before_fp" ]] || { printf 'client CA was not replaced\n'; failed=1; }
+    openssl x509 -in "$TLS_DIR/ca/upstream-ca.crt" -noout -subject 2>/dev/null | grep -q 'GM-Mapping-Untrusted-CA' \
+        || { printf 'replaced client CA is not the untrusted root\n'; failed=1; }
+    # 真实校验链：原上游叶证书在替换后的根下必须验证失败。
+    if mapping_cert_verifies_with "$TLS_ASSETS/upstream/tls/srv.crt" "$TLS_DIR/ca/upstream-ca.crt"; then
+        printf 'untrusted CA still verified the upstream leaf\n'
+        failed=1
+    fi
+    printf 'NEG_CA_CHAIN_REJECTED=1\n'
+    srv_before=$(mapping_cert_fingerprint "$TLS_ASSETS/upstream/tls/srv.crt") || failed=1
+    MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san upstream \
+        || { printf 'wrong SAN injection failed\n'; return 1; }
+    srv_after=$(mapping_cert_fingerprint "$TLS_ASSETS/upstream/tls/srv.crt") || failed=1
+    printf 'NEG_SAN_FP before=%s after=%s\n' "$srv_before" "$srv_after"
+    [[ -n $srv_after && $srv_after != "$srv_before" ]] || { printf 'server leaf was not replaced\n'; failed=1; }
+    if mapping_cert_san_has "$TLS_ASSETS/upstream/tls/srv.crt" "$MAPPING_UPSTREAM_HOST"; then
+        printf 'replaced leaf still carries the expected SAN\n'
+        failed=1
+    fi
+    mapping_cert_san_has "$TLS_ASSETS/upstream/tls/srv.crt" other-host.invalid \
+        || { printf 'replaced leaf lost its injected SAN\n'; failed=1; }
+    # 链仍由真实 CA 签发 ⇒ 拒绝只能来自主机名不匹配（正确的内层 TLS 判据）。
+    mapping_cert_verifies_with "$TLS_ASSETS/upstream/tls/srv.crt" "$TLS_ASSETS/upstream/tls/ca.crt" \
+        || { printf 'replaced leaf chain must still verify\n'; failed=1; }
+    printf 'NEG_SAN_HOSTNAME_MISMATCH=1\n'
     rm -rf "$TLS_DIR"
     return "$failed"
 }
@@ -1162,7 +1284,9 @@ mapping_isolation_check_behavior
 mapping_run_id_binding
 mapping_snapshot_requires_ready'
 
-MAPPING_TLS_TESTS='proxy_accept_dials_frozen_u
+MAPPING_TLS_TESTS='upstream_evidence_volume_writable
+negative_injection_replaces_files
+proxy_accept_dials_frozen_u
 proxy_reject_never_dials
 proxy_other_authority_never_dials
 proxy_bad_count_fails

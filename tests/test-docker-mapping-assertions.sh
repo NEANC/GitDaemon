@@ -616,6 +616,58 @@ fixture_failure_is_80() {
     return "$failed"
 }
 
+# 场景运行必须局部化证据目录：返回后外层 IT_EVIDENCE_DIR 不得被改写，
+# 否则映射组之后的其它分组会把证据写进映射场景的嵌套目录。
+scenario_evidence_dir_local() {
+    local dir_a dir_b failed=0 rc=0
+    dir_a=$(mktemp -d)
+    dir_b=$(mktemp -d)
+    sa_lifecycle_case fallback
+    IT_EVIDENCE_DIR=/outer/evidence
+    mapping_scenario_run fallback "$dir_a" || { printf 'scenario run failed\n'; failed=1; }
+    [[ $IT_EVIDENCE_DIR == /outer/evidence ]] \
+        || { printf 'scenario run changed IT_EVIDENCE_DIR: %s\n' "$IT_EVIDENCE_DIR"; failed=1; }
+    sa_lifecycle_case fallback
+    D_SYNC_EXIT=1
+    D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n'
+    IT_EVIDENCE_DIR=/outer/evidence
+    rc=0
+    mapping_negative_run missing-map fallback "$dir_b" || rc=$?
+    [[ $rc == 0 ]] || { printf 'negative run rc=%s\n' "$rc"; failed=1; }
+    [[ $IT_EVIDENCE_DIR == /outer/evidence ]] \
+        || { printf 'negative run changed IT_EVIDENCE_DIR: %s\n' "$IT_EVIDENCE_DIR"; failed=1; }
+    MAPPING_ASSERT_CASE=''
+    rm -rf "$dir_a" "$dir_b"
+    return "$failed"
+}
+
+# 隔离负例的真实注入代码必须执行：创建并登记第二个网络，再把产品接入该网络；
+# 只替换 Docker 边界，注入逻辑本身走真实实现（不能整体替换为 return 0）。
+negative_extra_network_real_injection() {
+    local failed=0 ledger calls id
+    RS_STORE=$(mktemp)
+    : > "$RS_STORE"
+    ledger=$(mktemp -d)
+    calls=$(mktemp)
+    rs_install
+    mapping_fixture_docker() {
+        printf '%s\n' "$*" >> "$calls"
+        rs_docker "$@"
+    }
+    mapping_profile_load "$MAPPING_PROFILE" || { printf 'profile load failed\n'; failed=1; }
+    MAPPING_ASSERT_CASE=isolation
+    mapping_negative_extra_network "$ledger" product-id || { printf 'extra network injection failed\n'; failed=1; }
+    id=$(rs_lookup network gm-mtest-neg-net)
+    [[ -n $id ]] || { printf 'extra network was not created and registered\n'; failed=1; }
+    grep -q 'network connect gm-mtest-neg-net product-id' "$calls" \
+        || { printf 'product was not attached to the extra network\n'; failed=1; }
+    printf 'EXTRA_NETWORK id=%s\n' "$id"
+    MAPPING_ASSERT_CASE=''
+    rm -rf "$ledger"
+    rm -f "$RS_STORE" "$calls"
+    return "$failed"
+}
+
 # dns.txt 是活证据：github.com 指向可信 U（假绿）或 gm-proxy 未指向 X 时必须拒绝，
 # 且拒绝层次为映射判定层。
 dns_evidence_required() {
@@ -896,6 +948,8 @@ reject_stale_refs
 invalid_map_original_validator_rejects
 dns_evidence_required
 residual_connect_not_reused
+scenario_evidence_dir_local
+negative_extra_network_real_injection
 scenario_repeated_run_succeeds
 probe_release_uses_registered_id
 direct_clears_git_proxy

@@ -567,7 +567,8 @@ mapping_scenario_release() {
         [[ -n $id ]] || continue
         resource_remove network "$id" || return "$MAPPING_ASSERT_FIXTURE"
     done
-    for name in "$(mapping_scenario_data_volume "$generation")" "$(mapping_assets_volume)" "$(mapping_ca_volume)"; do
+    for name in "$(mapping_scenario_data_volume "$generation")" "$(mapping_assets_volume)" \
+        "$(mapping_ca_volume)" "$(mapping_evidence_volume)"; do
         [[ -n $name ]] || continue
         id=$(mapping_fixture_docker volume inspect -f '{{.Name}}' "$name" 2>/dev/null) || continue
         [[ -n $id ]] || continue
@@ -710,7 +711,9 @@ mapping_scenario_run() {
     MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
     generation=$(mapping_assert_generation "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     mapping_assert_prepare_dir "$dir" || return "$MAPPING_ASSERT_FIXTURE"
-    IT_EVIDENCE_DIR=$dir
+    # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
+    # 分组会把证据写进映射场景的嵌套目录，主成功/清理失败校验被静默跳过。
+    local IT_EVIDENCE_DIR=$dir
     if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
         MAPPING_PROXY_RUN_ID=''
@@ -761,7 +764,9 @@ mapping_negative_run() {
     MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
     generation=$(mapping_assert_generation "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     mapping_assert_prepare_dir "$dir" || return "$MAPPING_ASSERT_FIXTURE"
-    IT_EVIDENCE_DIR=$dir
+    # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
+    # 分组会把证据写进映射场景的嵌套目录，主成功/清理失败校验被静默跳过。
+    local IT_EVIDENCE_DIR=$dir
     if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
         MAPPING_ASSERT_CASE='' MAPPING_PROXY_RUN_ID=''
@@ -824,9 +829,11 @@ mapping_negative_apply() {
 }
 
 # 额外网络附件：把产品接到第二个网络，配置审计必须拒绝该隔离破坏。
+# ledger 必须在 dir 赋值之后展开：同一行声明会让 $dir 在 set -u 下取到未绑定的外层变量。
 mapping_negative_extra_network() {
-    local dir=${1:-} product=${2:-} ledger=$dir/control/resources name
+    local dir=${1:-} product=${2:-} name ledger
     [[ -n $dir && -n $product ]] || return 1
+    ledger=$dir/control/resources
     name="gm-${MP_RUN_ID}-neg-net"
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
     resource_create_register network "$MAPPING_ASSERT_CASE" extra -- \
@@ -886,4 +893,45 @@ openssl x509 -req -in "$work/srv.csr" -CA "$d/tls/ca.crt" -CAkey "$d/tls/ca.key"
     -CAcreateserial -days 2 -extfile "$work/srv.ext" -out "$d/tls/srv.crt" >/dev/null 2>&1
 rm -rf "$work"
 MAPPING_NEGSAN
+}
+
+# 全量验收汇总判定：字段 failures/fixture_failures/deferred/primary_exit/cleanup_exit/residual_count
+# 必须为 0；mapping_fallback/mapping_direct/system_fallback/system_direct/dns_negatives/tls_negatives/
+# isolation_negatives 必须为 PASS；缺项、重复键、未知形状或非约定取值一律返回 1。
+# 汇总由集成结束路径（integration_full_summary_write）在运行期写出，runner 末尾消费本判定。
+mapping_full_accept() {
+    local file=${1:-} line key value
+    local -A seen=()
+    local -a zero_fields=(failures fixture_failures deferred primary_exit cleanup_exit residual_count)
+    local -a pass_fields=(mapping_fallback mapping_direct system_fallback system_direct
+        dns_negatives tls_negatives isolation_negatives)
+    [[ -n $file && -f $file && ! -L $file && -r $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        [[ $line == *$'\t'* ]] || return 1
+        key=${line%%$'\t'*}
+        value=${line#*$'\t'}
+        [[ -n $key && -n $value && $value != *$'\t'* ]] || return 1
+        [[ -z ${seen[$key]:-} ]] || return 1
+        seen[$key]=$value
+    done < "$file"
+    for key in "${zero_fields[@]}"; do
+        [[ ${seen[$key]:-} == 0 ]] || return 1
+    done
+    for key in "${pass_fields[@]}"; do
+        [[ ${seen[$key]:-} == PASS ]] || return 1
+    done
+    return 0
+}
+
+# runner 末尾判定：对集成结束路径写出的九字段汇总运行 mapping_full_accept；判定不通过即非零，
+# 使单项模式或过滤运行写出的不完整汇总不能被当作 full 结论。
+integration_full_accept() {
+    local file=${1:-}
+    if mapping_full_accept "$file"; then
+        printf 'MAPPING_FULL_ACCEPT=0\n'
+        return 0
+    fi
+    printf 'MAPPING_FULL_ACCEPT=REJECT file=%s\n' "${file:-none}" >&2
+    return 1
 }

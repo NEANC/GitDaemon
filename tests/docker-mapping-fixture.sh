@@ -226,6 +226,7 @@ mapping_network_id_load() {
 }
 
 # 通过资源账本创建本轮映射网络并登记；创建命令必须携带 run/scenario/role 三 label。
+# 独立 internal bridge：外部路由由 Docker 侧先隔离，guard 的精确规则是附加约束而非唯一防线。
 # 身份写入运行状态，返回 network ID。调用者由编排接线提供。
 mapping_network_create() {
     local profile=${1:-} ledger_dir=${2:-} id state
@@ -240,7 +241,7 @@ mapping_network_create() {
         --label "gitdaemon.run=$MP_RUN_ID" \
         --label "gitdaemon.scenario=$MAPPING_LEDGER_SCENARIO" \
         --label "gitdaemon.role=$MAPPING_LEDGER_ROLE" \
-        --ipv6=false --subnet "$MP_CIDR" -o "com.docker.network.bridge.name=$MP_BRIDGE" \
+        --ipv6=false --internal --subnet "$MP_CIDR" -o "com.docker.network.bridge.name=$MP_BRIDGE" \
         "$MP_NETWORK_NAME" || return $?
     id=$RESOURCE_CREATED_ID
     [[ -n $id ]] || return 2
@@ -450,6 +451,9 @@ mapping_isolation_check() {
 # 双 CA、代理与 DNS 契约参数（接口 D）。
 MAPPING_FIXTURE_MOUNT='/var/lib/git-daemon'
 MAPPING_ASSET_ROOT="$MAPPING_FIXTURE_MOUNT"
+# 上游连接取证的独立可写卷挂载点：资产卷对上游只读，serve.sh 的写重定向必须落到该 rw 卷，
+# 否则只读文件系统上重定向失败、requests.log 永不生成。
+MAPPING_EVIDENCE_MOUNT='/ev'
 MAPPING_CA_MOUNT='/ca'
 MAPPING_SCENARIO_RE='^mapping-[a-z0-9-]{1,32}$'
 MAPPING_UPSTREAM_HOST='github.com'
@@ -465,6 +469,7 @@ MAPPING_CLIENT_UPSTREAM_CA="$MAPPING_CA_MOUNT/upstream-ca.crt"
 MAPPING_CLIENT_PROXY_CA="$MAPPING_CA_MOUNT/proxy-ca.crt"
 MAPPING_ASSET_VOLUME_ROLE='assets'
 MAPPING_CA_VOLUME_ROLE='ca'
+MAPPING_EVIDENCE_VOLUME_ROLE='evidence'
 MAPPING_SAFE_OPTIONS='--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges --sysctl net.ipv6.conf.all.disable_ipv6=1'
 # 上游 U:443 连接取证与上游 Git 助手：serve.sh 逐连接记录 requests.log；
 # git 助手在服务目录内初始化并推进受控 dumb HTTP 仓库，供 refs/HEAD 预期读取。
@@ -472,8 +477,8 @@ MAPPING_UPSTREAM_OWNER='gitdaemon'
 MAPPING_UPSTREAM_REPO='fixture'
 MAPPING_UPSTREAM_PATH="$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git"
 MAPPING_UPSTREAM_REF='refs/heads/main'
-MAPPING_UPSTREAM_REQUESTS="$MAPPING_FIXTURE_MOUNT/upstream/requests.log"
-MAPPING_UPSTREAM_SERVE_LOG="$MAPPING_FIXTURE_MOUNT/upstream/serve.log"
+MAPPING_UPSTREAM_REQUESTS="$MAPPING_EVIDENCE_MOUNT/requests.log"
+MAPPING_UPSTREAM_SERVE_LOG="$MAPPING_EVIDENCE_MOUNT/serve.log"
 # 受控 DNS 的假绿开关：默认留空；仅安全负例显式设置后，指定名称才解析到指定地址。
 MAPPING_DNS_FAKE_HOST=''
 MAPPING_DNS_FAKE_IP=''
@@ -558,6 +563,11 @@ mapping_assets_volume() {
 
 mapping_ca_volume() {
     printf 'gm-%s-mapping-ca\n' "$(mapping_fixture_run_id)"
+}
+
+# 上游连接取证卷（rw）：资产卷对上游只读，须另挂一个可写卷承载 requests.log/serve.log。
+mapping_evidence_volume() {
+    printf 'gm-%s-mapping-evidence\n' "$(mapping_fixture_run_id)"
 }
 
 # 夹具容器名：上游 U、代理 X、DNS D、校准探针 P。
@@ -863,14 +873,16 @@ mapping_fixture_ca_publish() {
 }
 
 # 资产卷经资源账本创建并登记：账本目录不可解析或身份为空一律拒绝。
+# 三个卷角色固定 assets（只读资产）、ca（客户端公开 CA）、evidence（上游连接取证，rw）。
 mapping_assets_volumes_create() {
-    local ledger=${1:-} role volume
+    local ledger=${1:-} spec role volume
     [[ -n $ledger ]] || return 1
-    for role in "$MAPPING_ASSET_VOLUME_ROLE" "$MAPPING_CA_VOLUME_ROLE"; do
-        case "$role" in
-            "$MAPPING_ASSET_VOLUME_ROLE") volume=$(mapping_assets_volume) ;;
-            *) volume=$(mapping_ca_volume) ;;
-        esac
+    for spec in "$MAPPING_ASSET_VOLUME_ROLE:$(mapping_assets_volume)" \
+        "$MAPPING_CA_VOLUME_ROLE:$(mapping_ca_volume)" \
+        "$MAPPING_EVIDENCE_VOLUME_ROLE:$(mapping_evidence_volume)"; do
+        role=${spec%%:*}
+        volume=${spec#*:}
+        [[ -n $role && -n $volume ]] || return 1
         RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
         resource_create_register volume "$MAPPING_LEDGER_SCENARIO" "$role" -- \
             resource_docker volume create \
@@ -917,18 +929,22 @@ mapping_dns_daemon_args() {
 }
 
 # 上游服务脚本：逐连接接受一次并记录 requests.log，供 U:443 实际连接计数取证。
+# 请求日志与 serve.log 落在独立可写证据卷（MAPPING_EVIDENCE_ROOT），证书私钥仍留在只读资产卷；
+# 只读文件系统上的写重定向会失败并使循环空转，因此两者必须分开挂载。
 # 以 -naccept 1 循环使每次接受的连接恰好落一行证据，不依赖外部递归。
 mapping_upstream_serve_script() {
     cat <<'MAPPING_SERVE'
 set -u
 R=${MAPPING_ASSET_ROOT:?}
+E=${MAPPING_EVIDENCE_ROOT:?}
+mkdir -p "$E" || exit 1
 cd "$R/upstream/web" || exit 1
-: > "$R/upstream/requests.log"
+: > "$E/requests.log" || exit 1
 while :; do
     openssl s_server -quiet -naccept 1 -accept 443 \
         -cert "$R/upstream/tls/srv.crt" -key "$R/upstream/tls/srv.key" -WWW \
-        >"$R/upstream/serve.log" 2>&1
-    printf '%s\n' connection >> "$R/upstream/requests.log"
+        >"$E/serve.log" 2>&1
+    printf '%s\n' connection >> "$E/requests.log"
 done
 MAPPING_SERVE
 }
@@ -999,12 +1015,12 @@ mapping_upstream_git_run() {
         -s "$action" ${msg:+"$msg"}
 }
 
-# 夹具前置核验：映射网络与两个资产卷必须已存在且身份相符。
+# 夹具前置核验：映射网络与三个资产/取证卷必须已存在且身份相符。
 mapping_fixture_precheck() {
     local name value
     value=$(mapping_fixture_docker network inspect -f '{{.Name}}' "$MP_NETWORK_NAME" 2>/dev/null) || return 1
     [[ $value == "$MP_NETWORK_NAME" ]] || return 1
-    for name in "$(mapping_assets_volume)" "$(mapping_ca_volume)"; do
+    for name in "$(mapping_assets_volume)" "$(mapping_ca_volume)" "$(mapping_evidence_volume)"; do
         value=$(mapping_fixture_docker volume inspect -f '{{.Name}}' "$name" 2>/dev/null) || return 1
         [[ $value == "$name" ]] || return 1
     done
@@ -1061,11 +1077,14 @@ mapping_fixture_start() {
     dns_args=$(mapping_dns_daemon_args "$profile") || return "$MAPPING_FAILURE"
     accept_count=$(mapping_proxy_count_path "$scenario" "$MAPPING_PROXY_ACCEPT_PORT") || return "$MAPPING_FAILURE"
     reject_count=$(mapping_proxy_count_path "$scenario" "$MAPPING_PROXY_REJECT_PORT") || return "$MAPPING_FAILURE"
-    # 上游：固定地址 U，只读资产卷，绝不带 github.com 网络别名。
+    # 上游：固定地址 U，资产卷只读（证书私钥只在此）、连接证据卷可写；绝不带 github.com 网络别名。
     mapping_fixture_run "$scenario" upstream -d --name "$(mapping_upstream_container)" \
         $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_U" \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_UPSTREAM_PORT" \
-        -v "$(mapping_assets_volume):$root:ro" --entrypoint /bin/sh "$tools_image" \
+        -v "$(mapping_assets_volume):$root:ro" \
+        -v "$(mapping_evidence_volume):$MAPPING_EVIDENCE_MOUNT" \
+        -e "MAPPING_EVIDENCE_ROOT=$MAPPING_EVIDENCE_MOUNT" \
+        --entrypoint /bin/sh "$tools_image" \
         -c "exec $root/upstream/serve.sh" \
         >/dev/null || return "$MAPPING_FAILURE"
     # 代理：固定地址 X；接受/拒绝端口各用独立计数文件，同一进程不并发读改同一文件。
