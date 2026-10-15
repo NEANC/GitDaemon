@@ -383,11 +383,22 @@ mapping_scenario_product_ready() {
     return 1
 }
 
+# 顺序占位释放：账本登记身份是 `docker create` 返回的容器 ID（见 docker-resource-ledger.sh 的
+# resource_inspect_identity），故先经实时 inspect 取 ID 再精确删除；未登记（inspect 失败）视为无需释放。
+mapping_scenario_release_probe() {
+    local probe id
+    probe=$(mapping_probe_container) || return 1
+    id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$probe" 2>/dev/null) || return 0
+    [[ -n $id ]] || return 0
+    resource_remove container "$id" || return 1
+    return 0
+}
+
 # 产品就绪：独立数据卷 create/登记 → 安全离线 helper 写合法快照与测试 Git 信任配置 →
 # 释放顺序占位 probe(P) → READY 握手 → 从正式容器入口启动并等待可观测就绪。
 mapping_scenario_product_up() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
-    local ledger=$dir/control/resources data gitconfig snapshot_content name netid probe
+    local ledger=$dir/control/resources data gitconfig snapshot_content name netid
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
     netid=$(mapping_network_id_load) || return "$MAPPING_ASSERT_FIXTURE"
@@ -406,11 +417,8 @@ mapping_scenario_product_up() {
     gitconfig=$(mapping_scenario_gitconfig_content) || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_data_write "$data" "$MAPPING_ASSERT_GITCONFIG_REL" "$gitconfig" "$MAPPING_PRODUCT_IMAGE" \
         || return "$MAPPING_ASSERT_FIXTURE"
-    # 顺序占位必须先释放：产品启动前删除登记 probe，产品才能取得冻结地址 P。
-    probe=$(mapping_probe_container)
-    if mapping_fixture_docker inspect -f '{{.Id}}' "$probe" >/dev/null 2>&1; then
-        resource_remove container "$probe" || return "$MAPPING_ASSERT_FIXTURE"
-    fi
+    # 顺序占位必须先释放：产品启动前按登记身份删除 probe，产品才能取得冻结地址 P。
+    mapping_scenario_release_probe || return "$MAPPING_ASSERT_FIXTURE"
     mapping_ready "$MAPPING_PROFILE" "$netid" || return "$MAPPING_ASSERT_FIXTURE"
     name=$(mapping_scenario_product_container "$MAPPING_ASSERT_GENERATION")
     mapping_fixture_create "$scenario" "$MAPPING_ASSERT_PRODUCT_ROLE" -d --name "$name" \

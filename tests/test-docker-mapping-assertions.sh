@@ -156,7 +156,13 @@ sa_doubles() {
         sa_baseline_write "$3/proxy.before" "${D_ACCEPT_BEFORE:-0}" "${D_REJECT_BEFORE:-0}" || return 80
     }
     mapping_scenario_product_up() {
+        local dir=${3:-} content
         [[ ${D_PRODUCT_FAIL:-0} == 0 ]] || return 80
+        [[ -n $dir && -d $dir ]] || return 80
+        # 行为级取证：真实消费按用例选定的快照模式，把本轮实际写入的快照内容落盘，
+        # 使「missing-map 未置 none / invalid-map 未置 reserved」这类回归可被断言检出。
+        content=$(mapping_scenario_snapshot_content "$1") || return 80
+        printf '%s' "$content" > "$dir/control/snapshot.content" || return 80
         printf '%s\n' "${D_PRODUCT_ID:-gm-double-product}"
     }
     mapping_scenario_upstream_count() {
@@ -449,9 +455,57 @@ sa_negative_layer() {
     return 0
 }
 
+# 负例快照行为断言（行为级）：读取本轮实际写入的快照内容，核验「按用例选择快照模式」未回归。
+# 空内容=未写快照；invalid-map 写的地址必须仍被未修改的产品校验器拒绝；
+# unreachable-map-system 必须写冻结未分配地址 N；TLS/isolation 必须写可信 U。
+sa_negative_snapshot() {
+    local case_name=$1 dir=$2 file=$2/control/snapshot.content content addr expect
+    case "$case_name" in
+        missing-map|dns-false-green) expect=none ;;
+        invalid-map) expect=reserved ;;
+        unreachable-map-system) expect=unallocated ;;
+        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san|isolation) expect=valid ;;
+        *) printf 'unknown negative case %s\n' "$case_name"; return 1 ;;
+    esac
+    [[ -f $file ]] || { printf 'case %s recorded no snapshot decision\n' "$case_name"; return 1; }
+    content=$(cat -- "$file" 2>/dev/null) || content=''
+    mapping_profile_load "$MAPPING_PROFILE" || return 1
+    if [[ $expect == none ]]; then
+        [[ -z $content ]] || { printf 'case %s wrote snapshot %s\n' "$case_name" "$content"; return 1; }
+        printf 'NEG_SNAPSHOT %s=%s\n' "$case_name" "$expect"
+        return 0
+    fi
+    [[ -n $content && $content == *" $MAPPING_UPSTREAM_HOST" ]] || {
+        printf 'case %s wrote malformed snapshot: %s\n' "$case_name" "$content"
+        return 1
+    }
+    addr=${content%% *}
+    case "$expect" in
+        reserved)
+            if mapping_public_address "$addr" >/dev/null 2>&1; then
+                printf 'case %s wrote a public address %s\n' "$case_name" "$addr"
+                return 1
+            fi
+            ;;
+        unallocated|valid)
+            if ! mapping_public_address "$addr"; then
+                printf 'case %s wrote non-public address %s\n' "$case_name" "$addr"
+                return 1
+            fi
+            if [[ $expect == unallocated ]]; then
+                [[ $addr == "$MP_N" ]] || { printf 'case %s wrote %s != N\n' "$case_name" "$addr"; return 1; }
+            else
+                [[ $addr == "$MP_U" ]] || { printf 'case %s wrote %s != U\n' "$case_name" "$addr"; return 1; }
+            fi
+            ;;
+    esac
+    printf 'NEG_SNAPSHOT %s=%s\n' "$case_name" "$expect"
+    return 0
+}
+
 # 负例通用驱动：编排走真实实现，缺陷由替身参数注入。
 # 行为级断言：未注入缺陷时同一替身下正例通过（证明缺陷真的改变了结果），注入后负例被拒，
-# 且证据记录了与用例语义一致的被拒层次。
+# 证据记录了与用例语义一致的被拒层次，且本轮实际写入的快照内容与用例语义一致。
 sa_negative_case() {
     local case_name=$1 kind=$2 mode=$3 dir rc=0 failed=0
     sa_positive_control "$kind" || { printf 'baseline control failed %s/%s\n' "$case_name" "$kind"; failed=1; }
@@ -462,6 +516,7 @@ sa_negative_case() {
     printf 'NEGATIVE %s/%s rc=%s\n' "$case_name" "$kind" "$rc"
     if [[ $rc != 0 ]]; then printf 'negative %s/%s not rejected rc=%s\n' "$case_name" "$kind" "$rc"; failed=1; fi
     sa_negative_layer "$case_name" "$dir" || failed=1
+    sa_negative_snapshot "$case_name" "$dir" || failed=1
     if [[ $mode == judge ]]; then
         if mapping_assert_result "$kind" "$dir"; then printf 'negative %s/%s passed the judge\n' "$case_name" "$kind"; failed=1; fi
     fi
@@ -624,42 +679,69 @@ residual_connect_not_reused() {
     return "$failed"
 }
 
-# 有状态资源替身：同名网络/容器/卷重复创建即失败（等同 docker 冲突），删除后消失。
-rs_has() { grep -qxF "$1" "$RS_STORE" 2>/dev/null; }
-rs_add() { printf '%s\n' "$1" >> "$RS_STORE"; }
-rs_del() { grep -vxF "$1" "$RS_STORE" > "$RS_STORE.tmp" 2>/dev/null || true; mv "$RS_STORE.tmp" "$RS_STORE"; }
+# 有状态资源替身：同名对象重复创建即失败（等同 docker 冲突），删除后消失。
+# 身份与名称分离：容器/网络身份为与名称不同的 ID，卷身份为名称（与 docker create/volume create
+# 的打印一致），从而真正守护「按登记身份而非名称删除」。
+rs_new_id() { printf 'id-%s-%s\n' "$1" "$(printf '%s' "$2" | cksum | cut -d' ' -f1)"; }
+
+# 按 kind 与名称查原始行；不存在时输出为空。
+rs_row() {
+    awk -v k="$1" -v n="$2" 'BEGIN{FS="\t"} $1==k && $2==n {print; exit}' "$RS_STORE"
+}
+
+# 按 kind 与（名称或身份）查询登记身份。
+rs_lookup() {
+    awk -v k="$1" -v key="$2" 'BEGIN{FS="\t"} $1==k && ($2==key || $3==key) {print $3; exit}' "$RS_STORE"
+}
+
+# 身份是否已登记（严格匹配身份列，名称不算）。
+rs_has_id() {
+    awk -v k="$1" -v id="$2" 'BEGIN{FS="\t"} $1==k && $3==id {found=1} END{exit found?0:1}' "$RS_STORE"
+}
+
+rs_add() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RS_STORE"; }
+
+rs_delete() {
+    awk -v k="$1" -v id="$2" 'BEGIN{FS="\t"} !($1==k && $3==id)' "$RS_STORE" > "$RS_STORE.tmp"
+    mv -- "$RS_STORE.tmp" "$RS_STORE"
+}
+
 rs_count() { wc -l < "$RS_STORE" | tr -d ' '; }
 
 rs_docker() {
     local -a a=("$@")
-    local last=${a[${#a[@]}-1]} name='' i
+    local last=${a[${#a[@]}-1]} name='' kind id i
     case "${a[0]}" in
         network|volume)
+            kind=${a[0]}
             case "${a[1]:-}" in
                 create)
-                    if rs_has "${a[0]} $last"; then return 1; fi
-                    rs_add "${a[0]} $last"; printf '%s\n' "$last" ;;
-                inspect)
-                    rs_has "${a[0]} $last" || return 1
-                    printf '%s\n' "$last" ;;
-                rm) rs_del "${a[0]} $last" ;;
+                    [[ -z $(rs_row "$kind" "$last") ]] || return 1
+                    if [[ $kind == volume ]]; then id=$last; else id=$(rs_new_id "$kind" "$last"); fi
+                    rs_add "$kind" "$last" "$id"
+                    printf '%s\n' "$id"
+                    ;;
+                inspect) rs_lookup "$kind" "$last" ;;
+                rm) rs_delete "$kind" "$last" ;;
                 *) return 0 ;;
             esac
             ;;
         create)
             for ((i = 0; i < ${#a[@]}; i++)); do [[ ${a[i]} == --name ]] && name=${a[i + 1]}; done
             [[ -n $name ]] || name=$last
-            if rs_has "container $name"; then return 1; fi
-            rs_add "container $name"; printf '%s\n' "$name" ;;
-        rm) rs_del "container $last" ;;
-        inspect)
-            rs_has "container $last" || return 1
-            printf '%s\n' "$last" ;;
+            [[ -z $(rs_row container "$name") ]] || return 1
+            id=$(rs_new_id container "$name")
+            rs_add container "$name" "$id"
+            printf '%s\n' "$id"
+            ;;
+        rm) rs_delete container "$last" ;;
+        inspect) rs_lookup container "$last" ;;
         *) return 0 ;;
     esac
 }
 
-# 安装有状态资源替身：resource_docker 与容器边界同名冲突即失败，resource_remove 从状态中移除。
+# 安装有状态资源替身：resource_docker 与容器边界同名冲突即失败；
+# resource_remove 只接受登记身份（容器/网络为 ID，卷为名称），传名称一律返回 2。
 rs_install() {
     mapping_fixture_docker() { rs_docker "$@"; }
     resource_docker() { rs_docker "$@"; }
@@ -676,8 +758,8 @@ rs_install() {
     }
     resource_remove() {
         local kind=$1 identity=$2
-        rs_has "$kind $identity" || return 2
-        rs_del "$kind $identity"
+        rs_has_id "$kind" "$identity" || return 2
+        rs_delete "$kind" "$identity"
     }
     return 0
 }
@@ -713,6 +795,33 @@ scenario_repeated_run_succeeds() {
     [[ $rc2 == 0 ]] || failed=1
     [[ $(rs_count) == 0 ]] || { printf 'run2 left resources behind\n'; failed=1; }
     rm -rf "$dir1" "$dir2"
+    rm -f "$RS_STORE"
+    return "$failed"
+}
+
+# 顺序占位释放必须按登记身份（容器 ID）而非容器名：替身的身份与名称不同，
+# 按名称删除必须被拒（等价真实拓扑返回 2），按登记身份删除必须成功且无残留。
+probe_release_uses_registered_id() {
+    local failed=0 ledger name id rc=0
+    RS_STORE=$(mktemp)
+    : > "$RS_STORE"
+    ledger=$(mktemp -d)
+    rs_install
+    mapping_profile_load "$MAPPING_PROFILE" || { rm -rf "$ledger" "$RS_STORE"; return 1; }
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    name=$(mapping_probe_container)
+    resource_create_register container "$MAPPING_LEDGER_SCENARIO" probe -- \
+        resource_docker create --label "gitdaemon.run=$MP_RUN_ID" \
+        --name "$name" "$MAPPING_PRODUCT_IMAGE" || { printf 'probe registration failed\n'; failed=1; }
+    id=${RESOURCE_CREATED_ID:-}
+    [[ -n $id && $id != "$name" ]] || { printf 'double identity %s equals name %s\n' "${id:-none}" "$name"; failed=1; }
+    [[ $(rs_count) == 1 ]] || { printf 'probe was not registered\n'; failed=1; }
+    resource_remove container "$name" && rc=0 || rc=$?
+    printf 'PROBE_REMOVE_BY_NAME rc=%s\n' "$rc"
+    [[ $rc != 0 ]] || { printf 'removal by container name was accepted\n'; failed=1; }
+    mapping_scenario_release_probe || { printf 'probe release rejected the registered id\n'; failed=1; }
+    [[ $(rs_count) == 0 ]] || { printf 'release left the probe behind\n'; failed=1; }
+    rm -rf "$ledger"
     rm -f "$RS_STORE"
     return "$failed"
 }
@@ -772,6 +881,7 @@ invalid_map_original_validator_rejects
 dns_evidence_required
 residual_connect_not_reused
 scenario_repeated_run_succeeds
+probe_release_uses_registered_id
 direct_clears_git_proxy
 product_ready_requires_marker
 negative_missing_map
