@@ -29,6 +29,13 @@ MAPPING_ASSERT_PRODUCT_ROLE='product'
 # invalid-map 负例使用的保留地址（原校验器必须拒绝，且不生成 resolve）。
 MAPPING_ASSERT_RESERVED_ADDR='198.18.0.1'
 
+# 判定器被拒层次：sync 表示底层同步/完整性失败，mapping 表示映射判定失败，policy 表示配置审计失败。
+# 负例编排把该层次写入证据，供后续区分「同步层」与「映射判定层」的拒绝。
+MAPPING_ASSERT_REJECT_LAYER=''
+# 产品可观测就绪标记（入口前台就绪日志）与轮询上限；容器在跑不等于业务可服务。
+MAPPING_PRODUCT_READY_MARK='[git-daemon] 容器前台就绪'
+MAPPING_PRODUCT_READY_TRIES=120
+
 # 运行期只读字段，由 identity 与边界填充。
 MAPPING_ASSERT_GENERATION=''
 MAPPING_ASSERT_PRODUCT=''
@@ -212,48 +219,85 @@ mapping_assert_connect_legal() {
     return 1
 }
 
+# dns.txt 必须证明受控 DNS 状态：github.com 的 A 与 AAAA 为 NXDOMAIN（成功不依赖系统 DNS），
+# gm-proxy 解析到 X。记录数、名称、类型或取值任一不符一律拒绝。
+mapping_assert_dns_file() {
+    local file=${1:-} line name rrtype value
+    local seen_a=0 seen_aaaa=0 seen_proxy=0
+    [[ -f $file && ! -L $file && -r $file ]] || return 1
+    mapping_profile_load "${MAPPING_PROFILE:-}" || return 1
+    while IFS=$'\t' read -r name rrtype value || [[ -n $name ]]; do
+        [[ -n $name && -n $rrtype && -n $value && $value != *$'\t'* ]] || return 1
+        case "$name $rrtype" in
+            "$MAPPING_UPSTREAM_HOST A")
+                [[ $value == NXDOMAIN && $seen_a == 0 ]] || return 1
+                seen_a=1
+                ;;
+            "$MAPPING_UPSTREAM_HOST AAAA")
+                [[ $value == NXDOMAIN && $seen_aaaa == 0 ]] || return 1
+                seen_aaaa=1
+                ;;
+            "$MAPPING_PROXY_HOST A")
+                [[ $value == "$MP_X" && $seen_proxy == 0 ]] || return 1
+                seen_proxy=1
+                ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ $seen_a == 1 && $seen_aaaa == 1 && $seen_proxy == 1 ]] || return 1
+    return 0
+}
+
+# 判定器拒绝层次标记：设置层次后由调用点 return 1，确保判定立即中止并记录层次。
+mapping_assert_fail() {
+    MAPPING_ASSERT_REJECT_LAYER=${1:-mapping}
+    return 0
+}
+
 # 判定器：0 通过，1 拒绝。任何缺文件、跨场景 identity、读取错误或负计数均返回 1。
 mapping_assert_result() {
     local kind=${1:-} dir=${2:-} scenario
     local sync_exit fsck_exit before after delta up_before up_after
     local mapping_line system_line proxy_line proxy_fail_line
-    mapping_assert_kind_valid "$kind" || return "$MAPPING_ASSERT_FAIL"
-    [[ -n $dir ]] || return 1
-    mapping_assert_require_files "$dir" || return 1
-    mapping_assert_identity_load "$dir" || return 1
-    scenario=$(mapping_assert_scenario "$kind") || return 1
-    [[ $MPA_SCENARIO == "$scenario" ]] || return 1
-    sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return 1
-    fsck_exit=$(mapping_assert_uint_file "$dir/fsck.exit") || return 1
-    [[ $sync_exit == 0 ]] || return 1
-    [[ $fsck_exit == 0 ]] || return 1
-    before=$(mapping_proxy_baseline_total "$dir/proxy.before") || return 1
-    after=$(mapping_proxy_baseline_total "$dir/proxy.after") || return 1
-    (( after >= before )) || return 1
+    MAPPING_ASSERT_REJECT_LAYER=''
+    mapping_assert_kind_valid "$kind" || { mapping_assert_fail mapping; return 1; }
+    [[ -n $dir ]] || { mapping_assert_fail mapping; return 1; }
+    mapping_assert_require_files "$dir" || { mapping_assert_fail mapping; return 1; }
+    mapping_assert_identity_load "$dir" || { mapping_assert_fail mapping; return 1; }
+    scenario=$(mapping_assert_scenario "$kind") || { mapping_assert_fail mapping; return 1; }
+    [[ $MPA_SCENARIO == "$scenario" ]] || { mapping_assert_fail mapping; return 1; }
+    sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || { mapping_assert_fail mapping; return 1; }
+    fsck_exit=$(mapping_assert_uint_file "$dir/fsck.exit") || { mapping_assert_fail mapping; return 1; }
+    [[ $sync_exit == 0 ]] || { mapping_assert_fail sync; return 1; }
+    [[ $fsck_exit == 0 ]] || { mapping_assert_fail sync; return 1; }
+    mapping_assert_dns_file "$dir/dns.txt" || { mapping_assert_fail mapping; return 1; }
+    before=$(mapping_proxy_baseline_total "$dir/proxy.before") || { mapping_assert_fail mapping; return 1; }
+    after=$(mapping_proxy_baseline_total "$dir/proxy.after") || { mapping_assert_fail mapping; return 1; }
+    (( after >= before )) || { mapping_assert_fail mapping; return 1; }
     delta=$(( after - before ))
-    up_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 1
-    up_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 1
-    (( up_after > up_before )) || return 1
-    mapping_assert_refs_match "$dir" || return 1
-    mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 1
-    mapping_assert_head_match "$dir" || return 1
+    up_before=$(mapping_assert_uint_file "$dir/upstream.before") || { mapping_assert_fail mapping; return 1; }
+    up_after=$(mapping_assert_uint_file "$dir/upstream.after") || { mapping_assert_fail mapping; return 1; }
+    (( up_after > up_before )) || { mapping_assert_fail mapping; return 1; }
+    mapping_assert_refs_match "$dir" || { mapping_assert_fail mapping; return 1; }
+    mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || { mapping_assert_fail mapping; return 1; }
+    mapping_assert_head_match "$dir" || { mapping_assert_fail mapping; return 1; }
     mapping_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_MAPPING")
-    [[ -n $mapping_line ]] || return 1
+    [[ -n $mapping_line ]] || { mapping_assert_fail mapping; return 1; }
     system_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_SYSTEM")
-    [[ -z $system_line ]] || return 1
+    [[ -z $system_line ]] || { mapping_assert_fail mapping; return 1; }
     proxy_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_PROXY")
-    [[ -z $proxy_line ]] || return 1
+    [[ -z $proxy_line ]] || { mapping_assert_fail mapping; return 1; }
     case "$kind" in
         fallback)
             proxy_fail_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_PROXY_FAIL")
-            [[ -n $proxy_fail_line ]] || return 1
-            (( proxy_fail_line < mapping_line )) || return 1
-            (( delta > 0 )) || return 1
-            mapping_profile_load "${MAPPING_PROFILE:-}" || return 1
-            mapping_assert_connect_legal "$dir/connect.log" "$MP_U" || return 1
+            [[ -n $proxy_fail_line ]] || { mapping_assert_fail mapping; return 1; }
+            (( proxy_fail_line < mapping_line )) || { mapping_assert_fail mapping; return 1; }
+            (( delta > 0 )) || { mapping_assert_fail mapping; return 1; }
+            mapping_profile_load "${MAPPING_PROFILE:-}" || { mapping_assert_fail mapping; return 1; }
+            mapping_assert_connect_legal "$dir/connect.log" "$MP_U" || { mapping_assert_fail mapping; return 1; }
             ;;
         direct)
-            (( delta == 0 )) || return 1
+            (( delta == 0 )) || { mapping_assert_fail mapping; return 1; }
             ;;
     esac
     return 0
@@ -297,12 +341,14 @@ mapping_scenario_upstream_head() {
 }
 
 # 夹具准备：可复用只读资产 + 独立映射网络 + 上游/代理/DNS/探针；负例注入在启动前生效。
+# 产品启动前先重建本轮 CONNECT 日志，杜绝上一轮残留的合法行被复用。
 mapping_scenario_fixture_prepare() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} ledger
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n ${MAPPING_PROFILE:-} && -n ${MAPPING_PRODUCT_IMAGE:-} && -n ${MAPPING_TOOLS_IMAGE:-} ]] || return "$MAPPING_ASSERT_FIXTURE"
     ledger=$dir/control/resources
     mapping_assets_prepare "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$ledger" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_proxy_evidence_reset "$scenario" "$MAPPING_PRODUCT_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_network_create "$MAPPING_PROFILE" "$ledger" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
     mapping_negative_prepare "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_fixture_start "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$MAPPING_TOOLS_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
@@ -317,8 +363,28 @@ mapping_scenario_calibrate() {
     return 0
 }
 
+# 测试 Git 信任配置内容：显式清空 http.proxy（不继承宿主/全局代理），只单独指定代理 CA。
+# 空值的键必须存在，否则 direct 场景会沿用外部 http.proxy 而绕过直连判定。
+mapping_scenario_gitconfig_content() {
+    printf '[http]\n\tproxy =\n\tproxySSLCAInfo = %s\n' "$MAPPING_CLIENT_PROXY_CA"
+}
+
+# 产品可观测就绪：轮询容器日志中的入口前台就绪标记；容器退出即失败。
+# 不把「容器在跑」当作业务可服务，也不依赖持久化 PID 或卷内残留状态。
+mapping_scenario_product_ready() {
+    local name=${1:-} i logs
+    [[ -n $name ]] || return 1
+    for ((i = 0; i < MAPPING_PRODUCT_READY_TRIES; i++)); do
+        logs=$(mapping_fixture_docker logs "$name" 2>&1) || logs=''
+        [[ $logs == *"$MAPPING_PRODUCT_READY_MARK"* ]] && return 0
+        [[ $(mapping_fixture_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null) == true ]] || return 1
+        sleep 0.5
+    done
+    return 1
+}
+
 # 产品就绪：独立数据卷 create/登记 → 安全离线 helper 写合法快照与测试 Git 信任配置 →
-# 释放顺序占位 probe(P) → READY 握手 → 从正式容器入口启动并等待就绪。
+# 释放顺序占位 probe(P) → READY 握手 → 从正式容器入口启动并等待可观测就绪。
 mapping_scenario_product_up() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
     local ledger=$dir/control/resources data gitconfig snapshot_content name netid probe
@@ -337,7 +403,7 @@ mapping_scenario_product_up() {
         mapping_scenario_data_write "$data" "$MAPPING_ASSERT_SNAPSHOT_REL" "$snapshot_content" "$MAPPING_PRODUCT_IMAGE" \
             || return "$MAPPING_ASSERT_FIXTURE"
     fi
-    gitconfig=$(printf '[http]\n\tproxySSLCAInfo = %s\n' "$MAPPING_CLIENT_PROXY_CA")
+    gitconfig=$(mapping_scenario_gitconfig_content) || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_data_write "$data" "$MAPPING_ASSERT_GITCONFIG_REL" "$gitconfig" "$MAPPING_PRODUCT_IMAGE" \
         || return "$MAPPING_ASSERT_FIXTURE"
     # 顺序占位必须先释放：产品启动前删除登记 probe，产品才能取得冻结地址 P。
@@ -359,7 +425,7 @@ mapping_scenario_product_up() {
         -e "REPOS=$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO" \
         "$MAPPING_PRODUCT_IMAGE" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
     mapping_fixture_docker start "$name" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_fixture_wait "$name" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_scenario_product_ready "$name" || return "$MAPPING_ASSERT_FIXTURE"
     printf '%s\n' "$name"
 }
 
@@ -453,18 +519,52 @@ mapping_scenario_dns_state() {
     return 0
 }
 
-# 局部清理：释放本轮产品与独立数据卷，使 P 与数据卷可供下一场景重用。
+# 受控 DNS 恢复：清除假绿开关并核验 github.com 恢复为 NXDOMAIN、gm-proxy 仍指向 X。
+# 恢复后判定器读到的 DNS 证据不再是被造假绿样本。
+mapping_scenario_dns_restore() {
+    local kind=${1:-} scenario=${2:-} dir=${3:-} file rc=0
+    MAPPING_DNS_FAKE_HOST=''
+    MAPPING_DNS_FAKE_IP=''
+    [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    file=$dir/dns.restore
+    mapping_scenario_dns_state "$kind" "$scenario" "$dir" > "$file" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_assert_dns_file "$file" || rc="$MAPPING_ASSERT_FAIL"
+    rm -f "$file"
+    return "$rc"
+}
+
+# 局部清理：释放本场景创建的全部资源（产品/上游/代理/DNS/探针容器、映射与负例网络、
+# 数据/资产/CA 卷），使同一进程内重跑可重建同名资源而不冲突。资源身份由实时 inspect 取得。
 mapping_scenario_release() {
-    local kind=${1:-} scenario=${2:-} generation=${3:-} dir=${4:-} name data
+    local kind=${1:-} scenario=${2:-} generation=${3:-} dir=${4:-} ledger id name
     [[ -n $kind && -n $scenario && -n $generation && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
-    name=$(mapping_scenario_product_container "$generation")
-    data=$(mapping_scenario_data_volume "$generation")
-    if mapping_fixture_docker inspect -f '{{.Id}}' "$name" >/dev/null 2>&1; then
-        resource_remove container "$name" || return "$MAPPING_ASSERT_FIXTURE"
-    fi
-    if mapping_fixture_docker volume inspect -f '{{.Name}}' "$data" >/dev/null 2>&1; then
-        resource_remove volume "$data" || return "$MAPPING_ASSERT_FIXTURE"
-    fi
+    mapping_profile_load "${MAPPING_PROFILE:-}" || return "$MAPPING_ASSERT_FIXTURE"
+    ledger=$dir/control/resources
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    local -a containers=(
+        "$(mapping_scenario_product_container "$generation")"
+        "$(mapping_upstream_container)"
+        "$(mapping_proxy_container)"
+        "$(mapping_dns_container)"
+        "$(mapping_probe_container)"
+    )
+    for name in "${containers[@]}"; do
+        id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$name" 2>/dev/null) || continue
+        [[ -n $id ]] || continue
+        resource_remove container "$id" || return "$MAPPING_ASSERT_FIXTURE"
+    done
+    for name in "$MP_NETWORK_NAME" "gm-${MP_RUN_ID}-neg-net"; do
+        [[ -n $name ]] || continue
+        id=$(mapping_fixture_docker network inspect -f '{{.Id}}' "$name" 2>/dev/null) || continue
+        [[ -n $id ]] || continue
+        resource_remove network "$id" || return "$MAPPING_ASSERT_FIXTURE"
+    done
+    for name in "$(mapping_scenario_data_volume "$generation")" "$(mapping_assets_volume)" "$(mapping_ca_volume)"; do
+        [[ -n $name ]] || continue
+        id=$(mapping_fixture_docker volume inspect -f '{{.Name}}' "$name" 2>/dev/null) || continue
+        [[ -n $id ]] || continue
+        resource_remove volume "$id" || return "$MAPPING_ASSERT_FIXTURE"
+    done
     return 0
 }
 
@@ -566,6 +666,8 @@ mapping_scenario_evidence() {
     [[ -n $scenario && -n $generation && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     base_scenario=$(mapping_assert_scenario "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_GENERATION=$generation
+    # 本轮代理计数与 CONNECT 日志按 generation 独立，重跑不复用上一轮证据。
+    MAPPING_PROXY_RUN_ID=$generation
     mapping_scenario_fixture_prepare "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_calibrate "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     product=$(mapping_scenario_product_up "$kind" "$scenario" "$dir") || return "$MAPPING_ASSERT_FIXTURE"
@@ -603,6 +705,7 @@ mapping_scenario_run() {
     IT_EVIDENCE_DIR=$dir
     if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
+        MAPPING_PROXY_RUN_ID=''
         return "$MAPPING_ASSERT_FIXTURE"
     fi
     if mapping_assert_result "$kind" "$dir"; then
@@ -611,17 +714,22 @@ mapping_scenario_run() {
         rc="$MAPPING_ASSERT_FAIL"
     fi
     mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    MAPPING_PROXY_RUN_ID=''
     return "$rc"
 }
 
 # 负例判定：0 表示负例被正确拒绝（判定非零）；非零表示假绿/漏判。
+# 同时把被拒层次写入 MAPPING_ASSERT_REJECT_LAYER：sync 为底层同步层，mapping 为映射判定层，
+# policy 为配置审计层。
 mapping_negative_rejected() {
     local case_name=${1:-} kind=${2:-} dir=${3:-}
     case "$case_name" in
         isolation)
+            MAPPING_ASSERT_REJECT_LAYER=''
             if mapping_policy_check "${MAPPING_ASSERT_PRODUCT:-}" "$MAPPING_ASSERT_PRODUCT_ROLE" "$MAPPING_PROFILE"; then
                 return 1
             fi
+            MAPPING_ASSERT_REJECT_LAYER=policy
             return 0
             ;;
         *)
@@ -632,7 +740,7 @@ mapping_negative_rejected() {
 }
 
 # 接口 D：负例编排。三层退出：底层同步可为 0，mapping 判定须非零，负例本身才返回 0；
-# 任何夹具失败返回 80。
+# 任何夹具失败返回 80。负例证据记录被拒层次，结束后恢复受控 DNS 并复位本轮分段。
 mapping_negative_run() {
     local case_name=${1:-} kind=${2:-} dir=${3:-} scenario generation rc
     [[ $# == 3 && -n $case_name && -n $kind && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
@@ -648,7 +756,7 @@ mapping_negative_run() {
     IT_EVIDENCE_DIR=$dir
     if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
-        MAPPING_ASSERT_CASE=''
+        MAPPING_ASSERT_CASE='' MAPPING_PROXY_RUN_ID=''
         return "$MAPPING_ASSERT_FIXTURE"
     fi
     if mapping_negative_rejected "$case_name" "$kind" "$dir"; then
@@ -656,8 +764,12 @@ mapping_negative_run() {
     else
         rc="$MAPPING_ASSERT_FAIL"
     fi
+    printf '%s\n' "${MAPPING_ASSERT_REJECT_LAYER:-none}" > "$dir/reject.layer" || rc="$MAPPING_ASSERT_FIXTURE"
+    # 结束后恢复受控 DNS：清除假绿开关（配合本场景释放被造假的 DNS 容器，使后续运行回到 NXDOMAIN）。
+    MAPPING_DNS_FAKE_HOST=''
+    MAPPING_DNS_FAKE_IP=''
     mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || rc="$MAPPING_ASSERT_FIXTURE"
-    MAPPING_ASSERT_CASE=''
+    MAPPING_ASSERT_CASE='' MAPPING_PROXY_RUN_ID=''
     return "$rc"
 }
 

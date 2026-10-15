@@ -477,6 +477,8 @@ MAPPING_UPSTREAM_SERVE_LOG="$MAPPING_FIXTURE_MOUNT/upstream/serve.log"
 # 受控 DNS 的假绿开关：默认留空；仅安全负例显式设置后，指定名称才解析到指定地址。
 MAPPING_DNS_FAKE_HOST=''
 MAPPING_DNS_FAKE_IP=''
+# 本轮代理证据分段：由编排按 run/generation 设置，保证重跑不复用上一轮计数与 CONNECT 日志。
+MAPPING_PROXY_RUN_ID=''
 MAPPING_FAILURE=80
 MAPPING_USAGE=2
 
@@ -564,22 +566,46 @@ mapping_proxy_container() { printf 'gm-%s-proxy\n' "$(mapping_fixture_run_id)"; 
 mapping_dns_container() { printf 'gm-%s-dns\n' "$(mapping_fixture_run_id)"; }
 mapping_probe_container() { printf 'gm-%s-probe\n' "$(mapping_fixture_run_id)"; }
 
-# 单一场景下的代理计数文件与 CONNECT 日志路径；两个端口各用独立计数文件。
-mapping_proxy_count_path() {
-    local scenario=${1:-} port=${2:-} name
+# 单一场景的代理证据目录（容器内绝对路径）：按 run 分段，未设置分段时退回场景目录。
+# 分段使同一 scenario 重跑不复用上一轮的计数文件与 CONNECT 日志。
+mapping_proxy_scenario_dir() {
+    local scenario=${1:-}
     mapping_scenario_valid "$scenario" || return 1
+    if [[ -n ${MAPPING_PROXY_RUN_ID:-} ]]; then
+        printf '%s/proxy/scenarios/%s/%s\n' "$MAPPING_ASSET_ROOT" "$scenario" "$MAPPING_PROXY_RUN_ID"
+    else
+        printf '%s/proxy/scenarios/%s\n' "$MAPPING_ASSET_ROOT" "$scenario"
+    fi
+}
+
+# 单一场景下的代理计数文件路径；两个端口各用独立计数文件，且随 run 分段。
+mapping_proxy_count_path() {
+    local scenario=${1:-} port=${2:-} name dir
+    dir=$(mapping_proxy_scenario_dir "$scenario") || return 1
     case "$port" in
         "$MAPPING_PROXY_ACCEPT_PORT") name=accept ;;
         "$MAPPING_PROXY_REJECT_PORT") name=reject ;;
         *) return 1 ;;
     esac
-    printf '%s/proxy/scenarios/%s/%s.count\n' "$MAPPING_ASSET_ROOT" "$scenario" "$name"
+    printf '%s/%s.count\n' "$dir" "$name"
 }
 
+# 单一场景下的 CONNECT 日志路径；随 run 分段，避免读取上一轮残留。
 mapping_proxy_log_path() {
-    local scenario=${1:-}
+    local scenario=${1:-} dir
+    dir=$(mapping_proxy_scenario_dir "$scenario") || return 1
+    printf '%s/connect.log\n' "$dir"
+}
+
+# 场景开始时重建本轮代理证据：清空上一轮残留的 CONNECT 日志（计数文件随新分段自然为空）。
+mapping_proxy_evidence_reset() {
+    local scenario=${1:-} image=${2:-} dir rel
     mapping_scenario_valid "$scenario" || return 1
-    printf '%s/proxy/scenarios/%s/connect.log\n' "$MAPPING_ASSET_ROOT" "$scenario"
+    [[ -n $image ]] || return 1
+    dir=$(mapping_proxy_scenario_dir "$scenario") || return 1
+    rel=${dir#"$MAPPING_ASSET_ROOT"/}
+    mapping_fixture_asset_write "$rel/connect.log" '' "$image" || return 1
+    return 0
 }
 
 # 拨号地址必须是 IPv4 字面量：拒绝主机名，杜绝代理侧对 CONNECT 目标做 DNS 解析。

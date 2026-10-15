@@ -66,7 +66,7 @@ sa_evidence_defaults() {
     EV_HEAD_ACTUAL=$unique
     EV_UP_BEFORE=5 EV_UP_AFTER=6
     EV_SYNC_EXIT=0 EV_FSCK_EXIT=0
-    EV_DNS=$'github.com\tA\tNXDOMAIN\ngithub.com\tAAAA\tNXDOMAIN\n'
+    EV_DNS=$'github.com\tA\tNXDOMAIN\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t140.82.112.12\n'
     EV_ACCEPT_BEFORE=0 EV_REJECT_BEFORE=0 EV_ACCEPT_AFTER=0 EV_REJECT_AFTER=0
     EV_CONNECT=''
     case "$kind" in
@@ -140,7 +140,9 @@ sa_lifecycle_defaults() {
 }
 
 # 替换全部外部边界：Docker/Git/同步入口/校准探针/隔离审计。
+# 传 1 时保留真实 mapping_scenario_release（供「同进程重跑」用例验证释放完整性）。
 sa_doubles() {
+    local keep_release=${1:-0}
     mapping_scenario_fixture_prepare() {
         local dir=$3
         [[ ${D_FIXTURE_FAIL:-0} == 0 ]] || return 80
@@ -186,8 +188,22 @@ sa_doubles() {
     mapping_scenario_local_refs() { printf '%s\n' "${D_REFS_ACTUAL:-}"; }
     mapping_scenario_local_head() { printf '%s\n' "${D_HEAD_ACTUAL:-}"; }
     mapping_scenario_local_fsck() { printf '%s\n' "${D_FSCK:-0}"; }
-    mapping_scenario_dns_state() { printf '%s' "${D_DNS:-}"; }
-    mapping_scenario_release() { return 0; }
+    # 受控 DNS 状态替身：按假绿开关推导，模拟「开关生效 → github.com 指向可信 U；开关复位 → NXDOMAIN」，
+    # 使假绿负例自包含，并让「恢复 NXDOMAIN」可被真实断言。
+    mapping_scenario_dns_state() {
+        local fake='NXDOMAIN' proxy
+        mapping_profile_load "$MAPPING_PROFILE" || return 80
+        if [[ ${MAPPING_DNS_FAKE_HOST:-} == "$MAPPING_UPSTREAM_HOST" && -n ${MAPPING_DNS_FAKE_IP:-} ]]; then
+            fake=$MAPPING_DNS_FAKE_IP
+        fi
+        proxy=${D_PROXY_X:-$MP_X}
+        printf '%s\tA\t%s\n' "$MAPPING_UPSTREAM_HOST" "$fake"
+        printf '%s\tAAAA\tNXDOMAIN\n' "$MAPPING_UPSTREAM_HOST"
+        printf '%s\tA\t%s\n' "$MAPPING_PROXY_HOST" "$proxy"
+    }
+    if [[ $keep_release != 1 ]]; then
+        mapping_scenario_release() { return 0; }
+    fi
     # 证书替换与额外网络附件是唯一被替换的负例注入边界，负例缺陷选择逻辑保持真实。
     mapping_negative_wrong_ca() { return 0; }
     mapping_negative_wrong_san() { return 0; }
@@ -413,47 +429,39 @@ invalid_map_original_validator_rejects() {
     return "$failed"
 }
 
-# 负例缺陷选择的行为断言：快照/DNS 模式与用例语义一致，且假绿例只指向可信 U。
-sa_negative_expect_modes() {
-    local case_name=$1 expect_snapshot='' expect_dns='none'
+# 负例证据的被拒层次断言（行为级）：底层同步失败记为 sync，映射判定拒绝记为 mapping，
+# 配置审计拒绝记为 policy；层次必须被记录且与用例语义一致，供后续区分拒绝来源。
+sa_negative_layer() {
+    local case_name=$1 dir=$2 layer expect
     case "$case_name" in
-        missing-map) expect_snapshot=none ;;
-        invalid-map) expect_snapshot=reserved ;;
-        dns-false-green) expect_snapshot=none expect_dns=upstream ;;
-        unreachable-map-system) expect_snapshot=unallocated expect_dns=upstream ;;
-        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san|isolation) expect_snapshot=valid ;;
+        missing-map|invalid-map|wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) expect=sync ;;
+        dns-false-green|unreachable-map-system) expect=mapping ;;
+        isolation) expect=policy ;;
         *) printf 'unknown negative case %s\n' "$case_name"; return 1 ;;
     esac
-    [[ $MAPPING_ASSERT_SNAPSHOT_MODE == "$expect_snapshot" ]] || {
-        printf 'case %s snapshot mode %s != %s\n' "$case_name" "$MAPPING_ASSERT_SNAPSHOT_MODE" "$expect_snapshot"
+    layer=$(sed -n '1p' "$dir/reject.layer" 2>/dev/null) || layer=''
+    [[ -n $layer ]] || { printf 'case %s recorded no reject layer\n' "$case_name"; return 1; }
+    [[ $layer == "$expect" ]] || {
+        printf 'case %s rejected at layer %s != %s\n' "$case_name" "$layer" "$expect"
         return 1
     }
-    [[ $MAPPING_ASSERT_DNS_MODE == "$expect_dns" ]] || {
-        printf 'case %s dns mode %s != %s\n' "$case_name" "$MAPPING_ASSERT_DNS_MODE" "$expect_dns"
-        return 1
-    }
-    if [[ $expect_dns == upstream ]]; then
-        [[ $MAPPING_DNS_FAKE_HOST == github.com && -n $MAPPING_DNS_FAKE_IP ]] || {
-            printf 'case %s did not point system DNS at trusted U\n' "$case_name"
-            return 1
-        }
-    elif [[ -n $MAPPING_DNS_FAKE_HOST || -n $MAPPING_DNS_FAKE_IP ]]; then
-        printf 'case %s leaked a fake DNS override\n' "$case_name"
-        return 1
-    fi
+    printf 'REJECT_LAYER %s=%s\n' "$case_name" "$layer"
     return 0
 }
 
 # 负例通用驱动：编排走真实实现，缺陷由替身参数注入。
+# 行为级断言：未注入缺陷时同一替身下正例通过（证明缺陷真的改变了结果），注入后负例被拒，
+# 且证据记录了与用例语义一致的被拒层次。
 sa_negative_case() {
     local case_name=$1 kind=$2 mode=$3 dir rc=0 failed=0
+    sa_positive_control "$kind" || { printf 'baseline control failed %s/%s\n' "$case_name" "$kind"; failed=1; }
     dir=$(mktemp -d)
     sa_lifecycle_case "$kind"
     sa_negative_overrides "$case_name"
     mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
     printf 'NEGATIVE %s/%s rc=%s\n' "$case_name" "$kind" "$rc"
     if [[ $rc != 0 ]]; then printf 'negative %s/%s not rejected rc=%s\n' "$case_name" "$kind" "$rc"; failed=1; fi
-    sa_negative_expect_modes "$case_name" || failed=1
+    sa_negative_layer "$case_name" "$dir" || failed=1
     if [[ $mode == judge ]]; then
         if mapping_assert_result "$kind" "$dir"; then printf 'negative %s/%s passed the judge\n' "$case_name" "$kind"; failed=1; fi
     fi
@@ -468,7 +476,12 @@ sa_negative_overrides() {
             D_SYNC_EXIT=1
             D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n传输失败：直连加动态地址映射；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
             ;;
-        dns-false-green|unreachable-map-system)
+        dns-false-green)
+            D_SYNC_EXIT=0
+            # 映射成功文案齐全，唯一缺陷是被造假的 DNS 状态；判定器必须因 dns.txt 本身拒绝。
+            D_LOG=$'同步传输路径：直连加动态地址映射\n'
+            ;;
+        unreachable-map-system)
             D_SYNC_EXIT=0
             D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n传输失败：直连加动态地址映射；尝试下一路径\n同步传输路径：直连系统 DNS\n'
             ;;
@@ -494,13 +507,18 @@ negative_invalid_map() {
     sa_negative_case invalid-map direct judge
 }
 
-# 两个 DNS 假绿例：DNS 指向可信 U 时底层 system 可成功，判定器必须非零。
+# 两个 DNS 假绿例：系统 DNS 指向可信 U 时底层 system 可成功，判定器必须因 DNS 证据非零。
+# 负例自包含（拒绝来自 dns.txt 本身，不依赖正例重跑），结束后断言受控 DNS 恢复 NXDOMAIN。
 negative_dns_false_green() {
+    local dir failed=0
     sa_negative_case dns-false-green fallback judge || return 1
     sa_negative_case dns-false-green direct judge || return 1
-    if ! sa_positive_control fallback; then printf 'post-negative positive control failed\n'; return 1; fi
-    if ! sa_positive_control direct; then printf 'post-negative positive control failed\n'; return 1; fi
-    return 0
+    [[ -z ${MAPPING_DNS_FAKE_HOST:-} && -z ${MAPPING_DNS_FAKE_IP:-} ]] || { printf 'fake dns override leaked\n'; return 1; }
+    dir=$(mktemp -d)
+    mapping_scenario_dns_restore fallback mapping-fallback-fake "$dir" \
+        || { printf 'dns not restored to NXDOMAIN\n'; failed=1; }
+    rm -rf "$dir"
+    return "$failed"
 }
 
 negative_unreachable_map_system() {
@@ -543,6 +561,206 @@ fixture_failure_is_80() {
     return "$failed"
 }
 
+# dns.txt 是活证据：github.com 指向可信 U（假绿）或 gm-proxy 未指向 X 时必须拒绝，
+# 且拒绝层次为映射判定层。
+dns_evidence_required() {
+    local dir failed=0 layer
+    dir=$(mktemp -d)
+    sa_evidence_defaults fallback
+    sa_evidence_write fallback "$dir"
+    mapping_assert_result fallback "$dir" || { printf 'valid dns evidence rejected\n'; failed=1; }
+    # 假绿：系统 DNS 把 github.com 指向可信 U，其余证据完好 —— 必须拒绝且层次为 mapping。
+    EV_DNS=$'github.com\tA\t140.82.112.11\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t140.82.112.12\n'
+    sa_evidence_write fallback "$dir"
+    mapping_assert_result fallback "$dir" && { printf 'dns false green accepted\n'; failed=1; }
+    layer=$MAPPING_ASSERT_REJECT_LAYER
+    [[ $layer == mapping ]] || { printf 'dns false green rejected at layer %s\n' "${layer:-none}"; failed=1; }
+    # AAAA 未 NXDOMAIN。
+    EV_DNS=$'github.com\tA\tNXDOMAIN\ngithub.com\tAAAA\t140.82.112.11\ngm-proxy\tA\t140.82.112.12\n'
+    sa_evidence_write fallback "$dir"
+    mapping_assert_result fallback "$dir" && { printf 'aaaa not nxdomain accepted\n'; failed=1; }
+    # gm-proxy 未指向 X。
+    EV_DNS=$'github.com\tA\tNXDOMAIN\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t10.0.0.1\n'
+    sa_evidence_write fallback "$dir"
+    mapping_assert_result fallback "$dir" && { printf 'wrong proxy resolution accepted\n'; failed=1; }
+    rm -rf "$dir"
+    return "$failed"
+}
+
+# 代理计数与 CONNECT 日志按 run 独立：上一轮残留合法行不得让本轮仅凭残留通过校验。
+residual_connect_not_reused() {
+    local failed=0 root saved base log1 log2 c1 residual
+    root=$(mktemp -d)
+    saved=${MAPPING_ASSET_ROOT:-}
+    MAPPING_ASSET_ROOT=$root
+    unset MAPPING_PROXY_RUN_ID
+    base=$root/proxy/scenarios/mapping-fallback
+    mkdir -p "$base"
+    residual=$'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+    printf '%s' "$residual" > "$base/connect.log"
+    printf '9\n' > "$base/accept.count"
+    # 残留行本身是合法样本：证明它能通过判据（否则「不复用」无意义）。
+    mapping_assert_connect_legal "$base/connect.log" 140.82.112.11 || { printf 'residual line is not legal\n'; failed=1; }
+    MAPPING_PROXY_RUN_ID=run-A
+    log1=$(mapping_proxy_log_path mapping-fallback) || failed=1
+    c1=$(mapping_proxy_count_path mapping-fallback "$MAPPING_PROXY_ACCEPT_PORT") || failed=1
+    MAPPING_PROXY_RUN_ID=run-B
+    log2=$(mapping_proxy_log_path mapping-fallback) || failed=1
+    MAPPING_PROXY_RUN_ID=run-A
+    [[ $log1 != "$base/connect.log" && $log2 != "$log1" ]] || { printf 'run logs share the residual path\n'; failed=1; }
+    [[ $c1 != "$base/accept.count" ]] || { printf 'run counters share the residual path\n'; failed=1; }
+    # 场景开始时重建本轮日志：替身把写入落到替身目录。
+    mapping_fixture_asset_write() {
+        local rel=$1 content=$2
+        mkdir -p "$root/$(dirname -- "$rel")" || return 1
+        printf '%s' "$content" > "$root/$rel"
+    }
+    mapping_proxy_evidence_reset mapping-fallback product || { printf 'evidence reset failed\n'; failed=1; }
+    [[ -f $log1 && ! -s $log1 ]] || { printf 'run log was not rebuilt empty\n'; failed=1; }
+    if mapping_assert_connect_legal "$log1" 140.82.112.11; then printf 'residual alone satisfied the check\n'; failed=1; fi
+    MAPPING_ASSET_ROOT=$saved
+    unset MAPPING_PROXY_RUN_ID
+    rm -rf "$root"
+    return "$failed"
+}
+
+# 有状态资源替身：同名网络/容器/卷重复创建即失败（等同 docker 冲突），删除后消失。
+rs_has() { grep -qxF "$1" "$RS_STORE" 2>/dev/null; }
+rs_add() { printf '%s\n' "$1" >> "$RS_STORE"; }
+rs_del() { grep -vxF "$1" "$RS_STORE" > "$RS_STORE.tmp" 2>/dev/null || true; mv "$RS_STORE.tmp" "$RS_STORE"; }
+rs_count() { wc -l < "$RS_STORE" | tr -d ' '; }
+
+rs_docker() {
+    local -a a=("$@")
+    local last=${a[${#a[@]}-1]} name='' i
+    case "${a[0]}" in
+        network|volume)
+            case "${a[1]:-}" in
+                create)
+                    if rs_has "${a[0]} $last"; then return 1; fi
+                    rs_add "${a[0]} $last"; printf '%s\n' "$last" ;;
+                inspect)
+                    rs_has "${a[0]} $last" || return 1
+                    printf '%s\n' "$last" ;;
+                rm) rs_del "${a[0]} $last" ;;
+                *) return 0 ;;
+            esac
+            ;;
+        create)
+            for ((i = 0; i < ${#a[@]}; i++)); do [[ ${a[i]} == --name ]] && name=${a[i + 1]}; done
+            [[ -n $name ]] || name=$last
+            if rs_has "container $name"; then return 1; fi
+            rs_add "container $name"; printf '%s\n' "$name" ;;
+        rm) rs_del "container $last" ;;
+        inspect)
+            rs_has "container $last" || return 1
+            printf '%s\n' "$last" ;;
+        *) return 0 ;;
+    esac
+}
+
+# 安装有状态资源替身：resource_docker 与容器边界同名冲突即失败，resource_remove 从状态中移除。
+rs_install() {
+    mapping_fixture_docker() { rs_docker "$@"; }
+    resource_docker() { rs_docker "$@"; }
+    resource_create_register() {
+        local kind=$1 scenario=$2 role=$3
+        shift 3
+        [[ ${1:-} != -- ]] || shift
+        local id rc=0
+        id=$("$@") || rc=$?
+        (( rc == 0 )) || return "$rc"
+        [[ -n $id ]] || return 2
+        RESOURCE_CREATED_ID=$id
+        return 0
+    }
+    resource_remove() {
+        local kind=$1 identity=$2
+        rs_has "$kind $identity" || return 2
+        rs_del "$kind $identity"
+    }
+    return 0
+}
+
+# 同一 scenario 在同一进程内连续运行两次均成功：释放必须清掉映射网络与固定名容器，
+# 第二次才能重建同名资源；残留即视为释放不完整。
+scenario_repeated_run_succeeds() {
+    local failed=0 dir1 dir2 rc1=0 rc2=0
+    dir1=$(mktemp -d)
+    dir2=$(mktemp -d)
+    RS_STORE=$(mktemp)
+    : > "$RS_STORE"
+    rs_install
+    sa_doubles 1
+    sa_lifecycle_defaults fallback
+    mapping_scenario_fixture_prepare() {
+        local kind=$1 scenario=$2 dir=$3 ledger=$dir/control/resources
+        mkdir -p "$dir/control" || return 80
+        mapping_network_create "$MAPPING_PROFILE" "$ledger" >/dev/null || return 80
+        RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+        resource_create_register container "$kind" upstream -- \
+            resource_docker create --label "gitdaemon.run=$MP_RUN_ID" \
+            --name "$(mapping_upstream_container)" "$MAPPING_PRODUCT_IMAGE" >/dev/null || return 80
+        mapping_negative_prepare "$kind" "$scenario" "$dir" || return 80
+        return 0
+    }
+    mapping_scenario_run fallback "$dir1" || rc1=$?
+    printf 'REPEAT run1 rc=%s leftover=%s\n' "$rc1" "$(rs_count)"
+    [[ $rc1 == 0 ]] || failed=1
+    [[ $(rs_count) == 0 ]] || { printf 'run1 left resources behind\n'; failed=1; }
+    mapping_scenario_run fallback "$dir2" || rc2=$?
+    printf 'REPEAT run2 rc=%s leftover=%s\n' "$rc2" "$(rs_count)"
+    [[ $rc2 == 0 ]] || failed=1
+    [[ $(rs_count) == 0 ]] || { printf 'run2 left resources behind\n'; failed=1; }
+    rm -rf "$dir1" "$dir2"
+    rm -f "$RS_STORE"
+    return "$failed"
+}
+
+# direct 传输必须显式清空 Git http.proxy（键存在且值为空），只单独指定代理 CA。
+direct_clears_git_proxy() {
+    local failed=0 cfg
+    cfg=$(mapping_scenario_gitconfig_content) || { printf 'gitconfig content failed\n'; return 1; }
+    printf '%s\n' "$cfg"
+    grep -qE '^[[:space:]]*proxy[[:space:]]*=[[:space:]]*$' <<< "$cfg" || { printf 'gitconfig does not clear http.proxy\n'; failed=1; }
+    grep -q 'proxySSLCAInfo = ' <<< "$cfg" || { printf 'gitconfig lost proxySSLCAInfo\n'; failed=1; }
+    # http.proxy 必须在 [http] 段内，且不得被 proxySSLCAInfo 误匹配。
+    awk 'BEGIN{s=0} /^\[http\]/{s=1;next} /^\[/{s=0} {if (s && $0 ~ /^[[:space:]]*proxy[[:space:]]*=/) found=1} END{exit found?0:1}' <<< "$cfg" \
+        || { printf 'cleared http.proxy not inside [http]\n'; failed=1; }
+    return "$failed"
+}
+
+# 产品就绪必须等可观测标记：仅 State.Running 不得判为就绪；容器退出即失败。
+product_ready_requires_marker() {
+    local failed=0
+    MAPPING_PRODUCT_READY_TRIES=2
+    mapping_fixture_docker() {
+        case "$*" in
+            logs*) printf '[git-daemon] 初始化命名卷内实例\n' ;;
+            *"{{.State.Running}}"*) printf 'true\n' ;;
+            *) return 0 ;;
+        esac
+    }
+    if mapping_scenario_product_ready probe; then printf 'running-only container accepted as ready\n'; failed=1; fi
+    mapping_fixture_docker() {
+        case "$*" in
+            logs*) printf '[git-daemon] 容器前台就绪\n' ;;
+            *"{{.State.Running}}"*) printf 'true\n' ;;
+            *) return 0 ;;
+        esac
+    }
+    mapping_scenario_product_ready probe || { printf 'ready marker rejected\n'; failed=1; }
+    mapping_fixture_docker() {
+        case "$*" in
+            logs*) printf '[git-daemon] 启动 git-daemon\n' ;;
+            *"{{.State.Running}}"*) printf 'false\n' ;;
+            *) return 0 ;;
+        esac
+    }
+    if mapping_scenario_product_ready probe; then printf 'exited container accepted as ready\n'; failed=1; fi
+    return "$failed"
+}
+
 MAPPING_ASSERTION_TESTS='fallback_requires_order_and_connect_growth
 direct_requires_own_baseline
 scenario_order_independent
@@ -551,6 +769,11 @@ reject_missing_counter
 reject_system_success
 reject_stale_refs
 invalid_map_original_validator_rejects
+dns_evidence_required
+residual_connect_not_reused
+scenario_repeated_run_succeeds
+direct_clears_git_proxy
+product_ready_requires_marker
 negative_missing_map
 negative_invalid_map
 negative_dns_false_green
