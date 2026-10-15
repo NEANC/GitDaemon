@@ -533,21 +533,462 @@ mapping_snapshot_requires_ready() {
     return "$failed"
 }
 
+# tls-proxy 契约：加载真实映射夹具的资产/代理/DNS 函数，仅替换 Docker、TLS 接受、
+# 拨号、中继与客户端探针等外部边界；本地可用可执行件（openssl）用于校验判据本身。
+TLS_DIR=''
+TLS_ASSETS=''
+TLS_SCENARIO_ID='mapping-fallback'
+
+# 记录型 Docker 替身：标签落盘（create 在命令替换子壳中执行，变量无法回传），
+# 身份由调用参数推导，exec 读取映射到本地替身目录。
+tls_docker() {
+    printf '%s\n' "$*" >> "$TLS_DIR/docker.calls"
+    local last=${!#} name='' run='mtest' scenario='' role='' labels
+    local -a argv=()
+    read -ra argv <<< "$*"
+    local i arg
+    for ((i = 0; i < ${#argv[@]}; i++)); do
+        arg=${argv[i]}
+        case "$arg" in
+            --name) name=${argv[i + 1]} ;;
+            gitdaemon.run=*) run=${arg#*=} ;;
+            gitdaemon.scenario=*) scenario=${arg#*=} ;;
+            gitdaemon.role=*) role=${arg#*=} ;;
+        esac
+    done
+    case "$*" in
+        'volume create '*)
+            printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" > "$TLS_DIR/labels"
+            printf '%s\n' "$last"
+            ;;
+        'create '*)
+            printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" > "$TLS_DIR/labels"
+            printf '%s\n' "${name:-$last}"
+            ;;
+        'exec '*)
+            case "$*" in
+                *' cat '*)
+                    [[ -f $last ]] || return 1
+                    command cat -- "$last"
+                    ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *'.Config.Labels'*|*'.Labels'*)
+            labels=$(command cat -- "$TLS_DIR/labels") || return 1
+            printf '%s\n' "$labels"
+            ;;
+        *'CreatedAt'*)
+            printf '%s|local|/var/lib/docker/volumes/%s/_data|gitdaemon.run=%s,\n' "$last" "$last" "$run"
+            ;;
+        *'.State.Running'*) printf 'true\n' ;;
+        *'.Name'*) printf '%s\n' "$last" ;;
+        *'.Id'*) printf '%s\n' "$last" ;;
+        'inspect '*) printf '{"Name":"%s"}\n' "$last" ;;
+        *) printf '{}\n' ;;
+    esac
+    return 0
+}
+
+# 建立本地替身目录与替换边界；容器内路径映射到替身目录，绝不触碰真实 daemon。
+tls_env() {
+    TLS_DIR=$(mktemp -d)
+    TLS_ASSETS=$TLS_DIR/assets
+    mkdir -p "$TLS_ASSETS/upstream" "$TLS_ASSETS/proxy" "$TLS_DIR/ca" "$TLS_DIR/scenario" "$TLS_DIR/ledger"
+    MAPPING_ASSET_ROOT=$TLS_ASSETS
+    MAPPING_LEDGER_DIR=$TLS_DIR/ledger
+    RESOURCE_LEDGER_DIR=$TLS_DIR/ledger
+    unset IT_EVIDENCE_DIR
+    profile_write "$TLS_DIR/profile.tsv"
+    mapping_fixture_docker() { tls_docker "$@"; }
+    resource_docker() { tls_docker "$@"; }
+    # 资产生成以本地 openssl 执行；资产卷写入与 CA 发布同样落在替身目录。
+    mapping_fixture_asset_exec() {
+        MAPPING_ASSET_ROOT=$TLS_ASSETS MAPPING_UPSTREAM_HOST=$MAPPING_UPSTREAM_HOST \
+            MAPPING_PROXY_HOST=$MAPPING_PROXY_HOST MAPPING_UPSTREAM_HEALTH=$MAPPING_UPSTREAM_HEALTH \
+            sh -c "$1"
+    }
+    mapping_fixture_asset_write() {
+        printf '%s' "$2" > "$TLS_ASSETS/$1" || return 1
+        chmod 755 "$TLS_ASSETS/$1"
+    }
+    mapping_fixture_ca_publish() {
+        cp "$TLS_ASSETS/upstream/tls/ca.crt" "$TLS_DIR/ca/upstream-ca.crt" || return 1
+        cp "$TLS_ASSETS/proxy/tls/ca.crt" "$TLS_DIR/ca/proxy-ca.crt" || return 1
+    }
+    return 0
+}
+
+# 完整 tls 契约环境：资产准备 + 夹具启动，并预置两端口独立计数文件与 CONNECT 日志。
+tls_setup() {
+    tls_env || return 1
+    mapping_assets_prepare "$TLS_DIR/profile.tsv" "$TLS_SCENARIO_ID" product "$TLS_DIR/ledger" || {
+        printf 'mapping_assets_prepare failed\n'
+        return 1
+    }
+    mkdir -p "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID"
+    printf '0\n' > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/accept.count"
+    printf '0\n' > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/reject.count"
+    : > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/connect.log"
+    mapping_fixture_start "$TLS_DIR/profile.tsv" "$TLS_SCENARIO_ID" product tools || {
+        printf 'mapping_fixture_start failed\n'
+        return 1
+    }
+    return 0
+}
+
+# 以给定 CA 生成负例叶证书（本任务用于校验判据本身）。
+tls_make_leaf() {
+    local out=$1 cn=$2 san=$3 ca=$4 ca_key=$5
+    mkdir -p "$out" || return 1
+    openssl req -newkey rsa:2048 -nodes -subj "/CN=$cn" -keyout "$out/leaf.key" -out "$out/leaf.csr" >/dev/null 2>&1 || return 1
+    printf 'basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:%s\n' "$san" > "$out/leaf.ext"
+    openssl x509 -req -in "$out/leaf.csr" -CA "$ca" -CAkey "$ca_key" -CAcreateserial -days 2 \
+        -extfile "$out/leaf.ext" -out "$out/leaf.crt" >/dev/null 2>&1 || return 1
+    rm -f "$out/leaf.csr" "$out/leaf.ext" "$out/leaf.srl"
+    return 0
+}
+
+# 四类 TLS 负例的接线与判据：分层判定必须可区分，且失败层不得被校准认作成功。
+tls_negative_case() {
+    local expect_verdict=$1 grow=$2 probe_fail=$3
+    local failed=0 rc=0 scenario_dir before after verdict probe_rc=0
+    tls_setup || return 1
+    scenario_dir=$TLS_DIR/scenario
+    mapping_fixture_state_load || { printf 'fixture state unreadable\n'; return 1; }
+    before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 1
+    mapping_proxy_probe_accept() {
+        if [[ $grow == 1 ]]; then
+            printf '%s\n' "$((before + 1))" > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/accept.count"
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n' \
+                >> "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/connect.log"
+        fi
+        printf 'curl: (%s) TLS failure before CONNECT\n' "$probe_fail" > "$scenario_dir/proxy.probe-accept"
+        return "$probe_fail"
+    }
+    mapping_proxy_probe_reject() { return 0; }
+    mapping_proxy_probe_accept "$scenario_dir" || probe_rc=$?
+    printf 'NEGATIVE_PROBE_EXIT=%s EXPECT=%s\n' "$probe_rc" "$probe_fail"
+    [[ $probe_rc == "$probe_fail" ]] || { printf 'probe exit %s != %s\n' "$probe_rc" "$probe_fail"; failed=1; }
+    after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 1
+    verdict=$(mapping_proxy_layer_verdict "$before" "$after" "$probe_rc") || { printf 'layer verdict rejected\n'; return 1; }
+    printf 'TLS_LAYER=%s CONNECT_BEFORE=%s CONNECT_AFTER=%s\n' "$verdict" "$before" "$after"
+    [[ $verdict == "$expect_verdict" ]] || { printf 'layer verdict %s != %s\n' "$verdict" "$expect_verdict"; failed=1; }
+    if [[ $grow == 1 ]]; then
+        ((after > before)) || { printf 'legal CONNECT not observed\n'; failed=1; }
+    else
+        [[ $after == "$before" ]] || { printf 'CONNECT grew without outer TLS success\n'; failed=1; }
+    fi
+    rc=0
+    mapping_proxy_calibrate "$scenario_dir" || rc=$?
+    printf 'CALIBRATE_EXIT=%s\n' "$rc"
+    [[ $rc == 80 ]] || { printf 'failed TLS layer still calibrated: %s\n' "$rc"; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 接受端口只在拨号成功后回 200，且拨号目的只能是冻结地址 U:443。
+proxy_accept_dials_frozen_u() {
+    local dir failed=0 rc=0
+    dir=$(mktemp -d)
+    printf '0\n' > "$dir/accept.count"
+    : > "$dir/dials"
+    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_dial() { printf '%s:%s\n' "$1" "$2" >> "$dir/dials"; return 0; }
+    mapping_proxy_relay() { return 0; }
+    printf 'CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n' \
+        | mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" 140.82.112.11 accept || rc=$?
+    printf 'ACCEPT_SERVE_EXIT=%s\n' "$rc"
+    [[ $rc == 0 ]] || failed=1
+    [[ $(cat "$dir/dials") == '140.82.112.11:443' ]] || { printf 'dial target not frozen U:443: %s\n' "$(cat "$dir/dials")"; failed=1; }
+    [[ $(cat "$dir/replies") == *'200 Connection Established'* ]] || { printf 'accept port did not return 200\n'; failed=1; }
+    [[ $(cat "$dir/accept.count") == 1 ]] || { printf 'accept counter not incremented\n'; failed=1; }
+    grep -q $'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443' "$dir/connect.log" \
+        || { printf 'connect evidence missing frozen U\n'; failed=1; }
+    # 拨号地址只能是字面量：主机名上游必须在拨号前被拒绝。
+    : > "$dir/dials"
+    rc=0
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" github.com accept >/dev/null 2>&1 || rc=$?
+    printf 'HOSTNAME_DIAL_EXIT=%s\n' "$rc"
+    [[ $rc != 0 ]] || { printf 'hostname upstream accepted\n'; failed=1; }
+    [[ ! -s $dir/dials ]] || { printf 'dial attempted for hostname upstream\n'; failed=1; }
+    rm -rf "$dir"
+    return "$failed"
+}
+
+# 拒绝端口对合法 CONNECT 计数并回 403，绝不拨号；两端口计数文件相互独立并求和保存。
+proxy_reject_never_dials() {
+    local dir failed=0 rc=0
+    dir=$(mktemp -d)
+    printf '0\n' > "$dir/reject.count"
+    printf '0\n' > "$dir/accept.count"
+    : > "$dir/dials"
+    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_dial() { printf '%s:%s\n' "$1" "$2" >> "$dir/dials"; return 0; }
+    mapping_proxy_relay() { return 0; }
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | mapping_proxy_serve 8444 "$dir/cert" "$dir/key" "$dir/reject.count" 140.82.112.11 reject || rc=$?
+    printf 'REJECT_SERVE_EXIT=%s\n' "$rc"
+    [[ $rc == 0 ]] || failed=1
+    [[ $(cat "$dir/replies") == *'403 Forbidden'* ]] || { printf 'reject port did not return 403\n'; failed=1; }
+    [[ ! -s $dir/dials ]] || { printf 'reject port dialed upstream\n'; failed=1; }
+    [[ $(cat "$dir/reject.count") == 1 ]] || { printf 'reject counter not incremented\n'; failed=1; }
+    grep -q $'authority=github.com:443\tmode=reject\tdial_target=-' "$dir/connect.log" \
+        || { printf 'reject evidence missing\n'; failed=1; }
+    : > "$dir/replies"
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" 140.82.112.11 accept || rc=$?
+    [[ $(cat "$dir/accept.count") == 1 && $(cat "$dir/reject.count") == 1 ]] \
+        || { printf 'port counters are not independent\n'; failed=1; }
+    mapping_proxy_baseline_write "$dir" 1 1 || failed=1
+    [[ $(mapping_proxy_baseline_total "$dir/proxy.before") == 2 ]] || { printf 'baseline sum wrong\n'; failed=1; }
+    rm -rf "$dir"
+    return "$failed"
+}
+
+# 非精确 authority（含错误端口）一律 502 且不拨号，两个模式都如此。
+proxy_other_authority_never_dials() {
+    local dir failed=0 rc=0 spec mode port target
+    dir=$(mktemp -d)
+    : > "$dir/dials"
+    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_dial() { printf '%s:%s\n' "$1" "$2" >> "$dir/dials"; return 0; }
+    mapping_proxy_relay() { return 0; }
+    for spec in \
+        'accept 8443 example.test:443' \
+        'accept 8443 github.com:8443' \
+        'accept 8443 140.82.112.11:443' \
+        'reject 8444 example.test:443' \
+        'reject 8444 github.com:8443'; do
+        read -r mode port target <<< "$spec"
+        printf '0\n' > "$dir/count"
+        : > "$dir/replies"
+        : > "$dir/dials"
+        rc=0
+        printf 'CONNECT %s HTTP/1.1\r\n\r\n' "$target" \
+            | mapping_proxy_serve "$port" "$dir/cert" "$dir/key" "$dir/count" 140.82.112.11 "$mode" || rc=$?
+        printf 'OTHER_AUTHORITY mode=%s target=%s EXIT=%s\n' "$mode" "$target" "$rc"
+        [[ $rc == 0 ]] || failed=1
+        [[ $(cat "$dir/replies") == *'502 Bad Gateway'* ]] || { printf 'authority %s not rejected with 502\n' "$target"; failed=1; }
+        [[ ! -s $dir/dials ]] || { printf 'authority %s dialed upstream\n' "$target"; failed=1; }
+        [[ $(cat "$dir/count") == 1 ]] || { printf 'authority %s not counted as attempt\n' "$target"; failed=1; }
+    done
+    rm -rf "$dir"
+    return "$failed"
+}
+
+# 代理读数损坏或缺失必须失败：进程侧返回 80，校准侧一律 80 且绝不默认成 0。
+proxy_bad_count_fails() {
+    local dir failed=0 rc=0 scenario_dir
+    dir=$(mktemp -d)
+    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_dial() { return 0; }
+    mapping_proxy_relay() { return 0; }
+    printf 'not-a-number\n' > "$dir/accept.count"
+    rc=0
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" 140.82.112.11 accept >/dev/null 2>&1 || rc=$?
+    printf 'CORRUPT_COUNT_EXIT=%s\n' "$rc"
+    [[ $rc == 80 ]] || { printf 'corrupt counter not rejected with 80\n'; failed=1; }
+    [[ ! -e $dir/replies ]] || { printf 'corrupt counter still served\n'; failed=1; }
+    printf -- '-1\n' > "$dir/accept.count"
+    rc=0
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" 140.82.112.11 accept >/dev/null 2>&1 || rc=$?
+    printf 'NEGATIVE_COUNT_EXIT=%s\n' "$rc"
+    [[ $rc == 80 ]] || { printf 'negative counter not rejected with 80\n'; failed=1; }
+    rm -rf "$dir"
+    tls_setup || { printf 'tls setup failed\n'; return 1; }
+    scenario_dir=$TLS_DIR/scenario
+    mapping_proxy_probe_accept() { printf 'mapping-upstream-ok\n' > "$scenario_dir/proxy.probe-accept"; return 0; }
+    mapping_proxy_probe_reject() { printf '403 Forbidden\n' > "$scenario_dir/proxy.probe-reject"; return 0; }
+    printf 'broken\n' > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/accept.count"
+    rc=0
+    mapping_proxy_calibrate "$scenario_dir" || rc=$?
+    printf 'CALIBRATE_CORRUPT_EXIT=%s\n' "$rc"
+    [[ $rc == 80 ]] || { printf 'corrupt read accepted by calibrate\n'; failed=1; }
+    printf '0\n' > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/accept.count"
+    rm -f "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/reject.count"
+    rc=0
+    mapping_proxy_calibrate "$scenario_dir" || rc=$?
+    printf 'CALIBRATE_MISSING_EXIT=%s\n' "$rc"
+    [[ $rc == 80 ]] || { printf 'missing counter accepted by calibrate\n'; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 客户端信任分离两条链：根证书互不相同、SAN 各自匹配、证书不得跨链验证、客户端卷只含公开 CA。
+client_trust_separates_two_ca() {
+    local failed=0 line extra fp_up fp_px up_ca px_ca
+    tls_setup || { printf 'tls setup failed\n'; return 1; }
+    up_ca=$TLS_DIR/ca/upstream-ca.crt
+    px_ca=$TLS_DIR/ca/proxy-ca.crt
+    [[ -f $up_ca && -f $px_ca ]] || { printf 'client CA files missing\n'; failed=1; }
+    fp_up=$(mapping_cert_fingerprint "$up_ca") || failed=1
+    fp_px=$(mapping_cert_fingerprint "$px_ca") || failed=1
+    printf 'UPSTREAM_CA=%s\nPROXY_CA=%s\n' "$fp_up" "$fp_px"
+    [[ -n $fp_up && -n $fp_px && $fp_up != "$fp_px" ]] || { printf 'two roots are not distinct\n'; failed=1; }
+    extra=$(ls -A "$TLS_DIR/ca" | grep -v -x -e upstream-ca.crt -e proxy-ca.crt || true)
+    [[ -z $extra ]] || { printf 'client CA volume carries extra material: %s\n' "$extra"; failed=1; }
+    if grep -rlq 'PRIVATE KEY' "$TLS_DIR/ca" 2>/dev/null; then printf 'client CA volume carries a private key\n'; failed=1; fi
+    mapping_cert_san_has "$TLS_ASSETS/upstream/tls/srv.crt" github.com || { printf 'upstream SAN missing github.com\n'; failed=1; }
+    mapping_cert_san_has "$TLS_ASSETS/proxy/tls/srv.crt" gm-proxy || { printf 'proxy SAN missing gm-proxy\n'; failed=1; }
+    if mapping_cert_san_has "$TLS_ASSETS/proxy/tls/srv.crt" github.com; then printf 'proxy cert claims github.com\n'; failed=1; fi
+    mapping_cert_verifies_with "$TLS_ASSETS/upstream/tls/srv.crt" "$up_ca" || { printf 'upstream chain not verifiable\n'; failed=1; }
+    if mapping_cert_verifies_with "$TLS_ASSETS/upstream/tls/srv.crt" "$px_ca"; then printf 'upstream cert accepted by proxy CA\n'; failed=1; fi
+    mapping_cert_verifies_with "$TLS_ASSETS/proxy/tls/srv.crt" "$px_ca" || { printf 'proxy chain not verifiable\n'; failed=1; }
+    if mapping_cert_verifies_with "$TLS_ASSETS/proxy/tls/srv.crt" "$up_ca"; then printf 'proxy cert accepted by upstream CA\n'; failed=1; fi
+    [[ -f $TLS_ASSETS/upstream/tls/ca.key && -f $TLS_ASSETS/proxy/tls/ca.key ]] || { printf 'fixture CA keys missing\n'; failed=1; }
+    [[ ! -e $TLS_DIR/ca/upstream-ca.key && ! -e $TLS_DIR/ca/proxy-ca.key ]] || { printf 'client CA volume carries a CA key\n'; failed=1; }
+    [[ -x $TLS_ASSETS/proxy/proxy.sh ]] || { printf 'proxy script missing in asset volume\n'; failed=1; }
+    grep -q 'mapping_proxy_serve "\$@"' "$TLS_ASSETS/proxy/proxy.sh" || { printf 'proxy script does not reuse fixture body\n'; failed=1; }
+    line=$(grep -m1 -- '--name gm-mtest-upstream' "$TLS_DIR/docker.calls") || failed=1
+    printf 'UPSTREAM_RUN=%s\n' "$line"
+    case "$line" in
+        *'--network-alias github.com'*) printf 'upstream carries github.com alias\n'; failed=1 ;;
+        *"-v gm-mtest-mapping-assets:$MAPPING_ASSET_ROOT:ro"*) ;;
+        *) printf 'upstream asset mount wrong\n'; failed=1 ;;
+    esac
+    case "$line" in
+        *'mapping-ca'*) printf 'upstream mounts the client CA volume\n'; failed=1 ;;
+    esac
+    line=$(grep -m1 -- '--name gm-mtest-proxy' "$TLS_DIR/docker.calls") || failed=1
+    printf 'PROXY_RUN=%s\n' "$line"
+    case "$line" in
+        *"-v gm-mtest-mapping-assets:$MAPPING_ASSET_ROOT "*|*"-v gm-mtest-mapping-assets:$MAPPING_ASSET_ROOT --entrypoint"*) ;;
+        *) printf 'proxy asset mount wrong\n'; failed=1 ;;
+    esac
+    case "$line" in
+        *'mapping-ca'*) printf 'proxy mounts the client CA volume\n'; failed=1 ;;
+    esac
+    line=$(grep -m1 -- '--name gm-mtest-probe' "$TLS_DIR/docker.calls") || failed=1
+    printf 'PROBE_RUN=%s\n' "$line"
+    case "$line" in
+        *"-v gm-mtest-mapping-ca:$MAPPING_CA_MOUNT:ro"*) ;;
+        *) printf 'probe does not mount only the public CA volume\n'; failed=1 ;;
+    esac
+    case "$line" in
+        *'mapping-assets'*) printf 'probe mounts private asset volume\n'; failed=1 ;;
+    esac
+    # 代理端口由独立计数文件承载：接受端口用 accept.count，拒绝端口用 reject.count。
+    grep -q "proxy.sh $MAPPING_PROXY_ACCEPT_PORT $MAPPING_ASSET_ROOT/proxy/tls/srv.crt $MAPPING_ASSET_ROOT/proxy/tls/srv.key $MAPPING_ASSET_ROOT/proxy/scenarios/$TLS_SCENARIO_ID/accept.count" \
+        "$TLS_DIR/docker.calls" || { printf 'accept port counter wiring wrong\n'; failed=1; }
+    grep -q "proxy.sh $MAPPING_PROXY_REJECT_PORT $MAPPING_ASSET_ROOT/proxy/tls/srv.crt $MAPPING_ASSET_ROOT/proxy/tls/srv.key $MAPPING_ASSET_ROOT/proxy/scenarios/$TLS_SCENARIO_ID/reject.count" \
+        "$TLS_DIR/docker.calls" || { printf 'reject port counter wiring wrong\n'; failed=1; }
+    # 受控 DNS：gm-proxy 指向 X，其余名称不可解析，不递归。
+    grep -q -- "--address=/gm-proxy/140.82.112.12" "$TLS_DIR/docker.calls" || { printf 'controlled DNS mapping missing\n'; failed=1; }
+    grep -q -- '--address=/#/' "$TLS_DIR/docker.calls" || { printf 'controlled DNS catch-all missing\n'; failed=1; }
+    grep -q -- '--no-resolv' "$TLS_DIR/docker.calls" || { printf 'controlled DNS recurses upstream\n'; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 外层 TLS：代理证书由不受信任的 CA 签发，链校验失败 → CONNECT 不增长、校准拒绝。
+wrong_proxy_ca() {
+    local failed=0 dir
+    tls_setup || return 1
+    dir=$TLS_DIR/neg
+    mkdir -p "$dir"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=GM-Mapping-Untrusted-CA \
+        -addext 'basicConstraints=critical,CA:TRUE' -keyout "$dir/ca.key" -out "$dir/ca.crt" >/dev/null 2>&1 || failed=1
+    tls_make_leaf "$dir" gm-proxy gm-proxy "$dir/ca.crt" "$dir/ca.key" || failed=1
+    mapping_cert_san_has "$dir/leaf.crt" gm-proxy || { printf 'negative proxy cert lost its SAN\n'; failed=1; }
+    if mapping_cert_verifies_with "$dir/leaf.crt" "$TLS_DIR/ca/proxy-ca.crt"; then
+        printf 'untrusted proxy CA still verified\n'
+        failed=1
+    fi
+    printf 'PROXY_CA_NEG_VERIFY_FAILED=1\n'
+    rm -rf "$TLS_DIR"
+    [[ $failed == 0 ]] || return 1
+    tls_negative_case outer-failure 0 60
+}
+
+# 外层 TLS：代理 SAN 不匹配 gm-proxy，主机名校验失败 → CONNECT 不增长、校准拒绝。
+wrong_proxy_san() {
+    local failed=0 dir
+    tls_setup || return 1
+    dir=$TLS_DIR/neg
+    tls_make_leaf "$dir" gm-proxy other-host.test "$TLS_ASSETS/proxy/tls/ca.crt" "$TLS_ASSETS/proxy/tls/ca.key" || failed=1
+    if mapping_cert_san_has "$dir/leaf.crt" gm-proxy; then printf 'negative SAN accepted for gm-proxy\n'; failed=1; fi
+    mapping_cert_verifies_with "$dir/leaf.crt" "$TLS_DIR/ca/proxy-ca.crt" || { printf 'proxy CA chain must still verify\n'; failed=1; }
+    printf 'PROXY_SAN_NEG_REJECTED=1\n'
+    rm -rf "$TLS_DIR"
+    [[ $failed == 0 ]] || return 1
+    tls_negative_case outer-failure 0 60
+}
+
+# 内层 TLS：上游证书由不受信任的 CA 签发 → 有合法 CONNECT 但内层获取失败、校准拒绝。
+wrong_upstream_ca() {
+    local failed=0 dir
+    tls_setup || return 1
+    dir=$TLS_DIR/neg
+    mkdir -p "$dir"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=GM-Mapping-Untrusted-Upstream-CA \
+        -addext 'basicConstraints=critical,CA:TRUE' -keyout "$dir/ca.key" -out "$dir/ca.crt" >/dev/null 2>&1 || failed=1
+    tls_make_leaf "$dir" github.com github.com "$dir/ca.crt" "$dir/ca.key" || failed=1
+    mapping_cert_san_has "$dir/leaf.crt" github.com || { printf 'negative upstream cert lost its SAN\n'; failed=1; }
+    if mapping_cert_verifies_with "$dir/leaf.crt" "$TLS_DIR/ca/upstream-ca.crt"; then
+        printf 'untrusted upstream CA still verified\n'
+        failed=1
+    fi
+    printf 'UPSTREAM_CA_NEG_VERIFY_FAILED=1\n'
+    rm -rf "$TLS_DIR"
+    [[ $failed == 0 ]] || return 1
+    tls_negative_case inner-failure 1 60
+}
+
+# 内层 TLS：上游 SAN 不匹配 github.com → 有合法 CONNECT 但内层获取失败、校准拒绝。
+wrong_upstream_san() {
+    local failed=0 dir
+    tls_setup || return 1
+    dir=$TLS_DIR/neg
+    tls_make_leaf "$dir" github.com other-host.test "$TLS_ASSETS/upstream/tls/ca.crt" "$TLS_ASSETS/upstream/tls/ca.key" || failed=1
+    if mapping_cert_san_has "$dir/leaf.crt" github.com; then printf 'negative SAN accepted for github.com\n'; failed=1; fi
+    mapping_cert_verifies_with "$dir/leaf.crt" "$TLS_DIR/ca/upstream-ca.crt" || { printf 'upstream CA chain must still verify\n'; failed=1; }
+    printf 'UPSTREAM_SAN_NEG_REJECTED=1\n'
+    rm -rf "$TLS_DIR"
+    [[ $failed == 0 ]] || return 1
+    tls_negative_case inner-failure 1 60
+}
+
 mkdir -p "$WORK/profile"
 profile_write "$WORK/profile/base.tsv"
 
+MAPPING_NETWORK_TESTS='mapping_profile_rejects_conflict
+mapping_extra_attachment_rejected
+mapping_requires_ready
+mapping_rule_keys_exact
+mapping_counter_missing_or_duplicate_fails
+mapping_witness_pause_detected
+mapping_network_create_registers
+mapping_isolation_check_behavior
+mapping_run_id_binding
+mapping_snapshot_requires_ready'
+
+MAPPING_TLS_TESTS='proxy_accept_dials_frozen_u
+proxy_reject_never_dials
+proxy_other_authority_never_dials
+proxy_bad_count_fails
+client_trust_separates_two_ca
+wrong_proxy_ca
+wrong_proxy_san
+wrong_upstream_ca
+wrong_upstream_san'
+
+case "${1:-all}" in
+    network) TESTS=$MAPPING_NETWORK_TESTS ;;
+    tls-proxy) TESTS=$MAPPING_TLS_TESTS ;;
+    all) TESTS="$MAPPING_NETWORK_TESTS
+$MAPPING_TLS_TESTS" ;;
+    *)
+        printf 'unknown subset: %s\n' "$1" >&2
+        exit 2
+        ;;
+esac
+
 failed=0
-for name in \
-    mapping_profile_rejects_conflict \
-    mapping_extra_attachment_rejected \
-    mapping_requires_ready \
-    mapping_rule_keys_exact \
-    mapping_counter_missing_or_duplicate_fails \
-    mapping_witness_pause_detected \
-    mapping_network_create_registers \
-    mapping_isolation_check_behavior \
-    mapping_run_id_binding \
-    mapping_snapshot_requires_ready; do
+for name in $TESTS; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

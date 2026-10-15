@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Mapping 独立网络与策略夹具（网络部分）。
-# 冻结地址档案、独立映射网络、按角色的附件/地址/安全校验、封闭拒绝策略与两端计数解析。
-# 双 CA、代理与 DNS 资产属后续任务；本文件不安装真实规则、不启动业务进程。
+# Mapping 独立网络、策略与双 CA 夹具。
+# 冻结地址档案、独立映射网络、按角色的附件/地址/安全校验、封闭拒绝策略与两端计数解析；
+# 双 CA 资产、CONNECT 直拨 U 的代理循环、受控 DNS 与非递归解析。
+# 本文件不安装真实规则、不启动业务进程。
 
 MAPPING_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 只读复用产品公网地址校验器，绝不改写或放宽校验规则。
@@ -191,17 +192,24 @@ mapping_profile_load() {
     return 0
 }
 
-# 运行状态文件：创建后追加不可变 network ID，不反写输入档案。
-mapping_network_state_file() {
+# 状态目录：优先证据控制目录，其次映射账本目录；两处都不存在即拒绝。
+mapping_state_dir() {
     if [[ -n ${IT_EVIDENCE_DIR:-} ]]; then
-        printf '%s\n' "$IT_EVIDENCE_DIR/control/mapping-network.tsv"
+        printf '%s\n' "$IT_EVIDENCE_DIR/control"
         return 0
     fi
     if [[ -n ${MAPPING_LEDGER_DIR:-} ]]; then
-        printf '%s\n' "$MAPPING_LEDGER_DIR/mapping-network.tsv"
+        printf '%s\n' "$MAPPING_LEDGER_DIR"
         return 0
     fi
     return 1
+}
+
+# 运行状态文件：创建后追加不可变 network ID，不反写输入档案。
+mapping_network_state_file() {
+    local dir
+    dir=$(mapping_state_dir) || return 1
+    printf '%s\n' "$dir/mapping-network.tsv"
 }
 
 # 读取已冻结的本轮 network ID（缺失返回非零）。
@@ -437,4 +445,650 @@ mapping_isolation_check() {
         [[ $ca -gt $cb ]] || return 1
     done
     return 0
+}
+
+# 双 CA、代理与 DNS 契约参数（接口 D）。
+MAPPING_FIXTURE_MOUNT='/var/lib/git-daemon'
+MAPPING_ASSET_ROOT="$MAPPING_FIXTURE_MOUNT"
+MAPPING_CA_MOUNT='/ca'
+MAPPING_SCENARIO_RE='^mapping-[a-z0-9-]{1,32}$'
+MAPPING_UPSTREAM_HOST='github.com'
+MAPPING_PROXY_HOST='gm-proxy'
+MAPPING_UPSTREAM_PORT=443
+MAPPING_PROXY_ACCEPT_PORT=8443
+MAPPING_PROXY_REJECT_PORT=8444
+MAPPING_PROXY_AUTHORITY="$MAPPING_UPSTREAM_HOST:$MAPPING_UPSTREAM_PORT"
+MAPPING_PROXY_MODES='accept reject'
+MAPPING_UPSTREAM_HEALTH='mapping-upstream-ok'
+MAPPING_CLIENT_UPSTREAM_CA="$MAPPING_CA_MOUNT/upstream-ca.crt"
+MAPPING_CLIENT_PROXY_CA="$MAPPING_CA_MOUNT/proxy-ca.crt"
+MAPPING_ASSET_VOLUME_ROLE='assets'
+MAPPING_CA_VOLUME_ROLE='ca'
+MAPPING_SAFE_OPTIONS='--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges --sysctl net.ipv6.conf.all.disable_ipv6=1'
+MAPPING_FAILURE=80
+MAPPING_USAGE=2
+
+# 夹具只读字段，由 mapping_fixture_state_load 填充。
+MPF_RUN_ID=''
+MPF_SCENARIO=''
+MPF_PRODUCT_IMAGE=''
+MPF_TOOLS_IMAGE=''
+MPF_UPSTREAM_IP=''
+
+# 夹具状态文件：只追加冻结状态，不反写输入档案。
+mapping_fixture_state_file() {
+    local dir
+    dir=$(mapping_state_dir) || return 1
+    printf '%s\n' "$dir/mapping-fixture.tsv"
+}
+
+# 追加一条冻结状态。
+mapping_fixture_state_write() {
+    local key=${1:-} value=${2:-} file
+    [[ -n $key && -n $value ]] || return 1
+    [[ $value != *$'\t'* && $value != *$'\n'* ]] || return 1
+    file=$(mapping_fixture_state_file) || return 1
+    mkdir -p "$(dirname -- "$file")" || return 1
+    printf '%s\t%s\n' "$key" "$value" >> "$file"
+}
+
+# 严格读取夹具状态：每键恰好一次、无未知键、值非空，缺项一律非零。
+mapping_fixture_state_load() {
+    local file line key value
+    file=$(mapping_fixture_state_file) || return 1
+    [[ -f $file && ! -L $file && -r $file ]] || return 1
+    MPF_RUN_ID='' MPF_SCENARIO='' MPF_PRODUCT_IMAGE='' MPF_TOOLS_IMAGE='' MPF_UPSTREAM_IP=''
+    while IFS=$'\t' read -r key value || [[ -n $key ]]; do
+        [[ -n $key && -n $value && $value != *$'\t'* ]] || return 1
+        case "$key" in
+            run_id) [[ -z $MPF_RUN_ID ]] || return 1; MPF_RUN_ID=$value ;;
+            scenario) [[ -z $MPF_SCENARIO ]] || return 1; MPF_SCENARIO=$value ;;
+            product_image) [[ -z $MPF_PRODUCT_IMAGE ]] || return 1; MPF_PRODUCT_IMAGE=$value ;;
+            tools_image) [[ -z $MPF_TOOLS_IMAGE ]] || return 1; MPF_TOOLS_IMAGE=$value ;;
+            upstream_ip) [[ -z $MPF_UPSTREAM_IP ]] || return 1; MPF_UPSTREAM_IP=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ $MPF_RUN_ID =~ ^[A-Za-z0-9-]{1,32}$ ]] || return 1
+    mapping_scenario_valid "$MPF_SCENARIO" || return 1
+    [[ -n $MPF_PRODUCT_IMAGE && -n $MPF_TOOLS_IMAGE ]] || return 1
+    mapping_proxy_upstream_literal "$MPF_UPSTREAM_IP" || return 1
+    return 0
+}
+
+# 场景标识形状：固定前缀加安全分量，负例以其独立后缀表达。
+mapping_scenario_valid() {
+    [[ ${1:-} =~ $MAPPING_SCENARIO_RE ]]
+}
+
+# 本轮 run id：优先夹具冻结状态，其次冻结档案字段。
+mapping_fixture_run_id() {
+    if [[ -n ${MPF_RUN_ID:-} ]]; then printf '%s\n' "$MPF_RUN_ID"; return 0; fi
+    if [[ -n ${MP_RUN_ID:-} ]]; then printf '%s\n' "$MP_RUN_ID"; return 0; fi
+    return 1
+}
+
+# Docker 外部边界：优先统一端点包装器，缺库时退回命令行。
+mapping_fixture_docker() {
+    if declare -F validation_docker >/dev/null 2>&1; then
+        validation_docker "$@"
+        return $?
+    fi
+    command docker "$@"
+}
+
+# 资产卷与客户端 CA 卷名；客户端 CA 卷名固定，供产品 /ca 挂载核验。
+mapping_assets_volume() {
+    printf 'gm-%s-mapping-assets\n' "$(mapping_fixture_run_id)"
+}
+
+mapping_ca_volume() {
+    printf 'gm-%s-mapping-ca\n' "$(mapping_fixture_run_id)"
+}
+
+# 夹具容器名：上游 U、代理 X、DNS D、校准探针 P。
+mapping_upstream_container() { printf 'gm-%s-upstream\n' "$(mapping_fixture_run_id)"; }
+mapping_proxy_container() { printf 'gm-%s-proxy\n' "$(mapping_fixture_run_id)"; }
+mapping_dns_container() { printf 'gm-%s-dns\n' "$(mapping_fixture_run_id)"; }
+mapping_probe_container() { printf 'gm-%s-probe\n' "$(mapping_fixture_run_id)"; }
+
+# 单一场景下的代理计数文件与 CONNECT 日志路径；两个端口各用独立计数文件。
+mapping_proxy_count_path() {
+    local scenario=${1:-} port=${2:-} name
+    mapping_scenario_valid "$scenario" || return 1
+    case "$port" in
+        "$MAPPING_PROXY_ACCEPT_PORT") name=accept ;;
+        "$MAPPING_PROXY_REJECT_PORT") name=reject ;;
+        *) return 1 ;;
+    esac
+    printf '%s/proxy/scenarios/%s/%s.count\n' "$MAPPING_ASSET_ROOT" "$scenario" "$name"
+}
+
+mapping_proxy_log_path() {
+    local scenario=${1:-}
+    mapping_scenario_valid "$scenario" || return 1
+    printf '%s/proxy/scenarios/%s/connect.log\n' "$MAPPING_ASSET_ROOT" "$scenario"
+}
+
+# 拨号地址必须是 IPv4 字面量：拒绝主机名，杜绝代理侧对 CONNECT 目标做 DNS 解析。
+mapping_proxy_upstream_literal() {
+    local ip=${1:-} octet
+    local -a parts=()
+    [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a parts <<< "$ip"
+    for octet in "${parts[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    return 0
+}
+
+# 计数解析：缺失视为新文件起始 0，存在但非非负整数即失败，绝不默认为零。
+mapping_proxy_count_read() {
+    local file=${1:-} raw
+    [[ -n $file ]] || return 1
+    if [[ ! -e $file ]]; then printf '0\n'; return 0; fi
+    [[ -f $file && ! -L $file && -r $file ]] || return 1
+    raw=$(cat -- "$file" 2>/dev/null) || return 1
+    mapping_proxy_count_strict "$raw"
+}
+
+mapping_proxy_count_strict() {
+    local raw=${1:-}
+    [[ $raw =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$raw"
+}
+
+# 计数递增：读改同一文件只允许端口进程内串行；两端口各自文件，绝不同文件并发读改。
+mapping_proxy_count_bump() {
+    local file=${1:-} value
+    value=$(mapping_proxy_count_read "$file") || return 1
+    printf '%s\n' "$((value + 1))" > "$file.new" || return 1
+    mv -- "$file.new" "$file" || return 1
+    return 0
+}
+
+# CONNECT 证据行：只记录 authority、模式与拨号目的，不记录凭据。
+mapping_proxy_record() {
+    local count_file=${1:-} authority=${2:-} mode=${3:-} dial_target=${4:-} log
+    log=$(mapping_proxy_log_path_from_count "$count_file") || return 1
+    printf 'authority=%s\tmode=%s\tdial_target=%s\n' "$authority" "$mode" "$dial_target" >> "$log"
+}
+
+mapping_proxy_log_path_from_count() {
+    local count_file=${1:-}
+    [[ -n $count_file ]] || return 1
+    printf '%s\n' "$(dirname -- "$count_file")/connect.log"
+}
+
+# 响应只写 fd 3（TLS 通道）；200 只在拨号成功后发送。
+mapping_proxy_reply() {
+    case "${1:-}" in
+        200) printf 'HTTP/1.1 200 Connection Established\r\n\r\n' >&3 ;;
+        403) printf 'HTTP/1.1 403 Forbidden\r\n\r\n' >&3 ;;
+        405) printf 'HTTP/1.1 405 Method Not Allowed\r\n\r\n' >&3 ;;
+        502) printf 'HTTP/1.1 502 Bad Gateway\r\n\r\n' >&3 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# 拨号边界：只接受字面量地址，直接连冻结 U:443，不解析 CONNECT 目标主机名。
+mapping_proxy_dial() {
+    local ip=${1:-} port=${2:-}
+    mapping_proxy_upstream_literal "$ip" || return 1
+    [[ $port == "$MAPPING_UPSTREAM_PORT" ]] || return 1
+    exec 4<>"/dev/tcp/$ip/$port"
+}
+
+# 中继边界：内层 TLS 不终结，仅透传字节。
+mapping_proxy_relay() {
+    timeout 60 cat <&4 >&3
+}
+
+# TLS 接受边界：openssl s_server 终结外层 TLS，请求走 fd 0、响应走 fd 3。
+# 真实判定由实机验证；契约测试替换本边界以校验接线与判据。
+mapping_proxy_tls_start() {
+    local port=${1:-} cert=${2:-} key=${3:-} dir=${MAPPING_PROXY_RUNTIME_DIR:-} in_fifo out_fifo
+    [[ -n $port && -n $cert && -n $key && -n $dir ]] || return 1
+    [[ -f $cert && -f $key ]] || return 1
+    mkdir -p "$dir" || return 1
+    rm -f "$dir/in" "$dir/out"
+    mkfifo "$dir/in" "$dir/out" || return 1
+    in_fifo=$dir/in
+    out_fifo=$dir/out
+    openssl s_server -quiet -accept "$port" -cert "$cert" -key "$key" <"$in_fifo" >"$out_fifo" 2>/dev/null &
+    MAPPING_PROXY_TLS_PID=$!
+    exec 3>"$in_fifo"
+    exec 0<"$out_fifo"
+    return 0
+}
+
+# CONNECT 循环：合法 authority 才拨号；拒绝模式与不匹配 authority 一律不拨号。
+mapping_proxy_loop() {
+    local count_file=${1:-} upstream=${2:-} mode=${3:-} line header target dial_target
+    while IFS= read -r line; do
+        line=${line%$'\r'}
+        while IFS= read -r header; do
+            header=${header%$'\r'}
+            [[ -n $header ]] || break
+        done
+        case "$line" in
+            CONNECT\ *) ;;
+            *)
+                mapping_proxy_reply 405 || return "$MAPPING_FAILURE"
+                continue
+                ;;
+        esac
+        target=${line#CONNECT }
+        target=${target%% *}
+        mapping_proxy_count_bump "$count_file" || return "$MAPPING_FAILURE"
+        dial_target='-'
+        if [[ $target != "$MAPPING_PROXY_AUTHORITY" ]]; then
+            mapping_proxy_record "$count_file" "$target" "$mode" "$dial_target" || return "$MAPPING_FAILURE"
+            mapping_proxy_reply 502 || return "$MAPPING_FAILURE"
+            continue
+        fi
+        if [[ $mode != accept ]]; then
+            mapping_proxy_record "$count_file" "$target" "$mode" "$dial_target" || return "$MAPPING_FAILURE"
+            mapping_proxy_reply 403 || return "$MAPPING_FAILURE"
+            continue
+        fi
+        mapping_proxy_record "$count_file" "$target" "$mode" "$upstream:$MAPPING_UPSTREAM_PORT" || return "$MAPPING_FAILURE"
+        if ! mapping_proxy_dial "$upstream" "$MAPPING_UPSTREAM_PORT"; then
+            mapping_proxy_reply 502 || return "$MAPPING_FAILURE"
+            continue
+        fi
+        mapping_proxy_reply 200 || return "$MAPPING_FAILURE"
+        mapping_proxy_relay || true
+    done
+    return 0
+}
+
+# 代理进程入口（接口 D）：读数损坏返回 80，用法错误返回 2。
+# 参数：<端口> <证书> <私钥> <计数文件> <上游地址> <accept|reject>
+mapping_proxy_serve() {
+    local port=${1:-} cert=${2:-} key=${3:-} count_file=${4:-} upstream=${5:-} mode=${6:-}
+    [[ $# == 6 && $port =~ ^[0-9]{1,5}$ && -n $cert && -n $key && -n $count_file ]] || return "$MAPPING_USAGE"
+    case " $MAPPING_PROXY_MODES " in
+        *" $mode "*) ;;
+        *) return "$MAPPING_USAGE" ;;
+    esac
+    mapping_proxy_upstream_literal "$upstream" || return "$MAPPING_USAGE"
+    mkdir -p "$(dirname -- "$count_file")" || return "$MAPPING_FAILURE"
+    [[ -e $count_file ]] || printf '0\n' > "$count_file" || return "$MAPPING_FAILURE"
+    mapping_proxy_count_read "$count_file" >/dev/null || return "$MAPPING_FAILURE"
+    MAPPING_PROXY_RUNTIME_DIR=$(dirname -- "$count_file")/rt
+    mapping_proxy_tls_start "$port" "$cert" "$key" || return "$MAPPING_FAILURE"
+    mapping_proxy_loop "$count_file" "$upstream" "$mode"
+    return $?
+}
+
+# 分层判据：外层 TLS 失败时不得增长；内层 TLS 失败必须有合法 CONNECT 但请求失败。
+mapping_proxy_layer_verdict() {
+    local before=${1:-} after=${2:-} request_exit=${3:-}
+    [[ $before =~ ^[0-9]+$ && $after =~ ^[0-9]+$ && $request_exit =~ ^[0-9]+$ ]] || return 1
+    (( after >= before )) || return 1
+    if (( request_exit == 0 )); then
+        (( after > before )) || return 1
+        printf 'ok\n'
+        return 0
+    fi
+    if (( after > before )); then printf 'inner-failure\n'; return 0; fi
+    printf 'outer-failure\n'
+    return 0
+}
+
+# 资产生成脚本：两条独立签发链、SAN、静态上游健康文件。变量经 env 注入，不写入镜像。
+mapping_asset_script() {
+    cat <<'MAPPING_ASSET'
+set -eu
+umask 022
+R=${MAPPING_ASSET_ROOT:?}
+up=$R/upstream
+px=$R/proxy
+mkdir -p "$up/tls" "$up/web" "$px/tls"
+rm -f "$up/tls"/* "$px/tls"/*
+gen_chain() {
+    dir=$1
+    caname=$2
+    cn=$3
+    san=$4
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=$caname" \
+        -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+        -keyout "$dir/tls/ca.key" -out "$dir/tls/ca.crt" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -subj "/CN=$cn" -keyout "$dir/tls/srv.key" -out "$dir/tls/srv.csr" >/dev/null 2>&1
+    printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s\n' "$san" > "$dir/tls/srv.ext"
+    openssl x509 -req -in "$dir/tls/srv.csr" -CA "$dir/tls/ca.crt" -CAkey "$dir/tls/ca.key" \
+        -CAcreateserial -days 2 -extfile "$dir/tls/srv.ext" -out "$dir/tls/srv.crt" >/dev/null 2>&1
+    rm -f "$dir/tls/srv.csr" "$dir/tls/srv.ext" "$dir/tls/ca.srl"
+}
+gen_chain "$up" GM-Mapping-Upstream-CA "$MAPPING_UPSTREAM_HOST" "$MAPPING_UPSTREAM_HOST"
+gen_chain "$px" GM-Mapping-Proxy-CA "$MAPPING_PROXY_HOST" "$MAPPING_PROXY_HOST"
+printf '%s\n' "${MAPPING_UPSTREAM_HEALTH:?}" > "$up/web/health.txt"
+MAPPING_ASSET
+}
+
+# 代理脚本：由既有函数体生成，避免整块复制到卷内。
+mapping_proxy_script() {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -u\n'
+    printf 'MAPPING_PROXY_AUTHORITY=%q\n' "$MAPPING_PROXY_AUTHORITY"
+    printf 'MAPPING_UPSTREAM_PORT=%q\n' "$MAPPING_UPSTREAM_PORT"
+    printf 'MAPPING_PROXY_MODES=%q\n' "$MAPPING_PROXY_MODES"
+    printf 'MAPPING_FAILURE=%q\n' "$MAPPING_FAILURE"
+    printf 'MAPPING_USAGE=%q\n' "$MAPPING_USAGE"
+    declare -f mapping_proxy_upstream_literal mapping_proxy_count_strict mapping_proxy_count_read \
+        mapping_proxy_count_bump mapping_proxy_log_path_from_count mapping_proxy_record \
+        mapping_proxy_reply mapping_proxy_dial mapping_proxy_relay mapping_proxy_tls_start \
+        mapping_proxy_loop mapping_proxy_serve
+    printf 'mapping_proxy_serve "$@"\n'
+}
+
+# 资产生成容器边界：单个资产卷挂在镜像既有的 10001 属主目录上，脚本以 UID 10001 运行。
+mapping_fixture_asset_exec() {
+    local script=${1:-} image=${2:-}
+    [[ -n $script && -n $image ]] || return 1
+    mapping_fixture_docker run --rm --user 10001:10001 --network none \
+        -e "MAPPING_ASSET_ROOT=$MAPPING_ASSET_ROOT" \
+        -e "MAPPING_UPSTREAM_HOST=$MAPPING_UPSTREAM_HOST" \
+        -e "MAPPING_PROXY_HOST=$MAPPING_PROXY_HOST" \
+        -e "MAPPING_UPSTREAM_HEALTH=$MAPPING_UPSTREAM_HEALTH" \
+        -v "$(mapping_assets_volume):$MAPPING_ASSET_ROOT" --entrypoint /bin/sh "$image" -c "$script"
+}
+
+# 资产卷内写文件边界：内容经标准输入送入容器，不落宿主路径。
+mapping_fixture_asset_write() {
+    local relpath=${1:-} content=${2:-} image=${3:-} status=0
+    [[ -n $relpath && -n $image ]] || return 1
+    printf '%s' "$content" | mapping_fixture_docker run --rm -i --user 10001:10001 --network none \
+        -v "$(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+        -c "umask 022; mkdir -p \"\$(dirname -- '$relpath')\"; cat > '$relpath' && chmod 755 '$relpath'" || status=$?
+    [[ $status == 0 ]] || return 1
+    return 0
+}
+
+# 客户端 CA 卷只发布公开根证书：从资产卷读取证书再写入 CA 卷，私钥绝不进入客户端卷。
+mapping_fixture_ca_publish() {
+    local image=${1:-} spec role source target status=0
+    [[ -n $image ]] || return 1
+    for spec in 'upstream upstream/tls/ca.crt upstream-ca.crt' 'proxy proxy/tls/ca.crt proxy-ca.crt'; do
+        read -r role source target <<< "$spec"
+        mapping_fixture_docker run --rm --user 10001:10001 --network none \
+            -v "$(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT" --entrypoint cat "$image" "$source" \
+            | mapping_fixture_docker run --rm -i --user 10001:10001 --network none \
+                -v "$(mapping_ca_volume):$MAPPING_FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+                -c "umask 022; cat > '$target'" || status=$?
+        [[ $status == 0 ]] || return 1
+        printf 'MAPPING_CA_PUBLISH=%s -> %s\n' "$role" "$target"
+    done
+    return 0
+}
+
+# 资产卷经资源账本创建并登记：账本目录不可解析或身份为空一律拒绝。
+mapping_assets_volumes_create() {
+    local ledger=${1:-} role volume
+    [[ -n $ledger ]] || return 1
+    for role in "$MAPPING_ASSET_VOLUME_ROLE" "$MAPPING_CA_VOLUME_ROLE"; do
+        case "$role" in
+            "$MAPPING_ASSET_VOLUME_ROLE") volume=$(mapping_assets_volume) ;;
+            *) volume=$(mapping_ca_volume) ;;
+        esac
+        RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+        resource_create_register volume "$MAPPING_LEDGER_SCENARIO" "$role" -- \
+            resource_docker volume create \
+            --label "gitdaemon.run=$MP_RUN_ID" \
+            --label "gitdaemon.scenario=$MAPPING_LEDGER_SCENARIO" \
+            --label "gitdaemon.role=$role" \
+            "$volume" || return 1
+        [[ -n $RESOURCE_CREATED_ID ]] || return 1
+    done
+    return 0
+}
+
+# 资产准备（接口 D）：两条独立签发链、SAN、客户端公开 CA 卷与代理脚本。
+# 返回 0 或 80；冻结档案或场景标识非法同样按夹具失败返回。
+mapping_assets_prepare() {
+    local profile=${1:-} scenario=${2:-} product_image=${3:-} ledger=${4:-} script
+    [[ $# == 4 && -n $profile && -n $scenario && -n $product_image && -n $ledger ]] || return "$MAPPING_FAILURE"
+    mapping_scenario_valid "$scenario" || return "$MAPPING_FAILURE"
+    mapping_profile_load "$profile" || return "$MAPPING_FAILURE"
+    mapping_state_dir >/dev/null || return "$MAPPING_FAILURE"
+    mapping_assets_volumes_create "$ledger" || return "$MAPPING_FAILURE"
+    script=$(mapping_asset_script) || return "$MAPPING_FAILURE"
+    mapping_fixture_asset_exec "$script" "$product_image" || return "$MAPPING_FAILURE"
+    mapping_fixture_asset_write 'proxy/proxy.sh' "$(mapping_proxy_script)" "$product_image" || return "$MAPPING_FAILURE"
+    mapping_fixture_ca_publish "$product_image" || return "$MAPPING_FAILURE"
+    mapping_fixture_state_write run_id "$MP_RUN_ID" || return "$MAPPING_FAILURE"
+    mapping_fixture_state_write scenario "$scenario" || return "$MAPPING_FAILURE"
+    mapping_fixture_state_write product_image "$product_image" || return "$MAPPING_FAILURE"
+    return 0
+}
+
+# 受控 DNS 参数：gm-proxy 指向 X，其余（含 github.com）不解析，且不递归外部。
+mapping_dns_daemon_args() {
+    local profile=${1:-}
+    mapping_profile_load "$profile" || return 1
+    printf '%s\n' dnsmasq --keep-in-foreground --no-resolv --no-hosts \
+        "--address=/$MAPPING_PROXY_HOST/$MP_X" '--address=/#/' \
+        --log-queries --log-facility=- --pid-file= --user=git-daemon
+}
+
+# 夹具前置核验：映射网络与两个资产卷必须已存在且身份相符。
+mapping_fixture_precheck() {
+    local name value
+    value=$(mapping_fixture_docker network inspect -f '{{.Name}}' "$MP_NETWORK_NAME" 2>/dev/null) || return 1
+    [[ $value == "$MP_NETWORK_NAME" ]] || return 1
+    for name in "$(mapping_assets_volume)" "$(mapping_ca_volume)"; do
+        value=$(mapping_fixture_docker volume inspect -f '{{.Name}}' "$name" 2>/dev/null) || return 1
+        [[ $value == "$name" ]] || return 1
+    done
+    return 0
+}
+
+# 夹具容器统一经登记边界创建并启动：create 返回身份 → 登记 → start。
+# 参数：<场景> <角色> <docker create 其余参数...>
+mapping_fixture_run() {
+    local scenario=${1:-} role=${2:-} id
+    shift 2
+    [[ -n $scenario && -n $role ]] || return 1
+    RESOURCE_LEDGER_DIR=$(resource_ledger_dir) || return 1
+    RESOURCE_RUN=$MP_RUN_ID
+    resource_create_register container "$scenario" "$role" -- \
+        resource_docker create \
+        --label "gitdaemon.run=$MP_RUN_ID" \
+        --label "gitdaemon.scenario=$scenario" \
+        --label "gitdaemon.role=$role" "$@" || return 1
+    id=$RESOURCE_CREATED_ID
+    [[ -n $id ]] || return 1
+    mapping_fixture_docker start "$id" >/dev/null || return 1
+    printf '%s\n' "$id"
+}
+
+# 等待夹具容器保持运行；短超时即失败。
+mapping_fixture_wait() {
+    local name=$1 i
+    for ((i = 0; i < 20; i++)); do
+        [[ $(mapping_fixture_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null) == true ]] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+# 夹具启动（接口 D）：上游 U（无 github.com 别名）、代理 X（两端口独立计数文件）、
+# 受控 DNS D 与校准探针 P；返回 0 或 80。
+mapping_fixture_start() {
+    local profile=${1:-} scenario=${2:-} product_image=${3:-} tools_image=${4:-}
+    local root="$MAPPING_ASSET_ROOT" accept_count reject_count proxy_cmd dns_args
+    [[ $# == 4 && -n $profile && -n $scenario && -n $product_image && -n $tools_image ]] || return "$MAPPING_FAILURE"
+    mapping_scenario_valid "$scenario" || return "$MAPPING_FAILURE"
+    mapping_profile_load "$profile" || return "$MAPPING_FAILURE"
+    mapping_fixture_precheck || return "$MAPPING_FAILURE"
+    dns_args=$(mapping_dns_daemon_args "$profile") || return "$MAPPING_FAILURE"
+    accept_count=$(mapping_proxy_count_path "$scenario" "$MAPPING_PROXY_ACCEPT_PORT") || return "$MAPPING_FAILURE"
+    reject_count=$(mapping_proxy_count_path "$scenario" "$MAPPING_PROXY_REJECT_PORT") || return "$MAPPING_FAILURE"
+    # 上游：固定地址 U，只读资产卷，绝不带 github.com 网络别名。
+    mapping_fixture_run "$scenario" upstream -d --name "$(mapping_upstream_container)" \
+        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_U" \
+        --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_UPSTREAM_PORT" \
+        -v "$(mapping_assets_volume):$root:ro" --entrypoint /bin/sh "$tools_image" \
+        -c "cd $root/upstream/web && exec openssl s_server -quiet -accept $MAPPING_UPSTREAM_PORT -cert $root/upstream/tls/srv.crt -key $root/upstream/tls/srv.key -WWW" \
+        >/dev/null || return "$MAPPING_FAILURE"
+    # 代理：固定地址 X；接受/拒绝端口各用独立计数文件，同一进程不并发读改同一文件。
+    proxy_cmd="$root/proxy/proxy.sh $MAPPING_PROXY_ACCEPT_PORT $root/proxy/tls/srv.crt $root/proxy/tls/srv.key $accept_count $MP_U accept &"
+    proxy_cmd+=" $root/proxy/proxy.sh $MAPPING_PROXY_REJECT_PORT $root/proxy/tls/srv.crt $root/proxy/tls/srv.key $reject_count $MP_U reject & wait"
+    mapping_fixture_run "$scenario" proxy -d --name "$(mapping_proxy_container)" \
+        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_X" --dns "$MP_D" \
+        -v "$(mapping_assets_volume):$root" --entrypoint /bin/bash "$tools_image" \
+        -c "$proxy_cmd" >/dev/null || return "$MAPPING_FAILURE"
+    # 受控 DNS：gm-proxy → X，github.com 与其他名称均不可解析，不递归外部。
+    mapping_fixture_run "$scenario" dns -d --name "$(mapping_dns_container)" \
+        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_D" \
+        "$tools_image" $dns_args >/dev/null || return "$MAPPING_FAILURE"
+    # 校准探针：无产品时以登记 probe 使用冻结地址 P，只读挂载公开 CA 卷。
+    mapping_fixture_run "$scenario" probe -d --name "$(mapping_probe_container)" \
+        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_P" --dns "$MP_D" \
+        -v "$(mapping_ca_volume):$MAPPING_CA_MOUNT:ro" --entrypoint /bin/sh "$product_image" \
+        -c 'sleep 900' >/dev/null || return "$MAPPING_FAILURE"
+    mapping_fixture_wait "$(mapping_upstream_container)" || return "$MAPPING_FAILURE"
+    mapping_fixture_wait "$(mapping_proxy_container)" || return "$MAPPING_FAILURE"
+    mapping_fixture_wait "$(mapping_dns_container)" || return "$MAPPING_FAILURE"
+    mapping_fixture_wait "$(mapping_probe_container)" || return "$MAPPING_FAILURE"
+    mapping_fixture_state_write tools_image "$tools_image" || return "$MAPPING_FAILURE"
+    mapping_fixture_state_write upstream_ip "$MP_U" || return "$MAPPING_FAILURE"
+    return 0
+}
+
+# 读取单个端口的代理计数：经 docker exec 读卷内文件，缺失/损坏一律非零，绝不默认成 0。
+mapping_proxy_count_read_remote() {
+    local port=${1:-} file raw
+    file=$(mapping_proxy_count_path "$MPF_SCENARIO" "$port") || return 1
+    raw=$(mapping_fixture_docker exec "$(mapping_proxy_container)" cat "$file" 2>/dev/null) || return 1
+    mapping_proxy_count_strict "$raw"
+}
+
+# 接受端口正校准：经 gm-proxy:8443 完成内层 HTTPS 获取，期望 200 且内容匹配。
+# 参数：<场景证据目录>；客户端探针边界可在契约测试中替换。
+mapping_proxy_probe_accept() {
+    local scenario_dir=${1:-} out rc=0
+    [[ -n $scenario_dir && -d $scenario_dir ]] || return 1
+    out=$(mapping_fixture_docker exec "$(mapping_probe_container)" \
+        curl --silent --show-error --fail \
+        --proxy "https://$MAPPING_PROXY_HOST:$MAPPING_PROXY_ACCEPT_PORT" \
+        --proxy-cacert "$MAPPING_CLIENT_PROXY_CA" --cacert "$MAPPING_CLIENT_UPSTREAM_CA" \
+        "https://$MAPPING_UPSTREAM_HOST/health.txt" 2>&1) || rc=$?
+    printf '%s\n' "$out" > "$scenario_dir/proxy.probe-accept" || return 1
+    (( rc == 0 )) || return 1
+    [[ $out == *"$MAPPING_UPSTREAM_HEALTH"* ]] || return 1
+    return 0
+}
+
+# 拒绝端口校准：合法 CONNECT 必须收到 403，且不接受 200。
+mapping_proxy_probe_reject() {
+    local scenario_dir=${1:-} out rc=0
+    [[ -n $scenario_dir && -d $scenario_dir ]] || return 1
+    out=$(mapping_fixture_docker exec "$(mapping_probe_container)" \
+        curl --silent --show-error \
+        --proxy "https://$MAPPING_PROXY_HOST:$MAPPING_PROXY_REJECT_PORT" \
+        --proxy-cacert "$MAPPING_CLIENT_PROXY_CA" \
+        "https://$MAPPING_UPSTREAM_HOST/health.txt" 2>&1) || rc=$?
+    printf '%s\n' "$out" > "$scenario_dir/proxy.probe-reject" || return 1
+    (( rc != 0 )) || return 1
+    [[ $out == *403* ]] || return 1
+    return 0
+}
+
+# CONNECT 证据核验：authority 精确相等，拨号目的只能是冻结 U:443，拒绝端口不得拨号。
+mapping_proxy_log_check() {
+    local log target
+    target="$MPF_UPSTREAM_IP:$MAPPING_UPSTREAM_PORT"
+    log=$(mapping_fixture_docker exec "$(mapping_proxy_container)" \
+        cat "$(mapping_proxy_log_path "$MPF_SCENARIO")" 2>/dev/null) || return 1
+    awk -v authority="$MAPPING_PROXY_AUTHORITY" -v target="$target" '
+    NF == 0 { next }
+    {
+        auth = ""; mode = ""; dial = ""
+        n = split($0, field, "\t")
+        for (i = 1; i <= n; i++) {
+            if (field[i] ~ /^authority=/) auth = substr(field[i], 11)
+            if (field[i] ~ /^mode=/) mode = substr(field[i], 6)
+            if (field[i] ~ /^dial_target=/) dial = substr(field[i], 13)
+        }
+        if (auth == "" || mode == "" || dial == "") bad = 1
+        if (dial != "-" && dial != target) bad = 1
+        if (dial != "-" && auth != authority) bad = 1
+        if (auth == authority && mode == "accept" && dial == target) seen_accept = 1
+        if (auth == authority && mode == "reject" && dial == "-") seen_reject = 1
+    }
+    END { if (bad || !seen_accept || !seen_reject) exit 1 }
+    ' <<< "$log"
+}
+
+# 基线：两端口计数求和后一并保存，读取时校验求和一致。
+mapping_proxy_baseline_write() {
+    local scenario_dir=${1:-} accept=${2:-} reject=${3:-}
+    [[ -n $scenario_dir && -d $scenario_dir ]] || return 1
+    [[ $accept =~ ^[0-9]+$ && $reject =~ ^[0-9]+$ ]] || return 1
+    {
+        printf 'accept\t%s\n' "$accept"
+        printf 'reject\t%s\n' "$reject"
+        printf 'total\t%s\n' "$((accept + reject))"
+    } > "$scenario_dir/proxy.before.tmp" || return 1
+    mv -- "$scenario_dir/proxy.before.tmp" "$scenario_dir/proxy.before"
+}
+
+mapping_proxy_baseline_total() {
+    local file=${1:-} key value accept='' reject='' total=''
+    [[ -n $file && -f $file && ! -L $file ]] || return 1
+    while IFS=$'\t' read -r key value || [[ -n $key ]]; do
+        case "$key" in
+            accept) [[ -z $accept ]] || return 1; accept=$value ;;
+            reject) [[ -z $reject ]] || return 1; reject=$value ;;
+            total) [[ -z $total ]] || return 1; total=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ $accept =~ ^[0-9]+$ && $reject =~ ^[0-9]+$ && $total =~ ^[0-9]+$ ]] || return 1
+    (( total == accept + reject )) || return 1
+    printf '%s\n' "$total"
+}
+
+# 代理校准（接口 D）：先证明接受端口可达、拒绝端口 403、两端口计数增长且 authority 精确，
+# 再保存基线；任一读数缺失、损坏或非非负整数一律返回 80。
+mapping_proxy_calibrate() {
+    local scenario_dir=${1:-} before_accept before_reject after_accept after_reject
+    [[ -n $scenario_dir && -d $scenario_dir && ! -L $scenario_dir ]] || return "$MAPPING_FAILURE"
+    mapping_fixture_state_load || return "$MAPPING_FAILURE"
+    before_accept=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return "$MAPPING_FAILURE"
+    before_reject=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_REJECT_PORT") || return "$MAPPING_FAILURE"
+    mapping_proxy_probe_accept "$scenario_dir" || return "$MAPPING_FAILURE"
+    mapping_proxy_probe_reject "$scenario_dir" || return "$MAPPING_FAILURE"
+    after_accept=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return "$MAPPING_FAILURE"
+    after_reject=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_REJECT_PORT") || return "$MAPPING_FAILURE"
+    (( after_accept > before_accept )) || return "$MAPPING_FAILURE"
+    (( after_reject > before_reject )) || return "$MAPPING_FAILURE"
+    mapping_proxy_log_check || return "$MAPPING_FAILURE"
+    mapping_proxy_baseline_write "$scenario_dir" "$after_accept" "$after_reject" || return "$MAPPING_FAILURE"
+    return 0
+}
+
+# 证书判据（真实拓扑判据属实机验证；此处校验判据本身）：SAN 精确包含指定主机名。
+mapping_cert_san_has() {
+    local cert=${1:-} host=${2:-} san
+    [[ -n $cert && -n $host && -f $cert && ! -L $cert ]] || return 1
+    san=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null) || return 1
+    awk -v want="DNS:$host" '{ n = split($0, item, /[ ,]+/); for (i = 1; i <= n; i++) if (item[i] == want) found = 1 } END { exit found ? 0 : 1 }' <<< "$san"
+}
+
+# 证书链判据：叶证书必须能由给定 CA 验证通过。
+mapping_cert_verifies_with() {
+    local cert=${1:-} ca=${2:-}
+    [[ -n $cert && -n $ca && -f $cert && -f $ca ]] || return 1
+    openssl verify -CAfile "$ca" "$cert" >/dev/null 2>&1
+}
+
+# 证书指纹：用于证明两条根证书互不相同。
+mapping_cert_fingerprint() {
+    local cert=${1:-}
+    [[ -n $cert && -f $cert ]] || return 1
+    openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null
 }
