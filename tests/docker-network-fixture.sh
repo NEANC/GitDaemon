@@ -179,8 +179,11 @@ network_count() {
         if(bad || value=="")exit 1; print value
     }' "$IT_EVIDENCE_DIR/snapshot-$1.rules"
 }
-# 接收端恰好三个协议端口键，输出固定顺序且只接受非负整数。
-network_witness() {
+# 见证链计数解析（参数化入口）：恰好三个协议端口键，输出固定顺序且只接受非负整数。
+# 旧网络与映射见证共用该入口，映射入口不复制旧检查。
+witness_chain_counts() {
+    local file=${1:-}
+    [[ -n $file && -f $file && ! -L $file ]] || return 1
     awk '
     $3=="RETURN" {
         key=$4 ":" $11; n++
@@ -190,11 +193,15 @@ network_witness() {
     END {
         if(bad || n!=3 || seen["tcp:dpt:19419"]!=1 || seen["udp:dpt:53"]!=1 || seen["tcp:dpt:53"]!=1)exit 1
         print count["tcp:dpt:19419"];print count["udp:dpt:53"];print count["tcp:dpt:53"]
-    }' "$IT_EVIDENCE_DIR/snapshot-$1.witness"
+    }' "$file"
 }
-# 校准仅允许当前 DNS 协议增长，其他见证项必须不变。
-network_witness_delta() {
-    local before=$1 after=$2 proto=$3
+# 接收端见证计数：复用同一解析入口，只换入参来源。
+network_witness() {
+    witness_chain_counts "$IT_EVIDENCE_DIR/snapshot-$1.witness"
+}
+# 单协议增量校验（参数化入口）：仅目标协议增长，其余见证项必须不变。
+witness_protocol_delta() {
+    local before=${1:-} after=${2:-} proto=${3:-}
     awk -v before="$before" -v after="$after" -v proto="$proto" 'BEGIN {
         if(split(before,b,"\n")!=3 || split(after,a,"\n")!=3 || (proto!="udp" && proto!="tcp"))exit 1
         target=(proto=="udp"?2:3)
@@ -203,6 +210,10 @@ network_witness_delta() {
             if(i==target){if(a[i]+0<=b[i]+0)exit 1}else if(a[i]!=b[i])exit 1
         }
     }'
+}
+# 校准仅允许当前 DNS 协议增长，其他见证项必须不变。
+network_witness_delta() {
+    witness_protocol_delta "$1" "$2" "$3"
 }
 # 每次请求比较目标 DROP 增量和接收端零增量，保留原始退出状态。
 network_negative() {

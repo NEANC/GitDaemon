@@ -36,7 +36,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -348,10 +348,36 @@ contract_case() {
                 rm -rf "$SCRATCH"
             done
             ;;
+        mapping_entry_mode_dispatch)
+            # 三种 mapping 模式必须各自生成独立入口，且不得复用旧业务断言。
+            local a b c entry_rc=0 scratch cmd
+            a=$(guard_runner_command mapping-fallback /src run1 /ev img tools man att prof) || return 1
+            b=$(guard_runner_command mapping-direct /src run1 /ev img tools man att prof) || return 1
+            c=$(guard_runner_command mapping-probe /src run1 /ev img tools man att prof) || return 1
+            [[ $a == *'--mapping-fallback'* && $b == *'--mapping-direct'* && $c == *'--mapping-probe'* ]] \
+                || { printf 'mapping entry flags missing\n'; return 1; }
+            [[ $a != "$b" && $b != "$c" && $a != "$c" ]] || { printf 'mapping entries not distinct\n'; return 1; }
+            for cmd in "$a" "$b" "$c"; do
+                [[ $cmd != *'--integration'* ]] || { printf 'mapping entry reused legacy integration\n'; return 1; }
+            done
+            # 未接线时入口必须固定标记 fail-closed，且不产生任何控制面副作用。
+            scratch=$(mktemp -d)
+            mkdir -p "$scratch/evidence/control"
+            IT_EVIDENCE_DIR=$scratch/evidence bash "$HERE/test-docker-network.sh" --mapping-probe > "$scratch/out" 2>&1 || entry_rc=$?
+            [[ $entry_rc != 0 ]] || { printf 'unwired mapping entry succeeded\n'; return 1; }
+            grep -q 'MAPPING_SCENARIO_NOT_WIRED' "$scratch/out" || { printf 'fixed marker missing\n'; return 1; }
+            [[ -z $(ls -A "$scratch/evidence/control") ]] || { printf 'mapping entry touched control plane\n'; return 1; }
+            rm -rf "$scratch"
+            ;;
     esac
 }
 case "${1:-}" in
     --contracts) contracts ;;
+    --mapping-fallback|--mapping-direct|--mapping-probe)
+        # 单项 mapping 场景本体由后续项接线；未接线时以固定标记 fail-closed，绝不静默成功。
+        printf 'MAPPING_SCENARIO_NOT_WIRED=%s\n' "${1#--}" >&2
+        exit 70
+        ;;
     --live|--integration|--startup-integration)
         trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
         trap 'exit 143' TERM

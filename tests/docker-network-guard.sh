@@ -186,7 +186,7 @@ guard_close_calibration() {
 guard_runner_command() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6
     local manifest=${7:-} attestation=${8:-} profile=${9:-} net=''
-    local script=''
+    local script='' routing='--integration'
     [[ $# -le 9 ]] || return 2
     local -a filter=(-u IT_FILTER) entry=(--integration) extra=()
     case "$mode" in
@@ -200,15 +200,17 @@ guard_runner_command() {
             if [[ $mode == full ]]; then
                 script+=$'\n''[[ ${IT_DEFER_MAPPING:-} != 1 ]] || exit 2'
             else
+                # 单项 mapping 模式各自独立入口，不跑旧业务断言；未接线时由入口 fail-closed。
                 extra=(IT_MAPPING=1 IT_MAPPING_PROFILE="$profile")
                 net="gm-$run-m-net"
+                routing="--$mode"
             fi
             script+=$'\n''endpoint=unix:///var/run/docker.sock'
             script+=$'\n''daemon=$(grep "^daemon_id" "$2" | cut -f2)'
             script+=$'\n''[[ -n $daemon ]] || exit 77'
             script+=$'\n''actual=$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker --host "$endpoint" info -f '"'"'{{.ID}}'"'"')'
             script+=$'\n''[[ $actual == "$daemon" ]] || exit 77'
-            script+=$'\n''exec bash "$1/tests/test-docker-network.sh" --integration'
+            script+=$'\n'"exec bash \"\$1/tests/test-docker-network.sh\" $routing"
             printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
             return 0
             ;;
@@ -267,6 +269,8 @@ guard_mapping_main() {
     local existing routes resources links rules table c ids parent command
     [[ -n $profile && -f $profile ]] || return 2
     mapping_profile_load "$profile" || return $?
+    # 冻结档案的 run_id 必须与 --run-id 一致，否则链名与规则评论键将互相错位。
+    [[ $MP_RUN_ID == "$RUN" ]] || return 70
     GUARD_SOURCE=$source
     GUARD_MANIFEST=$manifest
     GUARD_ATTESTATION=$attestation
@@ -344,7 +348,6 @@ guard_mapping_main() {
                     read -r sha netid nonce <<< "$token"
                     [[ $sha == "$MP_PROFILE_SHA256" && -n $netid && -n $nonce ]] || exit 65
                     guard_mapping_rules "$profile" "$netid" || exit $?
-                    MP_NETWORK_ID=$netid
                     printf 'network_id\t%s\n' "$netid" > "$E/control/mapping-network.tsv"
                     touch "$E/control/start"
                     ready=1
@@ -353,6 +356,8 @@ guard_mapping_main() {
                     seq=$((seq + 1))
                     ;;
                 mapping-snapshot)
+                    # 隔离取证只允许在 READY 放行之后，未放行前一律拒绝。
+                    [[ $ready == 1 ]] || exit 65
                     guard_mapping_snapshot "$seq" || exit $?
                     printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"

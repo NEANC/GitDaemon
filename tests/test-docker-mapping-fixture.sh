@@ -163,14 +163,23 @@ contract_mapping_driver() {
     }
     resource_docker() { docker "$@"; }
     validation_environment_verify() { return 0; }
-    # 降权边界替身：模拟 runner 写入 PID，并按开关发送绑定档案哈希与 network ID 的 READY。
+    # 降权边界替身：模拟 runner 写入 PID，并按开关发送 READY 或 READY 前的 snapshot 请求。
     su() {
         printf '%s\n' "$BASHPID" > "$SCRATCH/evidence/control/runner.pid"
-        [[ ${MAPPING_SEND_READY:-0} == 1 ]] || return 0
-        printf 'mapping-ready %s %s nonce1\n' "$MAPPING_SHA" "$MAPPING_NETID" > "$SCRATCH/evidence/control/request-1"
+        case "${MAPPING_SEND:-ready}" in
+            snapshot)
+                printf 'mapping-snapshot %s nonce1\n' "$MAPPING_SHA" > "$SCRATCH/evidence/control/request-1"
+                ;;
+            ready)
+                [[ ${MAPPING_SEND_READY:-0} == 1 ]] || return 0
+                printf 'mapping-ready %s %s nonce1\n' "$MAPPING_SHA" "$MAPPING_NETID" > "$SCRATCH/evidence/control/request-1"
+                ;;
+            *) return 0 ;;
+        esac
         local i
         for ((i = 0; i < 200; i++)); do
             [[ ! -f $SCRATCH/evidence/control/ack-1 ]] || return 0
+            [[ ! -f $SCRATCH/evidence/control/stop ]] || return 75
             sleep 0.05
         done
         return 75
@@ -200,6 +209,14 @@ mapping_requires_ready() {
             printf 'NO_READY exit=%s\n' "$actual"
             [[ ! -e $SCRATCH/evidence/control/start ]] || { printf 'start created without READY\n'; failed=1; }
             if grep -q -- '--comment mtest-' "$SCRATCH/rules" 2>/dev/null; then printf 'rules installed without READY\n'; failed=1; fi
+            # READY 前只允许建空链并由清理撤销：断言无规则挂载且建链与撤链数量等价。
+            if grep -Eq -- '-(A|I) .*(MEmtest|Mtest|MRmtest)' "$SCRATCH/rules" 2>/dev/null; then
+                printf 'mapping rules referenced without READY\n'; failed=1
+            fi
+            local created removed
+            created=$(grep -c -- '-N ' "$SCRATCH/rules" 2>/dev/null || true)
+            removed=$(grep -c -- '-X ' "$SCRATCH/rules" 2>/dev/null || true)
+            [[ ${created:-0} == "${removed:-0}" ]] || { printf 'chains not reversed: created=%s removed=%s\n' "$created" "$removed"; failed=1; }
         else
             printf 'WITH_READY exit=%s\n' "$actual"
             [[ -e $SCRATCH/evidence/control/start ]] || { printf 'start missing after READY\n'; failed=1; }
@@ -208,7 +225,7 @@ mapping_requires_ready() {
         fi
         rm -rf "$SCRATCH"
     done
-    # 启动包装器必须保留冻结档案 P，绝不改写为旧网络固定地址。
+    # 启动包装器按角色赋冻结地址：product 用 P，其余角色不得被赋 P。
     mkdir -p "$WORK/profile"
     [[ -f $WORK/profile/base.tsv ]] || profile_write "$WORK/profile/base.tsv"
     local IT_RUN_ID=mtest IT_NETWORK=gm-mtest-m-net IT_NETWORK_GUARD_READY=1 IT_MAPPING=1 IT_DNS_IP=172.30.243.53
@@ -219,24 +236,38 @@ mapping_requires_ready() {
         shift
         printf '%s\n' "$*"
     }
-    local out
-    out=$(docker run -d --name product --network "$IT_NETWORK" --user 10001:10001 \
+    local out spec role name ip
+    out=$(docker run -d --name gm-mtest-product --network "$IT_NETWORK" --user 10001:10001 \
         --read-only --cap-drop ALL --security-opt no-new-privileges product)
     printf 'WRAPPER_IP=%s\n' "$out"
     [[ $out == *'--ip 140.82.112.10'* ]] || { printf 'wrapper lost frozen P\n'; failed=1; }
     [[ $out != *'172.30.243.4'* ]] || { printf 'wrapper rewrote P to legacy address\n'; failed=1; }
+    for spec in 'upstream 140.82.112.11' 'proxy 140.82.112.12' 'dns 140.82.112.13'; do
+        read -r role ip <<< "$spec"
+        name=gm-mtest-$role
+        out=$(docker run -d --name "$name" --network "$IT_NETWORK" --user 10001:10001 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges product)
+        printf 'WRAPPER_IP_%s=%s\n' "$role" "$out"
+        [[ $out == *"--ip $ip"* ]] || { printf 'wrapper lost frozen %s address\n' "$role"; failed=1; }
+        [[ $out != *'--ip 140.82.112.10'* ]] || { printf 'wrapper assigned P to %s\n' "$role"; failed=1; }
+    done
     unset -f command
     return "$failed"
 }
 
+# 写入映射 DROP 快照：五键、源 P、指定桥、链 MEmtest；可指定计数基数用于增量样本。
+write_mapping_snapshot_base() {
+    local file=$1 base=${2:-0} bridge=${3:-mmtest}
+    printf '[%s:180] -A MEmtest -i %s -s 140.82.112.10/32 -d 172.30.244.53/32 -p tcp -m tcp --dport 19419 -m comment --comment "mtest-cross-network" -j DROP\n' "$((base + 3))" "$bridge" > "$file"
+    printf '[%s:240] -A MEmtest -i %s -s 140.82.112.10/32 -d 172.30.243.1/32 -p tcp -m tcp --dport 49382 -m comment --comment "mtest-host-published" -j DROP\n' "$((base + 4))" "$bridge" >> "$file"
+    printf '[%s:60] -A MEmtest -i %s -s 140.82.112.10/32 -d 172.30.243.1/32 -p tcp -m tcp --dport 49383 -m comment --comment "mtest-host-input" -j DROP\n' "$((base + 1))" "$bridge" >> "$file"
+    printf '[%s:300] -A MEmtest -i %s -s 140.82.112.10/32 -d 172.30.244.53/32 -p udp -m udp --dport 53 -m comment --comment "mtest-dns-udp" -j DROP\n' "$((base + 5))" "$bridge" >> "$file"
+    printf '[%s:360] -A MEmtest -i %s -s 140.82.112.10/32 -d 172.30.244.53/32 -p tcp -m tcp --dport 53 -m comment --comment "mtest-dns-tcp" -j DROP\n' "$((base + 6))" "$bridge" >> "$file"
+}
+
 # 写入合法映射 DROP 快照：五键、源 P、桥 mmtest、链 MEmtest。
 write_mapping_snapshot() {
-    local file=$1
-    printf '[3:180] -A MEmtest -i mmtest -s 140.82.112.10/32 -d 172.30.244.53/32 -p tcp -m tcp --dport 19419 -m comment --comment "mtest-cross-network" -j DROP\n' > "$file"
-    printf '[4:240] -A MEmtest -i mmtest -s 140.82.112.10/32 -d 172.30.243.1/32 -p tcp -m tcp --dport 49382 -m comment --comment "mtest-host-published" -j DROP\n' >> "$file"
-    printf '[1:60] -A MEmtest -i mmtest -s 140.82.112.10/32 -d 172.30.243.1/32 -p tcp -m tcp --dport 49383 -m comment --comment "mtest-host-input" -j DROP\n' >> "$file"
-    printf '[5:300] -A MEmtest -i mmtest -s 140.82.112.10/32 -d 172.30.244.53/32 -p udp -m udp --dport 53 -m comment --comment "mtest-dns-udp" -j DROP\n' >> "$file"
-    printf '[6:360] -A MEmtest -i mmtest -s 140.82.112.10/32 -d 172.30.244.53/32 -p tcp -m tcp --dport 53 -m comment --comment "mtest-dns-tcp" -j DROP\n' >> "$file"
+    write_mapping_snapshot_base "$1"
 }
 
 # 整行替换：命中 match 的行换成 repl。
@@ -309,23 +340,38 @@ mapping_counter_missing_or_duplicate_fails() {
     return "$failed"
 }
 
-# 见证正校准必须逐项通过；接收端暂停时校准失败，零计数不得被认作通过。
+# 见证校准：以接收端计数增量为判据；接收端在跑但计数不增长必须被判失败。
 mapping_witness_pause_detected() {
-    local base=$WORK/profile/base.tsv failed=0 rc=0 file=$WORK/witness.txt
+    local base=$WORK/profile/base.tsv failed=0 rc=0 file=$WORK/witness.txt counter=$WORK/wcount
+    printf '0\n' > "$counter"
+    WITNESS_STATIC=0
     docker() {
-        [[ ${WITNESS_PAUSED:-0} != 1 ]] || return 1
-        return 0
+        case "$*" in
+            *'nvxL'*)
+                local n=0
+                if [[ ${WITNESS_STATIC:-0} != 1 ]]; then
+                    n=$(cat "$counter")
+                    n=$((n + 1))
+                    printf '%s\n' "$n" > "$counter"
+                fi
+                printf '%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n' "$n"
+                printf '%s 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n' "$n"
+                printf '%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n' "$n"
+                ;;
+            *) return 0 ;;
+        esac
     }
     MP_WITNESS_CALIBRATED=0
     mapping_calibrate_witness "$base" || { printf 'healthy calibration failed\n'; failed=1; }
     [[ $MP_WITNESS_CALIBRATED == 1 ]] || { printf 'calibration flag unset\n'; failed=1; }
-    WITNESS_PAUSED=1
+    # 接收端在跑（探针成功）但计数零增长：校准必须失败。
+    WITNESS_STATIC=1
     MP_WITNESS_CALIBRATED=0
     mapping_calibrate_witness "$base" || rc=$?
     printf 'PAUSED_WITNESS_EXIT=%s\n' "$rc"
     [[ $rc != 0 ]] || { printf 'paused witness accepted\n'; failed=1; }
     [[ $MP_WITNESS_CALIBRATED == 0 ]] || { printf 'paused witness marked calibrated\n'; failed=1; }
-    unset WITNESS_PAUSED
+    WITNESS_STATIC=0
     # 双端见证：接收端计数解析与 UDP/TCP 协议校准。
     printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n' > "$file"
     printf '0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n' >> "$file"
@@ -335,6 +381,155 @@ mapping_witness_pause_detected() {
     mapping_witness_delta $'0\n0\n0' $'0\n0\n1' tcp || { printf 'tcp delta rejected\n'; failed=1; }
     if mapping_witness_delta $'0\n0\n0' $'0\n0\n1' udp; then printf 'tcp growth accepted as udp\n'; failed=1; fi
     if mapping_witness_delta $'0\n0\n0' $'0\n1\n1' udp; then printf 'multi growth accepted\n'; failed=1; fi
+    mapping_witness_growth $'0\n0\n0' $'1\n2\n3' || { printf 'growth rejected\n'; failed=1; }
+    if mapping_witness_growth $'0\n0\n0' $'1\n2\n0'; then printf 'zero increment accepted\n'; failed=1; fi
+    return "$failed"
+}
+
+# 映射网络创建必须经资源账本、带齐三 label 创建并登记；空身份即拒绝且不写账本。
+mapping_network_create_registers() {
+    local failed=0 scratch dir rc=0 id
+    scratch=$(mktemp -d)
+    dir=$scratch/ledger
+    mkdir -p "$dir"
+    profile_write "$scratch/profile.tsv"
+    unset IT_EVIDENCE_DIR
+    MAPPING_LEDGER_DIR=$dir
+    CREATE_NOID=0
+    # 兼容旧实现经 `command docker` 创建：拦截后仍只走替身，绝不触碰真实 daemon。
+    command() {
+        [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+        shift
+        resource_docker "$@"
+    }
+    resource_docker() {
+        case "$*" in
+            'network create '*)
+                printf '%s\n' "$*" >> "$scratch/create.calls"
+                [[ ${CREATE_NOID:-0} != 1 ]] || return 0
+                local -a a=()
+                read -ra a <<< "$*"
+                local i lab
+                : > "$scratch/labels"
+                for ((i = 0; i < ${#a[@]}; i++)); do
+                    [[ ${a[i]} == --label ]] || continue
+                    lab=${a[i + 1]}
+                    case "$lab" in
+                        gitdaemon.*) printf '%s\n' "$lab" >> "$scratch/labels" ;;
+                    esac
+                done
+                printf 'netid-new\n'
+                ;;
+            *'{{.Id}}'*) printf 'netid-new\n' ;;
+            *'gitdaemon.run'*)
+                local r='' s='' o='' l
+                if [[ -f $scratch/labels ]]; then
+                    while IFS= read -r l; do
+                        case "$l" in
+                            gitdaemon.run=*) r=${l#*=} ;;
+                            gitdaemon.scenario=*) s=${l#*=} ;;
+                            gitdaemon.role=*) o=${l#*=} ;;
+                        esac
+                    done < "$scratch/labels"
+                fi
+                printf '%s\t%s\t%s\n' "$r" "$s" "$o"
+                ;;
+            'inspect netid-new') printf '{"Id":"netid-new"}\n' ;;
+            *) printf '{}\n' ;;
+        esac
+    }
+    id=$(mapping_network_create "$scratch/profile.tsv" "$dir") || rc=$?
+    printf 'MAPPING_NETWORK_CREATE rc=%s id=%s\n' "$rc" "$id"
+    [[ $rc == 0 && $id == netid-new ]] || { printf 'create+register failed\n'; failed=1; }
+    grep -q -- '--label gitdaemon.run=mtest' "$scratch/create.calls" || { printf 'missing run label\n'; failed=1; }
+    grep -q -- '--label gitdaemon.scenario=mapping' "$scratch/create.calls" || { printf 'missing scenario label\n'; failed=1; }
+    grep -q -- '--label gitdaemon.role=network' "$scratch/create.calls" || { printf 'missing role label\n'; failed=1; }
+    grep -q $'register\tnetwork\tnetid-new\tmtest\tmapping\tnetwork\t' "$dir/ledger.tsv" || { printf 'ledger record missing\n'; failed=1; }
+    grep -qx $'network_id\tnetid-new' "$dir/mapping-network.tsv" || { printf 'state id missing\n'; failed=1; }
+    # 创建返回空身份：network ID 核验失败即拒绝，且不写账本。
+    local dir2=$scratch/ledger2
+    mkdir -p "$dir2"
+    MAPPING_LEDGER_DIR=$dir2 CREATE_NOID=1
+    rc=0
+    id=$(mapping_network_create "$scratch/profile.tsv" "$dir2") || rc=$?
+    printf 'MAPPING_NETWORK_NOID rc=%s\n' "$rc"
+    [[ $rc != 0 ]] || { printf 'empty network id accepted\n'; failed=1; }
+    [[ ! -e $dir2/ledger.tsv ]] || { printf 'ledger written without id\n'; failed=1; }
+    rm -rf "$scratch"
+    return "$failed"
+}
+
+# 隔离判定：五类 DROP 计数增长且接收端零变化才通过；桥名核验失败即拒绝。
+mapping_isolation_check_behavior() {
+    local base=$WORK/profile/base.tsv failed=0 scratch
+    scratch=$(mktemp -d)
+    IT_EVIDENCE_DIR=$scratch
+    MP_WITNESS_CALIBRATED=1
+    ISOLATION_BRIDGE=mmtest
+    network_control() {
+        CONTROL_SEQ=$((CONTROL_SEQ + 1))
+        write_mapping_snapshot_base "$scratch/mapping-snapshot-$CONTROL_SEQ.rules" "$((CONTROL_SEQ * 10))" "$ISOLATION_BRIDGE"
+        {
+            printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n'
+            printf '0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n'
+            printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n'
+        } > "$scratch/mapping-snapshot-$CONTROL_SEQ.witness"
+    }
+    mapping_probe_egress() { return 0; }
+    CONTROL_SEQ=0
+    mapping_isolation_check product-id gen1 "$base" || { printf 'valid isolation rejected\n'; failed=1; }
+    # 桥名核验失败：DROP 规则的桥不是冻结桥 m$RUN，计数解析必须拒绝。
+    CONTROL_SEQ=0
+    ISOLATION_BRIDGE=mtest
+    if mapping_isolation_check product-id gen1 "$base"; then printf 'wrong bridge accepted\n'; failed=1; fi
+    rm -rf "$scratch"
+    return "$failed"
+}
+
+# 冻结档案的 run_id 必须与 --run-id 一致，不一致即拒绝且不建链、不放行。
+mapping_run_id_binding() {
+    local failed=0 SCRATCH actual
+    SCRATCH=$(mktemp -d)
+    profile_write "$SCRATCH/profile.tsv"
+    profile_set "$SCRATCH/profile.tsv" run_id other
+    profile_set "$SCRATCH/profile.tsv" network_name gm-other-m-net
+    profile_set "$SCRATCH/profile.tsv" bridge mother
+    MAPPING_SHA=$(sha256sum "$SCRATCH/profile.tsv" | cut -d' ' -f1)
+    MAPPING_NETID=netid-abc
+    MAPPING_SEND=ready MAPPING_SEND_READY=1
+    export SCRATCH MAPPING_SHA MAPPING_NETID MAPPING_SEND MAPPING_SEND_READY HERE
+    export -f contract_mapping_driver
+    actual=0
+    bash -c contract_mapping_driver > "$SCRATCH/out" 2>&1 || actual=$?
+    printf 'RUNID_MISMATCH exit=%s\n' "$actual"
+    [[ $actual != 0 ]] || { printf 'run_id mismatch accepted\n'; failed=1; }
+    [[ ! -e $SCRATCH/evidence/control/start ]] || { printf 'start created on mismatch\n'; failed=1; }
+    [[ ! -e $SCRATCH/rules ]] || { printf 'chains created on mismatch\n'; failed=1; }
+    rm -rf "$SCRATCH"
+    return "$failed"
+}
+
+# READY 前不得接受 mapping-snapshot：拒绝且不产生 ack 或启动许可。
+mapping_snapshot_requires_ready() {
+    local failed=0 SCRATCH actual
+    SCRATCH=$(mktemp -d)
+    profile_write "$SCRATCH/profile.tsv"
+    MAPPING_SHA=$(sha256sum "$SCRATCH/profile.tsv" | cut -d' ' -f1)
+    MAPPING_NETID=netid-abc
+    MAPPING_SEND=snapshot
+    export SCRATCH MAPPING_SHA MAPPING_NETID MAPPING_SEND HERE
+    export -f contract_mapping_driver
+    actual=0
+    bash -c contract_mapping_driver > "$SCRATCH/out" 2>&1 || actual=$?
+    printf 'SNAPSHOT_BEFORE_READY exit=%s\n' "$actual"
+    [[ $actual != 0 ]] || { printf 'snapshot accepted before READY\n'; failed=1; }
+    [[ ! -e $SCRATCH/evidence/control/start ]] || { printf 'start created on snapshot\n'; failed=1; }
+    [[ ! -e $SCRATCH/evidence/control/ack-1 ]] || { printf 'snapshot acked before READY\n'; failed=1; }
+    # 未 READY 前连取证都不允许发生：不得留下任何映射快照文件。
+    if compgen -G "$SCRATCH/evidence/mapping-snapshot-*.rules" >/dev/null; then
+        printf 'snapshot taken before READY\n'; failed=1
+    fi
+    rm -rf "$SCRATCH"
     return "$failed"
 }
 
@@ -348,7 +543,11 @@ for name in \
     mapping_requires_ready \
     mapping_rule_keys_exact \
     mapping_counter_missing_or_duplicate_fails \
-    mapping_witness_pause_detected; do
+    mapping_witness_pause_detected \
+    mapping_network_create_registers \
+    mapping_isolation_check_behavior \
+    mapping_run_id_binding \
+    mapping_snapshot_requires_ready; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

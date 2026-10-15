@@ -18,6 +18,9 @@ MAPPING_ROLES='product upstream proxy dns probe'
 MAPPING_WITNESS_KEYS='cross-network host-published host-input dns-udp dns-tcp'
 MAPPING_MIN_PREFIX=8
 MAPPING_MAX_PREFIX=30
+# 资源账本登记用的场景与角色标签；与创建命令携带的三 label 保持一致。
+MAPPING_LEDGER_SCENARIO='mapping'
+MAPPING_LEDGER_ROLE='network'
 
 # 只读档案字段，由 mapping_profile_load 填充。
 MP_SCHEMA_VERSION=''
@@ -214,7 +217,8 @@ mapping_network_id_load() {
     return 1
 }
 
-# 通过资源账本创建本轮映射网络并登记；身份写入运行状态，返回 network ID。
+# 通过资源账本创建本轮映射网络并登记；创建命令必须携带 run/scenario/role 三 label。
+# 身份写入运行状态，返回 network ID。调用者由编排接线提供。
 mapping_network_create() {
     local profile=${1:-} ledger_dir=${2:-} id state
     [[ -n $profile && -n $ledger_dir ]] || return 2
@@ -223,9 +227,12 @@ mapping_network_create() {
     [[ -z $state || ! -s $state ]] || return 2
     if ! declare -F resource_create_register >/dev/null; then return 2; fi
     RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$MP_RUN_ID
-    resource_create_register network mapping network -- \
-        command docker network create --label "gitdaemon.run=$MP_RUN_ID" --ipv6=false \
-        --subnet "$MP_CIDR" -o "com.docker.network.bridge.name=$MP_BRIDGE" \
+    resource_create_register network "$MAPPING_LEDGER_SCENARIO" "$MAPPING_LEDGER_ROLE" -- \
+        resource_docker network create \
+        --label "gitdaemon.run=$MP_RUN_ID" \
+        --label "gitdaemon.scenario=$MAPPING_LEDGER_SCENARIO" \
+        --label "gitdaemon.role=$MAPPING_LEDGER_ROLE" \
+        --ipv6=false --subnet "$MP_CIDR" -o "com.docker.network.bridge.name=$MP_BRIDGE" \
         "$MP_NETWORK_NAME" || return $?
     id=$RESOURCE_CREATED_ID
     [[ -n $id ]] || return 2
@@ -321,34 +328,39 @@ mapping_count() {
     }' "$snapshot"
 }
 
-# 接收端见证快照解析：恰好三个协议端口键且计数为非负整数。
+# 接收端见证计数：复用统一解析入口，输入为映射见证快照文件，不复制旧检查实现。
 mapping_witness() {
-    local snapshot=${1:-}
-    [[ -n $snapshot && -f $snapshot && ! -L $snapshot ]] || return 1
-    awk '
-    $3 == "RETURN" {
-        key = $4 ":" $11
-        n++
-        if ($1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $10 != $4 || $8 != "0.0.0.0/0" || $9 != "0.0.0.0/0" || (key != "tcp:dpt:19419" && key != "udp:dpt:53" && key != "tcp:dpt:53")) bad = 1
-        seen[key]++; count[key] = $1
-    }
-    END {
-        if (bad || n != 3 || seen["tcp:dpt:19419"] != 1 || seen["udp:dpt:53"] != 1 || seen["tcp:dpt:53"] != 1) exit 1
-        print count["tcp:dpt:19419"]; print count["udp:dpt:53"]; print count["tcp:dpt:53"]
-    }' "$snapshot"
+    witness_chain_counts "${1:-}"
 }
 
-# 仅目标协议的见证计数必须增长，其余两项不得变化。
+# 单协议增量校验：复用统一入口，仅换入参来源。
 mapping_witness_delta() {
-    local before=${1:-} after=${2:-} proto=${3:-}
-    awk -v before="$before" -v after="$after" -v proto="$proto" 'BEGIN {
-        if (split(before, b, "\n") != 3 || split(after, a, "\n") != 3 || (proto != "udp" && proto != "tcp")) exit 1
-        target = (proto == "udp" ? 2 : 3)
+    witness_protocol_delta "$1" "$2" "$3"
+}
+
+# 三协议键计数必须全部严格增长；零增量或非整数一律失败。
+mapping_witness_growth() {
+    local before=${1:-} after=${2:-}
+    awk -v before="$before" -v after="$after" 'BEGIN {
+        if (split(before, b, "\n") != 3 || split(after, a, "\n") != 3) exit 1
         for (i = 1; i <= 3; i++) {
             if (b[i] !~ /^[0-9]+$/ || a[i] !~ /^[0-9]+$/) exit 1
-            if (i == target) { if (a[i] + 0 <= b[i] + 0) exit 1 } else if (a[i] != b[i]) exit 1
+            if (a[i] + 0 <= b[i] + 0) exit 1
         }
     }'
+}
+
+# 接收端见证链计数：经 docker exec 边界读取接收端链，未运行或链缺失即非零。
+mapping_receiver_witness_counts() {
+    local receiver="gm-$MP_RUN_ID-witness" file rc=0
+    file=$(mktemp) || return 1
+    if ! docker exec "$receiver" sh -c "iptables -t raw -nvxL MS$MP_RUN_ID" > "$file"; then
+        rm -f "$file"
+        return 1
+    fi
+    if ! mapping_witness "$file"; then rc=1; fi
+    rm -f "$file"
+    return "$rc"
 }
 
 # 单个见证接收端的正校准探针，全部经 docker exec 边界。
@@ -368,16 +380,20 @@ mapping_receiver_probe() {
     esac
 }
 
-# 逐项正校准接收端并覆盖 UDP/TCP；任一端未运行即失败，零计数不得被当作通过。
+# 正校准接收端并覆盖 UDP/TCP：先取接收端基线，逐项探测后要求计数严格增长。
+# 接收端在跑但不计数（零增量）不得通过校准。
 mapping_calibrate_witness() {
-    local profile=${1:-} key spec proto port
+    local profile=${1:-} key spec proto port before after
     mapping_profile_load "$profile" || return $?
+    before=$(mapping_receiver_witness_counts) || return 1
     for key in $MAPPING_WITNESS_KEYS; do
         spec=$(mapping_witness_spec "$key") || return 1
         IFS=$'\t' read -r proto port _ <<< "$spec"
         mapping_receiver_probe "$key" || return 1
-        printf 'WITNESS_CALIBRATED=%s PROTOCOL=%s PORT=%s\n' "$key" "$proto" "$port"
+        printf 'WITNESS_PROBE=%s PROTOCOL=%s PORT=%s\n' "$key" "$proto" "$port"
     done
+    after=$(mapping_receiver_witness_counts) || return 1
+    mapping_witness_growth "$before" "$after" || return 1
     MP_WITNESS_CALIBRATED=1
     return 0
 }

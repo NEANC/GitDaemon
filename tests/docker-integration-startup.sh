@@ -218,10 +218,16 @@ docker() {
     esac
     if [[ -n $name && $entry == 0 ]]; then
         if [[ ${IT_MAPPING:-0} == 1 ]]; then
-            # 映射产品地址来自冻结档案 P，绝不被改写为旧网络固定地址。
+            # 映射模式按角色赋冻结地址：只有 product 用 P，其余角色用各自档案地址。
             mapping_profile_load "$IT_MAPPING_PROFILE" || return 77
             [[ $network == "$MP_NETWORK_NAME" ]] || return 77
-            safe+=(--ip "$MP_P")
+            case "$name" in
+                *-product) safe+=(--ip "$MP_P") ;;
+                *-upstream) safe+=(--ip "$MP_U") ;;
+                *-proxy) safe+=(--ip "$MP_X") ;;
+                *-dns) safe+=(--ip "$MP_D") ;;
+                *) return 77 ;;
+            esac
         else
             [[ $network == "$IT_NETWORK" ]] || return 77
             safe+=(--ip 172.30.243.4)
