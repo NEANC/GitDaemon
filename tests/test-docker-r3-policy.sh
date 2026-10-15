@@ -47,4 +47,54 @@ for scenario in authorized compose-security disabled-security secondary missing-
     case "$scenario" in authorized|compose-security) expected=0 ;; secondary|disabled-security) expected=1 ;; esac
     ( policy_contract "$scenario" "$expected" ) || failed=1
 done
+
+# 映射角色使用冻结档案与单一网络 ID 判定；额外附件、错误地址与未知网络 ID 均拒绝。
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+PROFILE=$scratch/mapping-profile.tsv
+printf 'schema_version\t1\n' > "$PROFILE"
+printf 'run_id\tcontract\n' >> "$PROFILE"
+printf 'cidr\t140.82.112.0/24\n' >> "$PROFILE"
+printf 'gateway\t140.82.112.1\n' >> "$PROFILE"
+printf 'P\t140.82.112.10\n' >> "$PROFILE"
+printf 'U\t140.82.112.11\n' >> "$PROFILE"
+printf 'X\t140.82.112.12\n' >> "$PROFILE"
+printf 'D\t140.82.112.13\n' >> "$PROFILE"
+printf 'N\t140.82.112.14\n' >> "$PROFILE"
+printf 'network_name\tgm-contract-m-net\n' >> "$PROFILE"
+printf 'bridge\tmcontract\n' >> "$PROFILE"
+
+mapping_policy_contract() {
+    local scenario=$1 expected=$2 actual=0
+    local IT_RUN_ID=contract IT_MAPPING=1 IT_MAPPING_PROFILE=$PROFILE
+    local ATT='gm-contract-m-net' IP=140.82.112.10
+    case "$scenario" in
+        secondary) ATT='gm-contract-m-net other' ;;
+        wrong-ip) IP=140.82.112.99 ;;
+    esac
+    docker() {
+        case "$*" in
+            *'.NetworkID'*) printf 'netid-1 ' ;;
+            *'.IPAddress'*) printf '%s ' "$IP" ;;
+            *'.NetworkSettings.Networks'*) printf '%s ' "$ATT" ;;
+            *'.Config.User'*) printf '10001:10001 true false [ALL] [no-new-privileges]' ;;
+            *'.HostConfig.ExtraHosts'*) printf '[] []' ;;
+            *'.EnableIPv6'*) printf 'false' ;;
+            *) return 99 ;;
+        esac
+        return 0
+    }
+    case "$scenario" in
+        foreign-id) MP_NETWORK_ID=other-netid ;;
+        *) MP_NETWORK_ID=netid-1 ;;
+    esac
+    mapping_policy_check product-id product "$PROFILE" >/dev/null || actual=$?
+    printf 'mapping-%s EXPECT=%s ACTUAL=%s\n' "$scenario" "$expected" "$actual"
+    [[ $actual == "$expected" ]]
+}
+for scenario in valid secondary wrong-ip foreign-id; do
+    expected=0
+    case "$scenario" in secondary|wrong-ip|foreign-id) expected=1 ;; esac
+    ( mapping_policy_contract "$scenario" "$expected" ) || failed=1
+done
 exit "$failed"

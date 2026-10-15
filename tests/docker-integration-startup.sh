@@ -60,7 +60,12 @@ integration_helper_policy() {
         container:*)
             target=${mode#container:}
             [[ $(command docker inspect -f '{{index .Config.Labels "gitdaemon.run"}}' "$target") == "$IT_RUN_ID" ]] || return 1
-            assert_container_network_configuration "$target" || return $?
+            if [[ ${IT_MAPPING:-0} == 1 ]]; then
+                # 共享 netns 必须匹配本轮登记产品，且只允许单一映射网络附件。
+                mapping_policy_check "$target" product "$IT_MAPPING_PROFILE" || return $?
+            else
+                assert_container_network_configuration "$target" || return $?
+            fi
             ;;
         *) return 1 ;;
     esac
@@ -199,14 +204,28 @@ docker() {
     case "$network" in
         none|container:*) ;;
         "$IT_NETWORK")
-            safe+=(--dns "$IT_DNS_IP" --sysctl net.ipv6.conf.all.disable_ipv6=1)
-            if [[ $ca == 0 ]]; then safe+=(-v "gm-$IT_RUN_ID-ca:/ca:ro"); fi
+            if [[ ${IT_MAPPING:-0} == 1 ]]; then
+                # 映射角色使用冻结档案中的 DNS 地址与独立映射 CA 卷，不改旧网络通配。
+                mapping_profile_load "$IT_MAPPING_PROFILE" || return 77
+                safe+=(--dns "$MP_D" --sysctl net.ipv6.conf.all.disable_ipv6=1)
+                if [[ $ca == 0 ]]; then safe+=(-v "gm-$IT_RUN_ID-mapping-ca:/ca:ro"); fi
+            else
+                safe+=(--dns "$IT_DNS_IP" --sysctl net.ipv6.conf.all.disable_ipv6=1)
+                if [[ $ca == 0 ]]; then safe+=(-v "gm-$IT_RUN_ID-ca:/ca:ro"); fi
+            fi
             ;;
         *) printf '禁止未授权网络：%s\n' "$network" >&2; return 77 ;;
     esac
     if [[ -n $name && $entry == 0 ]]; then
-        [[ $network == "$IT_NETWORK" ]] || return 77
-        safe+=(--ip 172.30.243.4)
+        if [[ ${IT_MAPPING:-0} == 1 ]]; then
+            # 映射产品地址来自冻结档案 P，绝不被改写为旧网络固定地址。
+            mapping_profile_load "$IT_MAPPING_PROFILE" || return 77
+            [[ $network == "$MP_NETWORK_NAME" ]] || return 77
+            safe+=(--ip "$MP_P")
+        else
+            [[ $network == "$IT_NETWORK" ]] || return 77
+            safe+=(--ip 172.30.243.4)
+        fi
     fi
     if [[ $entry == 1 ]]; then
         integration_helper_run "$detached" "$remove" "$entrypoint" "$image" \

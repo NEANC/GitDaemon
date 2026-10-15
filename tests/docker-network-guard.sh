@@ -5,6 +5,7 @@ GUARD_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 环境授权库与资源账本库与 guard 同目录；缺库时由入口拒绝，不创建任何资源。
 [[ ! -f $GUARD_DIR/docker-validation-environment.sh ]] || source "$GUARD_DIR/docker-validation-environment.sh"
 [[ ! -f $GUARD_DIR/docker-resource-ledger.sh ]] || source "$GUARD_DIR/docker-resource-ledger.sh"
+[[ ! -f $GUARD_DIR/docker-mapping-fixture.sh ]] || source "$GUARD_DIR/docker-mapping-fixture.sh"
 OWN_RULES=() OWN_CHAINS=()
 PENDING_SIGNAL=0
 GUARD_BOUND=0
@@ -184,7 +185,7 @@ guard_close_calibration() {
 # 生成固定入口命令；新路径由子入口独立复核本地 daemon，full 由子入口再查延期请求。
 guard_runner_command() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6
-    local manifest=${7:-} attestation=${8:-} profile=${9:-}
+    local manifest=${7:-} attestation=${8:-} profile=${9:-} net=''
     local script=''
     [[ $# -le 9 ]] || return 2
     local -a filter=(-u IT_FILTER) entry=(--integration) extra=()
@@ -194,15 +195,21 @@ guard_runner_command() {
         full|mapping-fallback|mapping-direct|mapping-probe)
             [[ -n $manifest && -n $attestation && -n $profile ]] || return 2
             extra=(IT_MAPPING_PROFILE="$profile")
+            net="gm-$run-net"
             script='set -e'
-            [[ $mode != full ]] || script+=$'\n''[[ ${IT_DEFER_MAPPING:-} != 1 ]] || exit 2'
+            if [[ $mode == full ]]; then
+                script+=$'\n''[[ ${IT_DEFER_MAPPING:-} != 1 ]] || exit 2'
+            else
+                extra=(IT_MAPPING=1 IT_MAPPING_PROFILE="$profile")
+                net="gm-$run-m-net"
+            fi
             script+=$'\n''endpoint=unix:///var/run/docker.sock'
             script+=$'\n''daemon=$(grep "^daemon_id" "$2" | cut -f2)'
             script+=$'\n''[[ -n $daemon ]] || exit 77'
             script+=$'\n''actual=$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker --host "$endpoint" info -f '"'"'{{.ID}}'"'"')'
             script+=$'\n''[[ $actual == "$daemon" ]] || exit 77'
             script+=$'\n''exec bash "$1/tests/test-docker-network.sh" --integration'
-            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="gm-$run-net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
+            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
             return 0
             ;;
         probe) entry=(--live) ;;
@@ -210,6 +217,159 @@ guard_runner_command() {
         *) return 2 ;;
     esac
     printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="gm-$run-net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 bash "$source/tests/test-docker-network.sh" "${entry[@]}"
+}
+# 映射网精确策略：只放行同网所需通信，其余 INPUT/转发、跨网、外 DNS 与 IPv6 一律拒绝。
+# 源地址 P、桥接口与见证目标全部来自冻结档案，不复制旧 .4 规则。
+guard_mapping_rules() {
+    local profile=$1 network_id=$2
+    local name bridge chain parent table c item key spec proto port dest
+    [[ -n $profile && -n $network_id ]] || return 2
+    mapping_profile_load "$profile" || return $?
+    name=$(docker network inspect -f '{{.Name}}' "$network_id") || return $?
+    [[ $name == "$MP_NETWORK_NAME" ]] || return 1
+    bridge=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$network_id") || return $?
+    [[ $bridge == "$MP_BRIDGE" ]] || return 1
+    chain=M$MP_RUN_ID
+    # 必要回复与精确允许：产品→U:443、产品→X:8443/8444、产品→D:53 U/TCP、代理→U:443。
+    guard_rule filter -A "$chain" -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT
+    guard_rule filter -A "$chain" -i "$bridge" -o "$bridge" -s "$MP_P/32" -d "$MP_U/32" -p tcp --dport 443 -j ACCEPT
+    guard_rule filter -A "$chain" -i "$bridge" -o "$bridge" -s "$MP_P/32" -d "$MP_X/32" -p tcp --dport 8443 -j ACCEPT
+    guard_rule filter -A "$chain" -i "$bridge" -o "$bridge" -s "$MP_P/32" -d "$MP_X/32" -p tcp --dport 8444 -j ACCEPT
+    guard_rule filter -A "$chain" -i "$bridge" -o "$bridge" -s "$MP_P/32" -d "$MP_D/32" -p udp --dport 53 -j ACCEPT
+    guard_rule filter -A "$chain" -i "$bridge" -o "$bridge" -s "$MP_P/32" -d "$MP_D/32" -p tcp --dport 53 -j ACCEPT
+    guard_rule filter -A "$chain" -i "$bridge" -o "$bridge" -s "$MP_X/32" -d "$MP_U/32" -p tcp --dport 443 -j ACCEPT
+    # 五类见证目标精确 DROP：源为 P、桥为 m$RUN，评论键与本轮 run 绑定。
+    for key in $MAPPING_WITNESS_KEYS; do
+        spec=$(mapping_witness_spec "$key") || return 1
+        IFS=$'\t' read -r proto port dest <<< "$spec"
+        guard_rule raw -A "ME$MP_RUN_ID" -i "$bridge" -s "$MP_P/32" -d "$dest/32" -p "$proto" -m "$proto" --dport "$port" -m comment --comment "$MP_RUN_ID-$key" -j DROP
+    done
+    guard_rule filter -A "$chain" -j DROP
+    for parent in INPUT DOCKER-USER FORWARD; do
+        guard_rule filter -I "$parent" -i "$bridge" -j "$chain"
+    done
+    guard_rule raw -I PREROUTING -i "$bridge" -j "ME$MP_RUN_ID"
+    return 0
+}
+# 保存映射两端原始计数：发起端 iptables-save -c 与接收端见证链。
+guard_mapping_snapshot() {
+    local seq=$1 pid
+    iptables-save -c > "$E/mapping-snapshot-$seq.rules"
+    pid=$(docker inspect -f '{{.State.Pid}}' "gm-$RUN-witness") || return $?
+    nsenter -t "$pid" -n iptables -t raw -nvxL "MS$RUN" > "$E/mapping-snapshot-$seq.witness"
+    chmod a+r "$E/mapping-snapshot-$seq.rules" "$E/mapping-snapshot-$seq.witness"
+    return 0
+}
+# 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
+guard_mapping_main() {
+    local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6 manifest=$7 attestation=$8 profile=$9
+    local bridge chain early returnc seq=1 ready=0 rc=0 request token nonce sha netid
+    local existing routes resources links rules table c ids parent command
+    [[ -n $profile && -f $profile ]] || return 2
+    mapping_profile_load "$profile" || return $?
+    GUARD_SOURCE=$source
+    GUARD_MANIFEST=$manifest
+    GUARD_ATTESTATION=$attestation
+    GUARD_PROFILE=$profile
+    GUARD_BOUND=1
+    [[ $E != /tmp/* && $E != /var/tmp/* && ! -e $E ]] || return 73
+    [[ $(id -u "$RUNNER") != 0 ]] || return 77
+    bridge=$MP_BRIDGE
+    chain=M$RUN early=ME$RUN returnc=MR$RUN seen=MS$RUN
+    ids=$(docker network ls -q) || return $?
+    existing=''
+    if [[ -n $ids ]]; then
+        existing=$(docker network inspect $ids --format '{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}}{{println}}{{end}}{{end}}') || return $?
+    fi
+    routes=$(ip -4 route show) || return $?
+    routes=$(awk '$1!="default" {print $1}' <<< "$routes") || return $?
+    existing+=$'\n'"$routes"
+    guard_subnets_clear "$existing" || return 70
+    resources=$(docker ps -a --format '{{.Names}}') || return $?
+    if grep -F "gm-$RUN-" <<< "$resources"; then return 70; fi
+    resources=$(docker network ls --format '{{.Name}}') || return $?
+    if grep -Fx "$MP_NETWORK_NAME" <<< "$resources"; then return 70; fi
+    resources=$(docker volume ls --format '{{.Name}}') || return $?
+    if grep -F "gm-$RUN-" <<< "$resources"; then return 70; fi
+    links=$(ip link show) || return $?
+    if grep -Eq "^[0-9]+: ${bridge}(@[^:]+)?:" <<< "$links"; then return 70; fi
+    rules=$(iptables-save) || return $?
+    for c in "$chain" "$early" "$returnc"; do
+        if grep -w "$c" <<< "$rules"; then return 70; fi
+    done
+    mkdir -p "$E"
+    chmod 755 "$E"
+    mkdir "$E/control"
+    chown "$RUNNER" "$E/control"
+    printf '%s\n' "$existing" > "$E/subnets-before.txt"
+    sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
+    if [[ -d $source/.git ]]; then
+        git -C "$source" status --short > "$E/git-state.txt"
+    else
+        cp "$source/input-git-state.txt" "$E/git-state.txt"
+    fi
+    docker image inspect "$image" "$tools" > "$E/images.json"
+    iptables-save -c > "$E/rules-before.txt"
+    printf 'Run=%s\nOnly reverse listed rules and remove registered resources after SIGKILL; never flush global tables.\n' "$RUN" > "$E/recovery.txt"
+    trap guard_cleanup EXIT
+    trap 'PENDING_SIGNAL=143' TERM
+    trap 'PENDING_SIGNAL=130' INT
+    for spec in "filter|$chain" "raw|$early" "raw|$returnc"; do
+        table=${spec%%|*}
+        c=${spec#*|}
+        iptables -t "$table" -N "$c"
+        OWN_CHAINS+=("$spec")
+        printf '%s\n' "$spec" >> "$E/chains.owned"
+        guard_signal_checkpoint
+    done
+    command=$(guard_runner_command "$mode" "$source" "$RUN" "$E" "$image" "$tools" "$manifest" "$attestation" "$profile")
+    printf -v command 'su -s /bin/bash %q -c %q; rc=$?; printf "BUSINESS_SU_EXIT=%%s\\n" "$rc" > %q; exit "$rc"' "$RUNNER" "$command" "$E/business-su-status.txt"
+    setsid bash -c "$command" > "$E/run.log" 2>&1 &
+    CHILD=$!
+    guard_signal_checkpoint
+    while [[ ! -f $E/control/runner.pid ]]; do
+        guard_signal_checkpoint
+        kill -0 "$CHILD" 2>/dev/null || break
+        sleep 0.1
+    done
+    guard_signal_checkpoint
+    while kill -0 "$CHILD" 2>/dev/null; do
+        guard_signal_checkpoint
+        if [[ -f $E/control/request-$seq ]]; then
+            read -r request token < "$E/control/request-$seq"
+            [[ -n $token ]] || exit 65
+            case "$request" in
+                mapping-ready)
+                    [[ $ready == 0 ]] || exit 65
+                    read -r sha netid nonce <<< "$token"
+                    [[ $sha == "$MP_PROFILE_SHA256" && -n $netid && -n $nonce ]] || exit 65
+                    guard_mapping_rules "$profile" "$netid" || exit $?
+                    MP_NETWORK_ID=$netid
+                    printf 'network_id\t%s\n' "$netid" > "$E/control/mapping-network.tsv"
+                    touch "$E/control/start"
+                    ready=1
+                    printf '%s\n' "$nonce" > "$E/control/ack-$seq.tmp"
+                    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+                    seq=$((seq + 1))
+                    ;;
+                mapping-snapshot)
+                    guard_mapping_snapshot "$seq" || exit $?
+                    printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
+                    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+                    seq=$((seq + 1))
+                    ;;
+                *) exit 65 ;;
+            esac
+        fi
+        sleep 0.1
+    done
+    guard_signal_checkpoint
+    [[ $ready == 1 ]] || exit 65
+    wait "$CHILD" || rc=$?
+    guard_signal_checkpoint
+    CHILD=''
+    printf 'SETSID_WAIT_EXIT=%s\n' "$rc" >> "$E/exit-status.txt"
+    return "$rc"
 }
 # 固定入口解析、宿主预检、规则安装以及降权执行。
 guard_main() {
@@ -246,8 +406,9 @@ guard_main() {
         mapping-fallback|mapping-direct|mapping-probe)
             GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
             validation_environment_verify "$manifest" "$attestation" || return $?
-            # mapping 拒绝证据与独立网络尚未接入，不得安装旧业务网规则。
-            return 77
+            # 映射网络与拒绝证据按接口 C 接入：先冻结档案与拒绝基线，READY 后再放行业务。
+            guard_mapping_main "$mode" "$source" "$RUN" "$E" "$image" "$tools" "$manifest" "$attestation" "$profile"
+            return $?
             ;;
         *)
             ip -4 addr show | grep -q 'inet 192.168.10.9/' || return 77

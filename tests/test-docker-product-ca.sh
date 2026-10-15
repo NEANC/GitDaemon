@@ -53,3 +53,23 @@ for fault in valid writable wrong-volume data-path nested; do
     printf 'TRUST_CASE=%s EXIT=%s\n' "$fault" "$rc"
     if [[ $fault == valid ]]; then [[ $rc == 0 ]]; else [[ $rc != 0 ]]; fi
 done
+
+# 独立映射 CA 路径只在映射角色开放，且必须挂在专属映射 CA 卷上。
+for fault in mapping-upstream mapping-proxy mapping-old-role mapping-wrong-volume; do
+    trust_path=/ca/upstream-ca.crt trust_volume=gm-trust-mapping-ca trust_rw=false
+    unset IT_MAPPING
+    case "$fault" in
+        mapping-upstream) IT_MAPPING=1 ;;
+        mapping-proxy) IT_MAPPING=1; trust_path=/ca/proxy-ca.crt ;;
+        mapping-wrong-volume) IT_MAPPING=1; trust_volume=gm-trust-ca ;;
+    esac
+    rc=0
+    assert_container_trust_configuration product || rc=$?
+    printf 'TRUST_CASE=%s EXIT=%s\n' "$fault" "$rc"
+    if [[ $fault == mapping-upstream || $fault == mapping-proxy ]]; then
+        [[ $rc == 0 ]]
+    else
+        [[ $rc != 0 ]]
+    fi
+done
+unset IT_MAPPING

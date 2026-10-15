@@ -3,6 +3,8 @@
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 资源账本库与夹具同目录；登记与精确删除统一走该库。
 [[ ! -f $FIXTURE_DIR/docker-resource-ledger.sh ]] || source "$FIXTURE_DIR/docker-resource-ledger.sh"
+# 映射夹具提供冻结档案与角色化策略；缺文件时由 mapping 入口自行拒绝。
+[[ ! -f $FIXTURE_DIR/docker-mapping-fixture.sh ]] || source "$FIXTURE_DIR/docker-mapping-fixture.sh"
 SAFE=(--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges)
 NETSAFE=(--sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv4.ip_unprivileged_port_start=0)
 CONTROL_SEQ=0
@@ -78,6 +80,10 @@ assert_container_trust_configuration() {
                 case "$path" in
                     /ca/ca.crt|/ca/ca.pem) expected=gm-$IT_RUN_ID-ca ;;
                     /ca/fixture/tls/ca.crt) expected=gm-$IT_RUN_ID-fixture-ca ;;
+                    /ca/upstream-ca.crt|/ca/proxy-ca.crt)
+                        # 独立映射 CA 路径只在映射角色开放，不扩大旧 CA 通配。
+                        [[ ${IT_MAPPING:-0} == 1 ]] || return 1
+                        expected=gm-$IT_RUN_ID-mapping-ca ;;
                     *) return 1 ;;
                 esac
                 mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/ca"}}{{.Name}} {{.RW}}{{end}}{{end}}' "$id") || return $?
