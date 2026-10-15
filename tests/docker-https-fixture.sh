@@ -46,6 +46,18 @@ FIXTURE_HOSTS_BAD_KEY=$FIXTURE_TLS/hosts-bad.key
 FIXTURE_HOSTS_ALIAS=hosts-source.test
 FIXTURE_HOSTS_BAD_ALIAS=hosts-badcert.test
 FIXTURE_FAILURE=80
+# 夹具产物所有权标签：与集成同一 run/scenario，role 按子命令区分。这些容器因此可被资源账本、
+# guard 残留枚举与恢复脚本识别，中途失败不会被静默泄漏。CLI 与旧行为保持不变。
+FIXTURE_RUN=${IT_RUN_ID:-fixture}
+FIXTURE_SCENARIO=${IT_SCENARIO:-$FIXTURE_RUN}
+FIXTURE_LABEL_ARGS=(--label "gitdaemon.run=$FIXTURE_RUN" --label "gitdaemon.scenario=$FIXTURE_SCENARIO")
+
+# 夹具容器统一创建边界：补齐三 label 后转交 docker run；参数与退出码原样传递。
+fixture_run() {
+    local role=$1
+    shift
+    docker run "${FIXTURE_LABEL_ARGS[@]}" --label "gitdaemon.role=$role" "$@"
+}
 
 # 输出夹具诊断到 stderr。
 fail() {
@@ -86,7 +98,7 @@ validate_repo() {
 # 在指定命名卷内以 UID 10001 执行一段 POSIX sh 脚本；失败统一映射为夹具失败退出码。
 volume_run() {
     local volume=$1 image=$2 script=$3 status=0
-    docker run --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" -c "$script" || status=$?
+    fixture_run helper --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" -c "$script" || status=$?
     [[ $status == 0 ]] || { fail "卷内夹具命令失败（退出码 $status）"; return "$FIXTURE_FAILURE"; }
     return 0
 }
@@ -94,7 +106,7 @@ volume_run() {
 # 把一段脚本内容经标准输入写入夹具卷内固定路径并置为可执行，供代理/认证上游容器直接运行。
 fixture_write_script() {
     local volume=$1 image=$2 path=$3 body=$4 status=0
-    printf '%s\n' "$body" | docker run --rm -i --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" \
+    printf '%s\n' "$body" | fixture_run helper --rm -i --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" \
         --entrypoint /bin/sh "$image" -c "umask 022; cat > '$path' && chmod 755 '$path'" || status=$?
     [[ $status == 0 ]] || { fail "写入夹具脚本失败：$path"; return "$FIXTURE_FAILURE"; }
     return 0
@@ -291,7 +303,7 @@ REJECT
     volume_run "$volume" "$image" "rm -f $FIXTURE_ROOT/reject.in $FIXTURE_ROOT/reject.out" || return "$FIXTURE_FAILURE"
     fixture_write_script "$volume" "$image" "$FIXTURE_ROOT/reject.sh" "$body" || return "$FIXTURE_FAILURE"
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "$network" --network-alias github.com \
+    fixture_run reject -d --name "$name" --network "$network" --network-alias github.com \
         --read-only --cap-drop ALL --security-opt no-new-privileges \
         --sysctl net.ipv4.ip_unprivileged_port_start=443 --user 10001:10001 \
         -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/bash "$image" "$FIXTURE_ROOT/reject.sh" \
@@ -303,7 +315,7 @@ REJECT
 cmd_start() {
     local volume=$1 image=$2 network=$3 name=$4
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "$network" --network-alias github.com \
+    fixture_run upstream -d --name "$name" --network "$network" --network-alias github.com \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$FIXTURE_PORT" \
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
         -c "cd $FIXTURE_WEB && exec openssl s_server -accept $FIXTURE_PORT -cert $FIXTURE_CERT -key $FIXTURE_KEY -WWW -quiet" \
@@ -317,7 +329,7 @@ cmd_start() {
 cmd_hosts_put() {
     local volume=$1 image=$2 name=$3 status=0
     [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { fail "非法的 hosts 文件名：$name"; return 2; }
-    docker run --rm -i --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
+    fixture_run helper --rm -i --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
         -c "umask 022; mkdir -p '$FIXTURE_HOSTS_WEB'; cat > '$FIXTURE_HOSTS_WEB/$name'" || status=$?
     [[ $status == 0 ]] || { fail "发布 hosts 文件失败：$name"; return "$FIXTURE_FAILURE"; }
     return 0
@@ -328,7 +340,7 @@ cmd_hosts_put() {
 cmd_hosts_serve() {
     local volume=$1 image=$2 network=$3 name=$4 alias=${5:-$FIXTURE_HOSTS_ALIAS}
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "$network" --network-alias "$alias" \
+    fixture_run hosts -d --name "$name" --network "$network" --network-alias "$alias" \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$FIXTURE_PORT" \
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
         -c "cd $FIXTURE_HOSTS_WEB && exec openssl s_server -accept $FIXTURE_PORT -cert $FIXTURE_HOSTS_CERT -key $FIXTURE_HOSTS_KEY -WWW -quiet" \
@@ -342,7 +354,7 @@ cmd_hosts_serve() {
 cmd_hosts_serve_bad() {
     local volume=$1 image=$2 network=$3 name=$4 alias=${5:-$FIXTURE_HOSTS_BAD_ALIAS}
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "$network" --network-alias "$alias" \
+    fixture_run hosts-bad -d --name "$name" --network "$network" --network-alias "$alias" \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$FIXTURE_PORT" \
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
         -c "cd $FIXTURE_HOSTS_WEB && exec openssl s_server -accept $FIXTURE_PORT -cert $FIXTURE_HOSTS_BAD_CERT -key $FIXTURE_HOSTS_BAD_KEY -WWW -quiet" \
@@ -355,7 +367,7 @@ cmd_hosts_serve_bad() {
 cmd_auth_start() {
     local volume=$1 image=$2 network=$3 name=$4 expect=$5
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "$network" --network-alias github.com \
+    fixture_run auth -d --name "$name" --network "$network" --network-alias github.com \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$FIXTURE_PORT" \
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/bash "$image" \
         "$FIXTURE_AUTH_SCRIPT" "$FIXTURE_PORT" "$FIXTURE_CERT" "$FIXTURE_KEY" "$FIXTURE_WEB" "$expect" \
@@ -369,7 +381,7 @@ cmd_auth_start() {
 cmd_proxy_start() {
     local volume=$1 image=$2 network=$3 name=$4 host=${5:-gm-proxy}
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "$network" --network-alias "$host" \
+    fixture_run proxy -d --name "$name" --network "$network" --network-alias "$host" \
         --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint /bin/bash "$image" \
         -c "$FIXTURE_PROXY_SCRIPT $FIXTURE_PROXY_PORT $FIXTURE_PROXY_CERT $FIXTURE_PROXY_KEY \
             $FIXTURE_CONNECT_COUNT github.com accept & \
@@ -393,7 +405,7 @@ cmd_upstream_ip() {
 # 以 UID 10001 读取，与夹具其余步骤的最小权限保持一致。
 cmd_connects() {
     local volume=$1 image=$2 status=0 count
-    count=$(docker run --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "$FIXTURE_CONNECT_COUNT" 2>/dev/null) || status=$?
+    count=$(fixture_run helper --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "$FIXTURE_CONNECT_COUNT" 2>/dev/null) || status=$?
     if [[ $status != 0 ]]; then printf '0\n'; return 0; fi
     printf '%s\n' "$count"
     return 0
@@ -403,7 +415,7 @@ cmd_connects() {
 # 以 UID 10001 读取，与夹具其余步骤的最小权限保持一致。
 cmd_connect_log() {
     local volume=$1 image=$2 status=0
-    docker run --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "${FIXTURE_CONNECT_COUNT}.log" || status=$?
+    fixture_run helper --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "${FIXTURE_CONNECT_COUNT}.log" || status=$?
     [[ $status == 0 || $status == 1 ]] || return "$FIXTURE_FAILURE"
     return 0
 }
@@ -450,7 +462,7 @@ cmd_rev_parse() {
 # 输出测试 CA 证书（PEM），供调用方放入产品卷并由测试进程信任。
 cmd_ca() {
     local volume=$1 image=$2 status=0
-    docker run --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "$FIXTURE_CA" || status=$?
+    fixture_run helper --rm --user 10001:10001 -v "$volume:$FIXTURE_MOUNT" --entrypoint cat "$image" "$FIXTURE_CA" || status=$?
     [[ $status == 0 ]] || { fail '无法读取测试 CA'; return "$FIXTURE_FAILURE"; }
     return 0
 }

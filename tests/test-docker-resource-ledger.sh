@@ -19,6 +19,7 @@ ledger_setup() {
     : > "$DOCKER_CALLS"; : > "$DELETE_CALLS"; : > "$REMOVE_RULE_CALLS"
     M_LIVE=(); M_KIND=(); M_RUN=(); M_SCEN=(); M_ROLE=(); M_DIGEST=()
     M_DELFAIL=(); M_INSPECTFAIL=(); M_ENUMFAIL=(); M_RESIDFAIL=(); M_BLOCK=()
+    : > "$S/created.tsv"
     RESOURCE_LEDGER_DIR=$S/control/resources
     RESOURCE_RUN=r1
     mkdir -p "$RESOURCE_LEDGER_DIR"
@@ -50,12 +51,26 @@ mock_docker() {
             shift
             if [[ ${1:-} == -f ]]; then fmt=${2:-}; id=${3:-}; else fmt=''; id=${1:-}; fi
             [[ ${M_INSPECTFAIL[$id]:-0} != 1 ]] || return 9
-            [[ ${M_LIVE[$id]:-0} == 1 ]] || return 1
+            # 创建返回经命令替换子壳，变量无法回传，故创建分支把状态落盘并在 inspect 时回放。
+            local created=''
+            [[ ! -s $S/created.tsv ]] || created=$(awk -F'\t' -v k="$id" '$1==k{print; exit}' "$S/created.tsv")
+            [[ ${M_LIVE[$id]:-0} == 1 || -n $created ]] || return 1
             case "$fmt" in
                 '{{.Id}}'|'{{.Name}}') printf '%s\n' "$id" ;;
-                *'.CreatedAt'*) printf '%s\n' "${M_DIGEST[$id]}" ;;
+                *'.CreatedAt'*)
+                    if [[ -n $created ]]; then
+                        printf '%s\n' "$created" | sha256sum | cut -d' ' -f1
+                    else
+                        printf '%s\n' "${M_DIGEST[$id]}"
+                    fi
+                    ;;
                 *'.Config.Labels'*|*'.Labels'*)
-                    printf '%s\t%s\t%s\n' "${M_RUN[$id]}" "${M_SCEN[$id]}" "${M_ROLE[$id]}"
+                    if [[ -n $created ]]; then
+                        IFS=$'\t' read -r _ krun kscen krole <<< "$created"
+                        printf '%s\t%s\t%s\n' "$krun" "$kscen" "$krole"
+                    else
+                        printf '%s\t%s\t%s\n' "${M_RUN[$id]}" "${M_SCEN[$id]}" "${M_ROLE[$id]}"
+                    fi
                     if [[ -n ${M_BLOCK[$id]:-} ]]; then
                         : > "$S/label-entered"
                         local w=0
@@ -94,6 +109,33 @@ mock_docker() {
                     printf '%s %s\n' "$sub" "$id" >> "$DELETE_CALLS"
                     [[ ${M_DELFAIL[$id]:-0} != 1 ]] || return 9
                     M_LIVE[$id]=0
+                    ;;
+                create)
+                    # 保存并回放：对象标签取自创建命令实际携带的 --label；创建命令漏带
+                    # scenario/role 时回放为空，登记阶段即失败，使该回归在契约层直接转红。
+                    local i name='' lab run='' scenario='' role=''
+                    local -a argv=("$@")
+                    for ((i = 2; i < ${#argv[@]}; i++)); do
+                        case "${argv[i]}" in
+                            --label) i=$((i + 1)) ;;
+                            -*) ;;
+                            *) name=${argv[i]} ;;
+                        esac
+                    done
+                    [[ -n $name ]] || return 9
+                    if [[ $sub == volume ]]; then id=$name; else id="net-$name"; fi
+                    for ((i = 2; i < ${#argv[@]}; i++)); do
+                        [[ ${argv[i]} == --label ]] || continue
+                        lab=${argv[i + 1]}
+                        i=$((i + 1))
+                        case "$lab" in
+                            gitdaemon.run=*) run=${lab#*=} ;;
+                            gitdaemon.scenario=*) scenario=${lab#*=} ;;
+                            gitdaemon.role=*) role=${lab#*=} ;;
+                        esac
+                    done
+                    printf '%s\t%s\t%s\t%s\n' "$id" "$run" "$scenario" "$role" >> "$S/created.tsv"
+                    printf '%s\n' "$id"
                     ;;
                 inspect) printf 'false\n' ;;
                 *) return 0 ;;
@@ -493,6 +535,44 @@ case_helper_registers_three_labels() {
     rm -rf "$S"
 }
 
+# 卷与网络的创建命令必须自带齐备三 label：替身保存创建命令标签并在 inspect 时回放，
+# 缺 scenario/role 时登记失败、创建整体返回 2，绝不登记半身份对象。
+case_volume_network_create_carries_labels() {
+    ledger_setup
+    install_docker_double
+    local scratch=$S rc=0
+    mkdir -p "$scratch/control"
+    local IT_EVIDENCE_DIR=$scratch IT_RUN_ID=r1 IT_NETWORK=gm-r1-net IT_DNS_IP=172.30.243.53 IT_NETWORK_GUARD_READY=1
+    local IT_SCENARIO=fixture IT_ROLE=assets
+    # 包装器创建内部经 `command docker`；替身在此接管，只走 mock，不触碰真实 daemon。
+    command() {
+        [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+        shift
+        mock_docker "$@"
+    }
+    rc=0
+    docker volume create gm-r1-assets >/dev/null || rc=$?
+    printf 'volume_create=%s\n' "$rc"
+    [[ $rc == 0 ]] || { printf 'volume create calls: %s\n' "$(tr '\n' '|' < "$DOCKER_CALLS")"; return 1; }
+    grep -q -- '--label gitdaemon.scenario=fixture' "$DOCKER_CALLS" \
+        || { printf 'volume create missing scenario label\n'; return 1; }
+    grep -q -- '--label gitdaemon.role=assets' "$DOCKER_CALLS" \
+        || { printf 'volume create missing role label\n'; return 1; }
+    grep -q $'register\tvolume\tgm-r1-assets\tr1\tfixture\tassets\t' "$RESOURCE_LEDGER_DIR/ledger.tsv" \
+        || { printf 'volume register record missing\n'; return 1; }
+    rc=0
+    docker network create gm-r1-net >/dev/null || rc=$?
+    printf 'network_create=%s\n' "$rc"
+    [[ $rc == 0 ]] || { printf 'network create calls: %s\n' "$(tr '\n' '|' < "$DOCKER_CALLS")"; return 1; }
+    grep -q -- '--label gitdaemon.scenario=fixture' "$DOCKER_CALLS" \
+        || { printf 'network create missing scenario label\n'; return 1; }
+    grep -q -- '--label gitdaemon.role=assets' "$DOCKER_CALLS" \
+        || { printf 'network create missing role label\n'; return 1; }
+    grep -q $'register\tnetwork\tnet-gm-r1-net\tr1\tfixture\tassets\t' "$RESOURCE_LEDGER_DIR/ledger.tsv" \
+        || { printf 'network register record missing\n'; return 1; }
+    rm -rf "$S"
+}
+
 # 账本不可解析时必须留下固定可观测标记，绝不静默回退到旧语义。
 case_ledger_gate_is_observable() {
     ledger_setup
@@ -543,6 +623,7 @@ for name in \
     register_failure_blocks_start \
     register_requires_three_labels \
     helper_registers_three_labels \
+    volume_network_create_carries_labels \
     ledger_gate_is_observable; do
     rc=0
     ( "case_$name" ) || rc=$?

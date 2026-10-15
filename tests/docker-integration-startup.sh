@@ -145,9 +145,12 @@ docker() {
         shift 2
         local vname=''
         if ledger_dir=$(resource_ledger_dir); then
+            # 登记要求对象自身齐备三 label；创建命令必须与入参 scenario/role 完全一致。
             RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
             resource_create_register volume "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-volume}" -- \
-                command docker volume create --label "gitdaemon.run=$IT_RUN_ID" "$@" || return $?
+                command docker volume create --label "gitdaemon.run=$IT_RUN_ID" \
+                --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
+                --label "gitdaemon.role=${IT_ROLE:-volume}" "$@" || return $?
             printf '%s\n' "$RESOURCE_CREATED_ID"
             return 0
         fi
@@ -159,9 +162,12 @@ docker() {
     if [[ $sub == network && ${2:-} == create ]]; then
         local nid=''
         if ledger_dir=$(resource_ledger_dir); then
+            # 与卷路径一致：网络创建命令同样携带齐备的三 label，登记入参与其逐一相符。
             RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
             resource_create_register network "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-network}" -- \
-                command docker "$@" || return $?
+                command docker network create --label "gitdaemon.run=$IT_RUN_ID" \
+                --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
+                --label "gitdaemon.role=${IT_ROLE:-network}" "${@:3}" || return $?
             printf '%s\n' "$RESOURCE_CREATED_ID"
             return 0
         fi
