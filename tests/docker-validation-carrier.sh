@@ -19,6 +19,7 @@ CARRIER_RUNNER_USER=''
 CARRIER_RUNNER_UID=''
 CARRIER_RUNNER_GID=''
 CARRIER_EXPIRES_AT_EPOCH=''
+CARRIER_DOCKERD_READY_ATTEMPTS=${CARRIER_DOCKERD_READY_ATTEMPTS:-100}
 
 # 外部事实边界。
 carrier_now_epoch() { date +%s; }
@@ -28,11 +29,11 @@ carrier_host_boot_id() { tr -d '[:space:]' < /proc/sys/kernel/random/boot_id; }
 carrier_current_namespace() { stat -Lc '%d %i' /proc/self/ns/net; stat -Lc '%d %i' /proc/self/ns/mnt; }
 carrier_host_namespace() { stat -Lc '%d %i' /proc/1/ns/net; stat -Lc '%d %i' /proc/1/ns/mnt; }
 carrier_proc_starttime() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
-carrier_socket_facts() { local real; real=$(readlink -f -- "$1") || return 1; stat -Lc "%d %i %u %g $real" "$real"; }
+carrier_socket_facts() { local real; real=$(readlink -f -- "$1") || return 1; stat -Lc "%d %i %u %g %a $real" "$real"; }
 carrier_daemon_id() { command docker --host "$1" info --format '{{.ID}}'; }
 carrier_effect() { "$@"; }
 carrier_file_facts() { stat -c '%u %a' "$1" 2>/dev/null; }
-carrier_host_readonly_query() { local argv=$1; bash -c "$argv"; }
+carrier_host_readonly_query() { "$@"; }
 carrier_path_sha256() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 carrier_source_sha256() {
     ( CDPATH= cd -- "$1" 2>/dev/null || exit 1
@@ -45,6 +46,11 @@ carrier_runtime_root() { printf '/run/gitdaemon-validation\n'; }
 carrier_holder_namespace() { stat -Lc '%d %i' "/proc/$1/ns/net"; stat -Lc '%d %i' "/proc/$1/ns/mnt"; }
 carrier_start_holder() { unshare --net --mount --propagation private sleep infinity >/dev/null 2>&1 & printf '%s\n' "$!"; }
 carrier_start_dockerd() { local holder=$1; shift; nsenter --target "$holder" --net --mount -- "$@" >/dev/null 2>&1 & printf '%s\n' "$!"; }
+carrier_process_alive() { kill -0 "$1" 2>/dev/null; }
+carrier_sleep() { sleep "$1"; }
+carrier_stop_process() { kill -TERM "$1" 2>/dev/null || return 0; }
+carrier_remove_tree() { rm -rf -- "$1"; }
+carrier_configure_socket() { chown "0:$2" "$1" && chmod 660 "$1"; }
 
 # root 所有且不可由组或其他用户写入。
 carrier_file_guard() {
@@ -132,7 +138,27 @@ carrier_holder_argv() { printf 'unshare --net --mount --propagation private\n'; 
 carrier_dockerd_argv() {
     local run=${1:-}
     [[ $run =~ ^[A-Za-z0-9-]{1,32}$ ]] || return 2
-    printf 'dockerd --config-file /var/lib/gitdaemon-validation/%s/daemon.json --data-root /var/lib/gitdaemon-validation/%s/docker-data --exec-root /run/gitdaemon-validation/%s/docker-exec --pidfile /run/gitdaemon-validation/%s/dockerd.pid --host unix:///run/gitdaemon-validation/%s/docker.sock\n' "$run" "$run" "$run" "$run" "$run"
+    printf 'dockerd --config-file /var/lib/gitdaemon-validation/%s/daemon.json --data-root /var/lib/gitdaemon-validation/%s/docker-data --exec-root /run/gitdaemon-validation/%s/docker-exec --pidfile /run/gitdaemon-validation/%s/dockerd.pid --host unix:///run/gitdaemon-validation/%s/docker.sock --containerd-namespace gitdaemon-%s --containerd-plugins-namespace gitdaemon-%s-plugins\n' "$run" "$run" "$run" "$run" "$run" "$run" "$run"
+}
+
+# 等待私有 daemon 可查询并返回稳定身份。
+carrier_wait_dockerd() {
+    local endpoint=$1 pid=$2 attempt daemon
+    for ((attempt=0; attempt<CARRIER_DOCKERD_READY_ATTEMPTS; attempt++)); do
+        carrier_process_alive "$pid" || return 80
+        daemon=$(carrier_daemon_id "$endpoint" 2>/dev/null) && [[ -n $daemon ]] && { printf '%s\n' "$daemon"; return 0; }
+        carrier_sleep 0.1
+    done
+    return 80
+}
+
+# 只撤销本次 create 已产生的进程和目录。
+carrier_create_rollback() {
+    local holder=${1:-} dockerd=${2:-} state_dir=${3:-} run_dir=${4:-}
+    [[ -z $dockerd ]] || carrier_stop_process "$dockerd"
+    [[ -z $holder ]] || carrier_stop_process "$holder"
+    [[ -z $run_dir || ! -e $run_dir ]] || carrier_remove_tree "$run_dir"
+    [[ -z $state_dir || ! -e $state_dir ]] || carrier_remove_tree "$state_dir"
 }
 
 # 创建固定审批副本、独立 holder/dockerd，并原子写入完整状态。
@@ -161,27 +187,31 @@ carrier_create() {
     state_root=$(carrier_state_root); runtime_root=$(carrier_runtime_root)
     [[ $state_dir == "$state_root/$CARRIER_RUN_ID" && ! -e $state_dir ]] || return 77
     run_dir=$runtime_root/$CARRIER_RUN_ID
-    mkdir -p "$state_dir" "$run_dir" || return 80
-    chmod 700 "$state_dir" "$run_dir" || return 80
+    [[ ! -e $run_dir ]] || return 77
+    mkdir -p "$state_dir" "$run_dir" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
+    chmod 700 "$state_dir" "$run_dir" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
     approval_copy=$state_dir/approval.tsv
-    cp -- "$approval" "$approval_copy" || return 80
-    chmod 600 "$approval_copy" || return 80
-    carrier_approval_load "$approval_copy" || return 77
+    cp -- "$approval" "$approval_copy" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
+    chmod 600 "$approval_copy" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
+    carrier_approval_load "$approval_copy" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 77; }
     approval_hash=$CARRIER_APPROVAL_SHA256
-    holder=$(carrier_start_holder) || return 80
-    holder_start=$(carrier_proc_starttime "$holder") || return 80
-    namespace=$(carrier_holder_namespace "$holder" | tr '\n' ' ') || return 80
+    holder=$(carrier_start_holder) || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
+    holder_start=$(carrier_proc_starttime "$holder") || { carrier_create_rollback "$holder" '' "$state_dir" "$run_dir"; return 80; }
+    namespace=$(carrier_holder_namespace "$holder" | tr '\n' ' ') || { carrier_create_rollback "$holder" '' "$state_dir" "$run_dir"; return 80; }
     read -r net_device net_inode mnt_device mnt_inode <<< "$namespace"
     data_root=$state_dir/docker-data; exec_root=$run_dir/docker-exec
-    mkdir -p "$data_root" "$exec_root" || return 80
-    printf '{}\n' > "$state_dir/daemon.json" || return 80
-    chmod 600 "$state_dir/daemon.json" || return 80
+    mkdir -p "$data_root" "$exec_root" || { carrier_create_rollback "$holder" '' "$state_dir" "$run_dir"; return 80; }
+    printf '{}\n' > "$state_dir/daemon.json" || { carrier_create_rollback "$holder" '' "$state_dir" "$run_dir"; return 80; }
+    chmod 600 "$state_dir/daemon.json" || { carrier_create_rollback "$holder" '' "$state_dir" "$run_dir"; return 80; }
     endpoint=unix://$run_dir/docker.sock; socket=$run_dir/docker.sock
-    dockerd=$(carrier_start_dockerd "$holder" dockerd --config-file "$state_dir/daemon.json" --data-root "$data_root" --exec-root "$exec_root" --pidfile "$run_dir/dockerd.pid" --host "$endpoint") || return 80
-    dockerd_start=$(carrier_proc_starttime "$dockerd") || return 80
-    facts=$(carrier_socket_facts "$socket") || return 80
-    daemon=$(carrier_daemon_id "$endpoint") || return 80
-    read -r socket_device socket_inode socket_uid socket_gid socket_realpath <<< "$facts"
+    dockerd=$(carrier_start_dockerd "$holder" dockerd --config-file "$state_dir/daemon.json" --data-root "$data_root" --exec-root "$exec_root" --pidfile "$run_dir/dockerd.pid" --host "$endpoint" --containerd-namespace "gitdaemon-$CARRIER_RUN_ID" --containerd-plugins-namespace "gitdaemon-$CARRIER_RUN_ID-plugins") || { carrier_create_rollback "$holder" '' "$state_dir" "$run_dir"; return 80; }
+    dockerd_start=$(carrier_proc_starttime "$dockerd") || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    daemon=$(carrier_wait_dockerd "$endpoint" "$dockerd") || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    carrier_configure_socket "$socket" "$CARRIER_RUNNER_GID" || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    facts=$(carrier_socket_facts "$socket") || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    local socket_mode
+    read -r socket_device socket_inode socket_uid socket_gid socket_mode socket_realpath <<< "$facts"
+    [[ $socket_uid == 0 && $socket_gid == "$CARRIER_RUNNER_GID" && $socket_mode == 660 ]] || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 77; }
     {
         printf 'schema_version\t1\nrun_id\t%s\n' "$CARRIER_RUN_ID"
         printf 'host_machine_id\t%s\nhost_boot_id\t%s\n' "$CARRIER_HOST_MACHINE_ID" "$CARRIER_HOST_BOOT_ID"
@@ -191,18 +221,29 @@ carrier_create() {
         printf 'docker_endpoint\t%s\nsocket_realpath\t%s\n' "$endpoint" "$socket"
         printf 'socket_device\t%s\nsocket_inode\t%s\nsocket_uid\t%s\nsocket_gid\t%s\n' "$socket_device" "$socket_inode" "$socket_uid" "$socket_gid"
         printf 'data_root\t%s\nexec_root\t%s\napproval_sha256\t%s\n' "$data_root" "$exec_root" "$approval_hash"
-    } > "$state_dir/state.tsv.tmp" || return 80
-    chmod 600 "$state_dir/state.tsv.tmp" || return 80
-    mv "$state_dir/state.tsv.tmp" "$state_dir/state.tsv" || return 80
-    [[ $(sha256sum "$approval_copy" | cut -d' ' -f1) == "$approval_hash" ]] || return 77
+    } > "$state_dir/state.tsv.tmp" || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    chmod 600 "$state_dir/state.tsv.tmp" || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    mv "$state_dir/state.tsv.tmp" "$state_dir/state.tsv" || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 80; }
+    [[ $(sha256sum "$approval_copy" | cut -d' ' -f1) == "$approval_hash" ]] || { carrier_create_rollback "$holder" "$dockerd" "$state_dir" "$run_dir"; return 77; }
 }
 
 # 测试夹具生成与生产格式相同的 state 和 manifest 摘要链。
 carrier_test_state_write() {
-    local approval=$1 state=$2 manifest=$3 approval_hash state_hash state_root runtime_root
+    local approval=$1 state=$2 manifest=$3 attestation=${4:-$(dirname "$state")/attestation} profile=${5:-$(dirname "$state")/profile}
+    local approval_hash state_hash state_root runtime_root attestation_hash profile_hash explicit_inputs=0
+    [[ $# -lt 5 ]] || explicit_inputs=1
     carrier_approval_load "$approval" || return $?
     approval_hash=$CARRIER_APPROVAL_SHA256
     state_root=$(carrier_state_root); runtime_root=$(carrier_runtime_root)
+    [[ -f $attestation ]] || printf 'attestation\n' > "$attestation"
+    [[ -f $profile ]] || printf 'profile\n' > "$profile"
+    if (( explicit_inputs )); then
+        attestation_hash=$(sha256sum "$attestation" | cut -d' ' -f1)
+        profile_hash=$(sha256sum "$profile" | cut -d' ' -f1)
+    else
+        attestation_hash=$CARRIER_MAPPING_PROFILE_SHA256
+        profile_hash=$CARRIER_MAPPING_PROFILE_SHA256
+    fi
     {
         printf 'schema_version\t1\nrun_id\t%s\n' "$CARRIER_RUN_ID"
         printf 'host_machine_id\t0123456789abcdef0123456789abcdef\nhost_boot_id\taaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n'
@@ -217,12 +258,12 @@ carrier_test_state_write() {
     state_hash=$(sha256sum "$state" | cut -d' ' -f1)
     {
         printf 'schema_version\t2\nprofile\tisolated-netns\nrun_id\t%s\nexpires_at_epoch\t2000000000\n' "$CARRIER_RUN_ID"
-        printf 'machine_id\t%s\nboot_id\t%s\noffline_attestation_sha256\t%s\n' "$CARRIER_HOST_MACHINE_ID" "$CARRIER_HOST_BOOT_ID" "$CARRIER_MAPPING_PROFILE_SHA256"
+        printf 'machine_id\t%s\nboot_id\t%s\noffline_attestation_sha256\t%s\n' "$CARRIER_HOST_MACHINE_ID" "$CARRIER_HOST_BOOT_ID" "$attestation_hash"
         printf 'runner_user\t%s\nrunner_uid\t%s\nrunner_gid\t%s\n' "$CARRIER_RUNNER_USER" "$CARRIER_RUNNER_UID" "$CARRIER_RUNNER_GID"
         printf 'source_dir\t%s\nsource_sha256\t%s\nrunner_entry\ttests/test-docker-network.sh\n' "$CARRIER_SOURCE_DIR" "$CARRIER_SOURCE_SHA256"
         printf 'docker_endpoint\tunix://%s/%s/docker.sock\ndaemon_id\tdaemon-contract-0001\n' "$runtime_root" "$CARRIER_RUN_ID"
         printf 'socket_realpath\t%s/%s/docker.sock\nsocket_device\t9999\nsocket_inode\t4242\nsocket_uid\t0\nsocket_gid\t10001\n' "$runtime_root" "$CARRIER_RUN_ID"
-        printf 'product_image_id\t%s\ntools_image_id\t%s\nmapping_profile_sha256\t%s\n' "$CARRIER_PRODUCT_IMAGE_ID" "$CARRIER_TOOLS_IMAGE_ID" "$CARRIER_MAPPING_PROFILE_SHA256"
+        printf 'product_image_id\t%s\ntools_image_id\t%s\nmapping_profile_sha256\t%s\n' "$CARRIER_PRODUCT_IMAGE_ID" "$CARRIER_TOOLS_IMAGE_ID" "$profile_hash"
         printf 'holder_pid\t31337\nholder_start_ticks\t888\nnetns_device\t4\nnetns_inode\t4001\nmntns_device\t4\nmntns_inode\t4002\n'
         printf 'carrier_state_sha256\t%s\n' "$state_hash"
     } > "$manifest"
@@ -258,9 +299,10 @@ carrier_manifest_load() {
         key=${CARRIER_PARSED_KEYS[i]}; value=${CARRIER_PARSED_VALUES[i]}
         case "$key" in
             schema_version) CM_SCHEMA=$value ;; profile) CM_PROFILE=$value ;; run_id) CM_RUN_ID=$value ;;
-            machine_id) CM_MACHINE_ID=$value ;; boot_id) CM_BOOT_ID=$value ;;
+            expires_at_epoch) CM_EXPIRES_AT=$value ;; machine_id) CM_MACHINE_ID=$value ;; boot_id) CM_BOOT_ID=$value ;;
+            offline_attestation_sha256) CM_ATTESTATION_SHA=$value ;;
             runner_user) CM_RUNNER_USER=$value ;; runner_uid) CM_RUNNER_UID=$value ;; runner_gid) CM_RUNNER_GID=$value ;;
-            source_dir) CM_SOURCE_DIR=$value ;; source_sha256) CM_SOURCE_SHA=$value ;;
+            source_dir) CM_SOURCE_DIR=$value ;; source_sha256) CM_SOURCE_SHA=$value ;; runner_entry) CM_RUNNER_ENTRY=$value ;;
             docker_endpoint) CM_ENDPOINT=$value ;; daemon_id) CM_DAEMON_ID=$value ;;
             socket_realpath) CM_SOCKET_REALPATH=$value ;; socket_device) CM_SOCKET_DEVICE=$value ;;
             socket_inode) CM_SOCKET_INODE=$value ;; socket_uid) CM_SOCKET_UID=$value ;; socket_gid) CM_SOCKET_GID=$value ;;
@@ -272,11 +314,13 @@ carrier_manifest_load() {
         esac
     done
     [[ $CM_SCHEMA == 2 && $CM_PROFILE == isolated-netns ]] || return 77
+    [[ $CM_EXPIRES_AT =~ ^[0-9]{1,12}$ && $CM_RUNNER_ENTRY == tests/test-docker-network.sh ]] || return 77
+    [[ $CM_ATTESTATION_SHA =~ ^[0-9a-f]{64}$ && $CM_PROFILE_SHA =~ ^[0-9a-f]{64}$ && $CM_STATE_SHA =~ ^[0-9a-f]{64}$ ]] || return 77
 }
 
 # 核验 holder、namespace、socket 与 daemon 身份。
 carrier_verify() {
-    local state=${1:-} current holder_ns socket actual state_root runtime_root
+    local state=${1:-} current holder_ns socket actual state_root runtime_root socket_mode
     [[ $# == 1 ]] || return 2
     carrier_state_load "$state" || return $?
     [[ $(carrier_host_machine_id) == "$CS_MACHINE_ID" && $(carrier_host_boot_id) == "$CS_BOOT_ID" ]] || return 77
@@ -291,7 +335,8 @@ carrier_verify() {
     [[ $CS_ENDPOINT == "unix://$runtime_root/$CS_RUN_ID/docker.sock" && $CS_SOCKET_REALPATH == "$runtime_root/$CS_RUN_ID/docker.sock" ]] || return 77
     [[ $(carrier_proc_starttime "$CS_DOCKERD_PID") == "$CS_DOCKERD_START" ]] || return 77
     socket=$(carrier_socket_facts "$CS_SOCKET_REALPATH") || return 77
-    [[ $socket == "$CS_SOCKET_DEVICE $CS_SOCKET_INODE $CS_SOCKET_UID $CS_SOCKET_GID $CS_SOCKET_REALPATH" ]] || return 77
+    read -r _ _ _ _ socket_mode _ <<< "$socket"
+    [[ $socket == "$CS_SOCKET_DEVICE $CS_SOCKET_INODE $CS_SOCKET_UID $CS_SOCKET_GID 660 $CS_SOCKET_REALPATH" ]] || return 77
     actual=$(carrier_daemon_id "$CS_ENDPOINT") || return 77
     [[ $actual == "$CS_DAEMON_ID" ]] || return 77
 }
@@ -310,7 +355,7 @@ carrier_holder_verify() {
     [[ $CS_DATA_ROOT == "$state_root/$CS_RUN_ID/docker-data" && $CS_EXEC_ROOT == "$runtime_root/$CS_RUN_ID/docker-exec" ]] || return 77
     [[ $CS_ENDPOINT == "unix://$runtime_root/$CS_RUN_ID/docker.sock" && $CS_SOCKET_REALPATH == "$runtime_root/$CS_RUN_ID/docker.sock" ]] || return 77
     [[ $(carrier_proc_starttime "$CS_DOCKERD_PID") == "$CS_DOCKERD_START" ]] || return 77
-    [[ $(carrier_socket_facts "$CS_SOCKET_REALPATH") == "$CS_SOCKET_DEVICE $CS_SOCKET_INODE $CS_SOCKET_UID $CS_SOCKET_GID $CS_SOCKET_REALPATH" ]] || return 77
+    [[ $(carrier_socket_facts "$CS_SOCKET_REALPATH") == "$CS_SOCKET_DEVICE $CS_SOCKET_INODE $CS_SOCKET_UID $CS_SOCKET_GID 660 $CS_SOCKET_REALPATH" ]] || return 77
     [[ $(carrier_daemon_id "$CS_ENDPOINT") == "$CS_DAEMON_ID" ]] || return 77
 }
 
@@ -319,6 +364,8 @@ carrier_run() {
     local state=$1 manifest=$2 attestation=$3 profile=$4 mode=$5 evidence=$6 order=$7 approval state_hash expected_hash requested_order guard_path
     [[ $# == 7 ]] || return 2
     carrier_manifest_load "$manifest" || return $?
+    [[ $(carrier_path_sha256 "$attestation") == "$CM_ATTESTATION_SHA" ]] || return 77
+    [[ $(carrier_path_sha256 "$profile") == "$CM_PROFILE_SHA" ]] || return 77
     expected_hash=$CM_STATE_SHA
     state_hash=$(sha256sum "$state" 2>/dev/null | cut -d' ' -f1)
     [[ -n $expected_hash && $state_hash == "$expected_hash" ]] || return 77
@@ -326,9 +373,11 @@ carrier_run() {
     approval=$(dirname "$state")/approval.tsv
     carrier_approval_load "$approval" || { [[ $? == 2 ]] && return 77; return 77; }
     [[ $CARRIER_APPROVAL_SHA256 == "$CS_APPROVAL_SHA" ]] || return 77
+    [[ $CM_EXPIRES_AT == "$CARRIER_EXPIRES_AT_EPOCH" ]] || return 77
     [[ $CM_RUN_ID == "$CS_RUN_ID" && $CM_MACHINE_ID == "$CS_MACHINE_ID" && $CM_BOOT_ID == "$CS_BOOT_ID" ]] || return 77
     [[ $CM_RUNNER_USER == "$CARRIER_RUNNER_USER" && $CM_RUNNER_UID == "$CARRIER_RUNNER_UID" && $CM_RUNNER_GID == "$CARRIER_RUNNER_GID" ]] || return 77
     [[ $CM_SOURCE_DIR == "$CARRIER_SOURCE_DIR" && $CM_SOURCE_SHA == "$CARRIER_SOURCE_SHA256" ]] || return 77
+    [[ $(carrier_source_sha256 "$CARRIER_SOURCE_DIR") == "$CARRIER_SOURCE_SHA256" ]] || return 77
     [[ $CM_PRODUCT_IMAGE == "$CARRIER_PRODUCT_IMAGE_ID" && $CM_TOOLS_IMAGE == "$CARRIER_TOOLS_IMAGE_ID" && $CM_PROFILE_SHA == "$CARRIER_MAPPING_PROFILE_SHA256" ]] || return 77
     [[ $CM_HOLDER_PID == "$CS_HOLDER_PID" && $CM_HOLDER_START == "$CS_HOLDER_START" ]] || return 77
     [[ $CM_NET_DEVICE == "$CS_NET_DEVICE" && $CM_NET_INODE == "$CS_NET_INODE" && $CM_MNT_DEVICE == "$CS_MNT_DEVICE" && $CM_MNT_INODE == "$CS_MNT_INODE" ]] || return 77
@@ -341,37 +390,110 @@ carrier_run() {
     carrier_holder_verify "$state" || return $?
     guard_path=$(dirname "${BASH_SOURCE[0]}")/docker-network-guard.sh
     if [[ $mode == mapping-sequence ]]; then
-        carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- env IT_MAPPING_ORDER="$order" bash "$guard_path" "$mode" "$CARRIER_SOURCE_DIR" "$CS_RUN_ID" "$evidence" "$CARRIER_PRODUCT_IMAGE_ID" "$CARRIER_TOOLS_IMAGE_ID" "$manifest" "$attestation" "$profile"
+        carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- env IT_MAPPING_ORDER="$order" bash "$guard_path" --mode "$mode" --source-dir "$CARRIER_SOURCE_DIR" --run-id "$CS_RUN_ID" --evidence-dir "$evidence" --runner-user "$CARRIER_RUNNER_USER" --product-image "$CARRIER_PRODUCT_IMAGE_ID" --tools-image "$CARRIER_TOOLS_IMAGE_ID" --environment-manifest "$manifest" --offline-attestation "$attestation" --mapping-profile "$profile"
         return $?
     fi
-    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- env -u IT_MAPPING_ORDER bash "$guard_path" "$mode" "$CARRIER_SOURCE_DIR" "$CS_RUN_ID" "$evidence" "$CARRIER_PRODUCT_IMAGE_ID" "$CARRIER_TOOLS_IMAGE_ID" "$manifest" "$attestation" "$profile"
+    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- env -u IT_MAPPING_ORDER bash "$guard_path" --mode "$mode" --source-dir "$CARRIER_SOURCE_DIR" --run-id "$CS_RUN_ID" --evidence-dir "$evidence" --runner-user "$CARRIER_RUNNER_USER" --product-image "$CARRIER_PRODUCT_IMAGE_ID" --tools-image "$CARRIER_TOOLS_IMAGE_ID" --environment-manifest "$manifest" --offline-attestation "$attestation" --mapping-profile "$profile"
+}
+
+# 在已验证的 holder 内复用统一资源账本执行真实精确清理。
+carrier_internal_cleanup() {
+    local state=${1:-} evidence=${2:-} source
+    [[ $# == 2 && $evidence == /* ]] || return 2
+    carrier_verify "$state" || return $?
+    source=$(dirname "${BASH_SOURCE[0]}")
+    source "$source/docker-validation-environment.sh" || return 2
+    source "$source/docker-resource-ledger.sh" || return 2
+    VE_SCHEMA_VERSION=2
+    VE_RUN_ID=$CS_RUN_ID
+    VE_DOCKER_ENDPOINT=$CS_ENDPOINT
+    resource_docker() { validation_docker "$@"; }
+    RESOURCE_LEDGER_DIR=$evidence/control/resources RESOURCE_RUN=$CS_RUN_ID
+    resource_cleanup "$RESOURCE_LEDGER_DIR" || return 2
 }
 
 # 在同一 holder namespace 中执行封闭清理入口。
 carrier_cleanup() {
-    local state=${1:-} evidence=${2:-}
+    local state=${1:-} evidence=${2:-} script state_dir run_dir
     [[ $# == 2 && $evidence == /* ]] || return 2
     carrier_holder_verify "$state" || return $?
-    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- cleanup "$state" "$evidence"
+    script=$(readlink -f -- "${BASH_SOURCE[0]}") || return 77
+    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- bash "$script" internal-cleanup "$state" "$evidence" || return $?
+    state_dir=$(dirname "$state"); run_dir=$(dirname "$CS_EXEC_ROOT")
+    carrier_stop_process "$CS_DOCKERD_PID"
+    carrier_stop_process "$CS_HOLDER_PID"
+    [[ ! -e $run_dir ]] || carrier_remove_tree "$run_dir" || return 2
+    [[ ! -e $CS_DATA_ROOT ]] || carrier_remove_tree "$CS_DATA_ROOT" || return 2
 }
 
 # 恢复要求操作者显式确认 runner 已停止，再复用同一身份核验边界。
 carrier_recover() {
-    local state=${1:-} evidence=${2:-} confirmation=${3:-}
+    local state=${1:-} evidence=${2:-} confirmation=${3:-} recovery
     [[ $# == 3 && $evidence == /* ]] || return 2
     [[ $confirmation == --runner-stopped ]] || return 64
     carrier_holder_verify "$state" || return $?
-    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- recover "$state" "$evidence" "$confirmation"
+    recovery=$evidence/recover.sh
+    [[ -f $recovery && ! -L $recovery ]] || return 77
+    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- bash "$recovery" "$confirmation"
 }
 
 # 固定宿主只读 Docker argv 清单。
 carrier_host_inventory_argv() {
-    printf "docker --host unix:///var/run/docker.sock info --format '{{.ID}}'; docker --host unix:///var/run/docker.sock container ls -aq --no-trunc; docker --host unix:///var/run/docker.sock network ls -q --no-trunc; docker --host unix:///var/run/docker.sock volume ls -q; docker --host unix:///var/run/docker.sock image ls -aq --no-trunc\n"
+    printf "%s\n" \
+        "docker --host unix:///var/run/docker.sock info --format '{{.ID}}'" \
+        'docker --host unix:///var/run/docker.sock container ls -aq --no-trunc' \
+        'docker --host unix:///var/run/docker.sock network ls -q --no-trunc' \
+        'docker --host unix:///var/run/docker.sock volume ls -q' \
+        'docker --host unix:///var/run/docker.sock image ls -aq --no-trunc' \
+        'ip -4 route show table all' 'ip -6 route show table all' 'ip -4 rule show' 'ip -6 rule show' \
+        'ip -4 address show' 'ip -6 address show' 'iptables-save' 'ip6tables-save'
+}
+
+# 将固定命令的 argv、退出码和输出分别持久化。
+carrier_host_inventory_command() {
+    local snapshot=$1 name=$2; shift 2
+    local rc=0
+    printf '%q ' "$@" > "$snapshot/$name.argv"; printf '\n' >> "$snapshot/$name.argv"
+    carrier_host_readonly_query "$@" > "$snapshot/$name.stdout" 2> "$snapshot/$name.stderr" || rc=$?
+    printf '%s\n' "$rc" > "$snapshot/$name.exit"
+    printf '%s\n' "$name" >> "$snapshot/commands.tsv"
+    [[ $rc == 0 ]]
+}
+
+# 对列表结果逐项执行对应 inspect，并保留每个对象的独立命令证据。
+carrier_host_inventory_inspect() {
+    local snapshot=$1 kind=$2 list_name=$3 identity index=0
+    while IFS= read -r identity; do
+        [[ -z $identity ]] && continue
+        [[ $identity != -* ]] || return 80
+        case "$kind" in
+            container|network|image) [[ $identity =~ ^[0-9a-f]{12,64}$ ]] || return 80 ;;
+            volume) [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] || return 80 ;;
+            *) return 80 ;;
+        esac
+        carrier_host_inventory_command "$snapshot" "$kind-inspect-$index" docker --host unix:///var/run/docker.sock "$kind" inspect "$identity" || return 80
+        index=$((index + 1))
+    done < "$snapshot/$list_name.stdout"
+}
+
+# 比较完整前后命令集合与输出，不把查询失败当作空集合。
+carrier_host_inventory_compare() {
+    local state_dir=${1:-} before after name
+    [[ $# == 1 ]] || return 2
+    before=$state_dir/host-before; after=$state_dir/host-after
+    [[ -f $before/complete && -f $after/complete ]] || return 2
+    cmp -s "$before/commands.tsv" "$after/commands.tsv" || return 1
+    while IFS= read -r name; do
+        cmp -s "$before/$name.argv" "$after/$name.argv" || return 1
+        grep -qx '0' "$before/$name.exit" && grep -qx '0' "$after/$name.exit" || return 1
+        cmp -s "$before/$name.stdout" "$after/$name.stdout" || return 1
+        cmp -s "$before/$name.stderr" "$after/$name.stderr" || return 1
+    done < "$before/commands.tsv"
 }
 
 # 宿主盘点只接受 root、宿主 namespace 和 before/after 固定阶段。
 carrier_host_inventory() {
-    local approval=${1:-} state_dir=${2:-} phase=${3:-} snapshot identity argv
+    local approval=${1:-} state_dir=${2:-} phase=${3:-} snapshot identity
     [[ $# == 3 && -n $approval && -n $state_dir ]] || return 2
     [[ $phase == before || $phase == after ]] || return 2
     [[ $(carrier_current_uid) == 0 ]] || return 77
@@ -387,9 +509,43 @@ carrier_host_inventory() {
         printf 'machine_id\t%s\nboot_id\t%s\n' "$CARRIER_HOST_MACHINE_ID" "$CARRIER_HOST_BOOT_ID"
         printf 'namespace\t%s\n' "$identity"
     } > "$snapshot/identity.tsv" || return 80
-    argv=$(carrier_host_inventory_argv)
-    carrier_host_readonly_query "$argv" > "$snapshot/docker.tsv" || return 80
+    : > "$snapshot/commands.tsv"
+    carrier_host_inventory_command "$snapshot" docker-info docker --host unix:///var/run/docker.sock info --format '{{.ID}}' || return 80
+    carrier_host_inventory_command "$snapshot" containers docker --host unix:///var/run/docker.sock container ls -aq --no-trunc || return 80
+    carrier_host_inventory_inspect "$snapshot" container containers || return 80
+    carrier_host_inventory_command "$snapshot" networks docker --host unix:///var/run/docker.sock network ls -q --no-trunc || return 80
+    carrier_host_inventory_inspect "$snapshot" network networks || return 80
+    carrier_host_inventory_command "$snapshot" volumes docker --host unix:///var/run/docker.sock volume ls -q || return 80
+    carrier_host_inventory_inspect "$snapshot" volume volumes || return 80
+    carrier_host_inventory_command "$snapshot" images docker --host unix:///var/run/docker.sock image ls -aq --no-trunc || return 80
+    carrier_host_inventory_inspect "$snapshot" image images || return 80
+    carrier_host_inventory_command "$snapshot" route4 ip -4 route show table all || return 80
+    carrier_host_inventory_command "$snapshot" route6 ip -6 route show table all || return 80
+    carrier_host_inventory_command "$snapshot" rule4 ip -4 rule show || return 80
+    carrier_host_inventory_command "$snapshot" rule6 ip -6 rule show || return 80
+    carrier_host_inventory_command "$snapshot" address4 ip -4 address show || return 80
+    carrier_host_inventory_command "$snapshot" address6 ip -6 address show || return 80
+    carrier_host_inventory_command "$snapshot" iptables iptables-save || return 80
+    carrier_host_inventory_command "$snapshot" ip6tables ip6tables-save || return 80
     [[ $(carrier_host_machine_id) == "$CARRIER_HOST_MACHINE_ID" && $(carrier_host_boot_id) == "$CARRIER_HOST_BOOT_ID" ]] || return 77
     [[ "$(carrier_current_namespace | tr '\n' ' ')" == "$identity" ]] || return 77
     : > "$snapshot/complete" || return 80
 }
+
+# 封闭 CLI 只暴露载体入口，不接受任意命令。
+carrier_cli() {
+    local action=${1:-}; shift || true
+    case "$action" in
+        create) carrier_create "$@" ;;
+        run) carrier_run "$@" ;;
+        cleanup) carrier_cleanup "$@" ;;
+        recover) carrier_recover "$@" ;;
+        host-inventory) carrier_host_inventory "$@" ;;
+        internal-cleanup) carrier_internal_cleanup "$@" ;;
+        *) return 2 ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    carrier_cli "$@"
+fi

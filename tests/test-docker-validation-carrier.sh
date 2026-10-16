@@ -44,7 +44,7 @@ setup_boundaries() {
     carrier_current_namespace() { printf '4 4001 4 4002\n'; }
     carrier_host_namespace() { printf '4 3001 4 3002\n'; }
     carrier_proc_starttime() { if [[ $1 == 31337 ]]; then printf '888\n'; elif [[ $1 == 31338 ]]; then printf '889\n'; else return 1; fi; }
-    carrier_socket_facts() { printf '9999 4242 0 10001 %s/run/contract/docker.sock\n' "$scratch"; }
+    carrier_socket_facts() { printf '9999 4242 0 10001 660 %s/run/contract/docker.sock\n' "$scratch"; }
     carrier_daemon_id() { printf 'daemon-contract-0001\n'; }
     carrier_file_facts() { printf '0 %s\n' "$(stat -c '%a' "$1")"; }
     carrier_state_root() { printf '%s/state\n' "$scratch"; }
@@ -52,7 +52,17 @@ setup_boundaries() {
     carrier_holder_namespace() { printf '4 4001 4 4002\n'; }
     carrier_start_holder() { printf '31337\n'; }
     carrier_start_dockerd() { printf '31338\n'; }
-    carrier_host_readonly_query() { printf 'snapshot:%s\n' "$*"; }
+    carrier_process_alive() { return 0; }
+    carrier_sleep() { :; }
+    carrier_stop_process() { printf 'stop:%s\n' "$1" >> "$scratch/mutations"; }
+    carrier_remove_tree() { printf 'remove:%s\n' "$1" >> "$scratch/mutations"; rm -rf -- "$1"; }
+    carrier_configure_socket() { :; }
+    carrier_host_readonly_query() {
+        case "$*" in
+            *' container ls '*|*' network ls '*|*' volume ls '*|*' image ls '*) return 0 ;;
+            *) printf 'snapshot:%s\n' "$*" ;;
+        esac
+    }
     carrier_path_sha256() { printf '%s\n' "$TEST_SHA"; }
     carrier_source_sha256() { printf '%s\n' "$TEST_SHA"; }
     carrier_dockerd_sha256() { printf '%s\n' "$TEST_SHA"; }
@@ -85,7 +95,7 @@ case_run_enters_holder_with_real_guard_args() {
     carrier_effect() { printf '%s\n' "$*" >> "$scratch/mutations"; }
     carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-probe "$scratch/evidence" '' || return 1
     args=$(cat "$scratch/mutations")
-    [[ $args == "nsenter --target 31337 --net --mount -- env -u IT_MAPPING_ORDER bash $HERE/docker-network-guard.sh mapping-probe /approved/source contract $scratch/evidence $TEST_IMAGE $TEST_IMAGE $manifest $scratch/attestation $scratch/profile" ]] || return 1
+    [[ $args == "nsenter --target 31337 --net --mount -- env -u IT_MAPPING_ORDER bash $HERE/docker-network-guard.sh --mode mapping-probe --source-dir /approved/source --run-id contract --evidence-dir $scratch/evidence --runner-user gmtest --product-image $TEST_IMAGE --tools-image $TEST_IMAGE --environment-manifest $manifest --offline-attestation $scratch/attestation --mapping-profile $scratch/profile" ]] || return 1
     rm -rf "$scratch"
 }
 
@@ -128,7 +138,7 @@ case_sequence_passes_approved_order_to_guard() {
     carrier_current_namespace() { printf '4 3001 4 3002\n'; }
     carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-sequence "$scratch/evidence" direct,fallback || return 1
     args=$(cat "$scratch/mutations")
-    [[ $args == *'env IT_MAPPING_ORDER=direct,fallback bash '*'/docker-network-guard.sh mapping-sequence '* ]] || return 1
+    [[ $args == *'env IT_MAPPING_ORDER=direct,fallback bash '*'/docker-network-guard.sh --mode mapping-sequence '* ]] || return 1
     rm -rf "$scratch"
 }
 
@@ -140,12 +150,14 @@ case_cleanup_and_recover_are_identity_bound() {
     state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
     carrier_test_state_write "$approval" "$state" "$manifest"
     carrier_current_namespace() { printf '4 3001 4 3002\n'; }
+    mkdir -p "$scratch/final" "$scratch/recovery"
+    : > "$scratch/recovery/recover.sh"
     carrier_cleanup "$state" "$scratch/final" || return 1
     carrier_recover "$state" "$scratch/recovery" --runner-stopped || return 1
     rc=0; carrier_recover "$state" "$scratch/recovery" --unsafe || rc=$?
     [[ $rc == 64 ]] || return 1
-    grep -q '^nsenter --target 31337 --net --mount -- cleanup ' "$scratch/mutations" || return 1
-    grep -q '^nsenter --target 31337 --net --mount -- recover ' "$scratch/mutations" || return 1
+    grep -q '^nsenter --target 31337 --net --mount -- bash .*/docker-validation-carrier.sh internal-cleanup ' "$scratch/mutations" || return 1
+    grep -q '^nsenter --target 31337 --net --mount -- bash .*/recover.sh --runner-stopped$' "$scratch/mutations" || return 1
     rm -rf "$scratch"
 }
 
@@ -311,7 +323,7 @@ case_reject_socket_replacement() {
     approval=$scratch/approval.tsv; write_approval "$approval" mapping-probe none
     state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
     carrier_test_state_write "$approval" "$state" "$manifest"
-    carrier_socket_facts() { printf '9999 9999 0 10001 %s/run/contract/docker.sock\n' "$scratch"; }
+    carrier_socket_facts() { printf '9999 9999 0 10001 660 %s/run/contract/docker.sock\n' "$scratch"; }
     carrier_verify "$state" || rc=$?
     [[ $rc == 77 && ! -s $scratch/mutations ]] || return 1
     rm -rf "$scratch"
@@ -325,7 +337,60 @@ case_independent_dockerd_paths() {
     [[ $args == *'--exec-root /run/gitdaemon-validation/contract/docker-exec'* ]] || return 1
     [[ $args == *'--pidfile /run/gitdaemon-validation/contract/dockerd.pid'* ]] || return 1
     [[ $args == *'--host unix:///run/gitdaemon-validation/contract/docker.sock'* ]] || return 1
+    [[ $args == *'--containerd-namespace gitdaemon-contract'* ]] || return 1
+    [[ $args == *'--containerd-plugins-namespace gitdaemon-contract-plugins'* ]] || return 1
+    [[ $args != *'/run/containerd/containerd.sock'* ]] || return 1
     [[ $args != *'/var/run/docker.sock'* ]] || return 1
+}
+
+case_create_waits_for_dockerd_and_rolls_back_exactly() {
+    local scratch approval rc=0 calls=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/input.tsv; write_approval "$approval" mapping-probe none
+    mkdir -p "$scratch/state" "$scratch/run"
+    carrier_daemon_id() { calls=$((calls + 1)); return 1; }
+    carrier_process_alive() { return 0; }
+    carrier_create "$approval" "$scratch/state/contract" || rc=$?
+    [[ $rc == 80 && ! -e $scratch/state/contract && ! -e $scratch/run/contract ]] || return 1
+    grep -q '^stop:31338$' "$scratch/mutations" || return 1
+    grep -q '^stop:31337$' "$scratch/mutations" || return 1
+    [[ $(grep -c '^remove:' "$scratch/mutations") == 2 ]] || return 1
+    rm -rf "$scratch"
+}
+
+case_run_validates_manifest_attestation_and_profile() {
+    local scratch approval state manifest rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" mapping-probe none
+    state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
+    printf 'attestation\n' > "$scratch/attestation"
+    printf 'profile\n' > "$scratch/profile"
+    carrier_path_sha256() { sha256sum "$1" | cut -d' ' -f1; }
+    local profile_hash
+    profile_hash=$(carrier_path_sha256 "$scratch/profile")
+    awk -F '\t' -v hash="$profile_hash" 'BEGIN {OFS="\t"} $1 == "mapping_profile_sha256" {$2=hash} {print}' "$approval" > "$approval.tmp"
+    mv "$approval.tmp" "$approval"; chmod 600 "$approval"
+    carrier_test_state_write "$approval" "$state" "$manifest" "$scratch/attestation" "$scratch/profile"
+    carrier_current_namespace() { printf '4 3001 4 3002\n'; }
+    carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-probe "$scratch/evidence" '' || return 1
+    : > "$scratch/mutations"
+    printf 'tamper\n' >> "$scratch/profile"
+    carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-probe "$scratch/evidence" '' || rc=$?
+    [[ $rc == 77 && ! -s $scratch/mutations ]] || return 1
+    rm -rf "$scratch"
+}
+
+case_socket_permissions_reject_world_access() {
+    local scratch approval state manifest rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" mapping-probe none
+    state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
+    carrier_test_state_write "$approval" "$state" "$manifest"
+    carrier_current_namespace() { printf '4 3001 4 3002\n'; }
+    carrier_socket_facts() { printf '9999 4242 0 10001 666 %s/run/contract/docker.sock\n' "$scratch"; }
+    carrier_verify "$state" || rc=$?
+    [[ $rc == 77 ]] || return 1
+    rm -rf "$scratch"
 }
 
 # holder 必须显式使用 private mount propagation。
@@ -396,16 +461,33 @@ case_host_inventory_writes_immutable_snapshot() {
     mkdir -p "$scratch/state"
     carrier_host_inventory "$approval" "$scratch/state" before || return 1
     snapshot=$scratch/state/host-before
-    [[ -f $snapshot/identity.tsv && -f $snapshot/docker.tsv && -f $snapshot/complete ]] || return 1
+    [[ -f $snapshot/identity.tsv && -f $snapshot/commands.tsv && -f $snapshot/complete ]] || return 1
     grep -q $'^machine_id\t0123456789abcdef0123456789abcdef$' "$snapshot/identity.tsv" || return 1
-    grep -q 'container ls -aq --no-trunc' "$snapshot/docker.tsv" || return 1
+    [[ $(find "$snapshot" -name '*.argv' | wc -l) -ge 9 ]] || return 1
+    [[ $(find "$snapshot" -name '*.exit' | wc -l) -ge 9 ]] || return 1
+    grep -Rqx '0' "$snapshot"/*.exit || return 1
     carrier_host_inventory "$approval" "$scratch/state" before || rc=$?
     [[ $rc == 77 ]] || return 1
     rm -rf "$scratch"
 }
 
+case_host_inventory_compares_every_command() {
+    local scratch approval rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" full none
+    carrier_host_namespace() { printf '4 4001 4 4002\n'; }
+    mkdir -p "$scratch/state"
+    carrier_host_inventory "$approval" "$scratch/state" before || return 1
+    carrier_host_inventory "$approval" "$scratch/state" after || return 1
+    carrier_host_inventory_compare "$scratch/state" || return 1
+    printf 'changed\n' >> "$scratch/state/host-after/route4.stdout"
+    carrier_host_inventory_compare "$scratch/state" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    rm -rf "$scratch"
+}
+
 failed=0
-for name in create_builds_bound_state create_rejects_frozen_input_hash_drift run_enters_holder_with_real_guard_args run_requires_host_self_namespace run_uses_fixed_approval_copy sequence_passes_approved_order_to_guard cleanup_and_recover_are_identity_bound run_rejects_state_hash_drift verify_binds_holder_namespace_and_dockerd_paths approval_requires_exact_21_keys approval_mode_order_pair_is_closed approval_validates_every_field run_requires_exact_approved_mode_order run_binds_approval_through_state_and_manifest reject_host_namespace reject_reused_holder_pid reject_socket_replacement independent_dockerd_paths mount_propagation_private host_inventory_uses_closed_readonly_argv host_inventory_rejects_runner_and_foreign_namespace host_inventory_pins_host_identity host_inventory_uses_approved_identity host_inventory_has_no_business_delete_path host_inventory_writes_immutable_snapshot; do
+for name in create_builds_bound_state create_rejects_frozen_input_hash_drift create_waits_for_dockerd_and_rolls_back_exactly run_enters_holder_with_real_guard_args run_requires_host_self_namespace run_uses_fixed_approval_copy run_validates_manifest_attestation_and_profile sequence_passes_approved_order_to_guard cleanup_and_recover_are_identity_bound run_rejects_state_hash_drift verify_binds_holder_namespace_and_dockerd_paths approval_requires_exact_21_keys approval_mode_order_pair_is_closed approval_validates_every_field run_requires_exact_approved_mode_order run_binds_approval_through_state_and_manifest reject_host_namespace reject_reused_holder_pid reject_socket_replacement socket_permissions_reject_world_access independent_dockerd_paths mount_propagation_private host_inventory_uses_closed_readonly_argv host_inventory_rejects_runner_and_foreign_namespace host_inventory_pins_host_identity host_inventory_uses_approved_identity host_inventory_has_no_business_delete_path host_inventory_writes_immutable_snapshot host_inventory_compares_every_command; do
     rc=0
     ( "case_$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
