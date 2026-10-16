@@ -35,6 +35,10 @@ resource_run() {
 
 # Docker 外部边界：默认直连命令行，绕过启动包装器以避免删除递归。
 resource_docker() {
+    if declare -F validation_docker >/dev/null; then
+        validation_docker "$@"
+        return $?
+    fi
     command docker "$@"
 }
 
@@ -92,14 +96,17 @@ resource_inspect_hash() {
     printf '%s' "$raw" | sha256sum | cut -d' ' -f1
 }
 
-# 对象是否仍存在；查询失败按不存在处理，由登记回执另行判定。
+# 对象是否仍存在；不存在返回 1，查询错误返回 2。
 resource_exists() {
-    local kind=$1 identity=$2
+    local kind=$1 identity=$2 rc=0
     case "$kind" in
-        container|network) resource_docker inspect -f '{{.Id}}' "$identity" >/dev/null 2>&1 ;;
-        volume) resource_docker inspect -f '{{.Name}}' "$identity" >/dev/null 2>&1 ;;
-        *) return 1 ;;
+        container|network) resource_docker inspect -f '{{.Id}}' "$identity" >/dev/null 2>&1 || rc=$? ;;
+        volume) resource_docker inspect -f '{{.Name}}' "$identity" >/dev/null 2>&1 || rc=$? ;;
+        *) return 2 ;;
     esac
+    (( rc == 0 )) && return 0
+    (( rc == 1 )) && return 1
+    return 2
 }
 
 # 按本轮 label 枚举对象；任一类查询失败即返回 2，绝不解释为空集合。
@@ -296,12 +303,20 @@ resource_crosscheck() {
             if resource_exists "$kind" "$item"; then
                 printf 'RESOURCE_DIFF reappeared=%s\n' "$rkey" >&2
                 return 2
+            elif (( $? == 2 )); then
+                printf 'RESOURCE_DIFF existence_query_failed=%s\n' "$rkey" >&2
+                return 2
             fi
             continue
         fi
         [[ -n ${RESOURCE_LEDGER_ACTIVE[$rkey]:-} ]] || continue
         IFS='|' read -r rseq scenario role hash digest entry_run <<< "${RESOURCE_LEDGER_ACTIVE[$rkey]}"
-        if ! resource_exists "$kind" "$item"; then
+        if resource_exists "$kind" "$item"; then
+            :
+        elif (( $? == 2 )); then
+            printf 'RESOURCE_DIFF existence_query_failed=%s\n' "$rkey" >&2
+            return 2
+        else
             printf 'RESOURCE_DIFF missing_without_receipt=%s\n' "$rkey" >&2
             return 2
         fi
@@ -347,7 +362,7 @@ resource_remove() {
     resource_ledger_load "$dir" || return 2
     key="$kind|$identity"
     if [[ -n ${RESOURCE_LEDGER_REMOVED[$key]:-} ]]; then
-        if resource_exists "$kind" "$identity"; then return 2; fi
+        if resource_exists "$kind" "$identity"; then return 2; elif (( $? == 2 )); then return 2; fi
         return 0
     fi
     [[ -n ${RESOURCE_LEDGER_ACTIVE[$key]:-} ]] || return 2
@@ -355,6 +370,30 @@ resource_remove() {
     resource_verify_object "$kind" "$identity" "$scenario" "$role" "$digest" || return 2
     resource_delete "$kind" "$identity" || return 2
     resource_record_removed "$dir" "$kind" "$identity" "$run" "$scenario" "$role" "$hash" "$digest" || return 2
+    return 0
+}
+
+# 按场景从全 run 账本精确释放对象，查询不确定时停止。
+resource_cleanup_scenario() {
+    local dir=${1:-} scenario=${2:-} run kind entry identity kind_of i data entry_scenario
+    local -a order=()
+    [[ -n $dir && -n $scenario ]] || return 2
+    run=$(resource_run)
+    [[ -n $run ]] || return 2
+    RESOURCE_LEDGER_DIR=$dir
+    resource_crosscheck "$dir" || return 2
+    order=("${RESOURCE_LEDGER_ORDER[@]}")
+    for kind in $RESOURCE_KINDS; do
+        for ((i=${#order[@]}-1;i>=0;i--)); do
+            IFS='|' read -r _ kind_of identity <<< "${order[i]}"
+            [[ $kind_of == "$kind" ]] || continue
+            data=${RESOURCE_LEDGER_ACTIVE["$kind_of|$identity"]:-}
+            [[ -n $data ]] || continue
+            IFS='|' read -r _ entry_scenario _ <<< "$data"
+            [[ $entry_scenario == "$scenario" ]] || continue
+            resource_remove "$kind_of" "$identity" || return 2
+        done
+    done
     return 0
 }
 

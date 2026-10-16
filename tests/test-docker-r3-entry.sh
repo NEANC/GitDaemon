@@ -20,15 +20,15 @@ for mode in o1 c2 probe; do
         failed=1
     fi
 done
-# 新 full/mapping 路径必须带齐绑定参数，且命令内只出现唯一本地端点。
+# 新 full/mapping 路径必须带齐绑定参数，且端点只由环境库解析。
 for mode in full mapping-fallback mapping-direct mapping-probe; do
     command=$(guard_runner_command "$mode" /source run /evidence product tools /manifest /attestation /profile) || command=''
     if [[ $command != *'-u IT_FILTER'* || $command != *'test-docker-network.sh'* ]]; then
         printf 'FAIL bound mode=%s actual=%s\n' "$mode" "$command"
         failed=1
     fi
-    if [[ $(grep -o 'unix:///var/run/docker.sock' <<< "$command" | wc -l) != 1 ]]; then
-        printf 'FAIL mode=%s endpoint not unique: %s\n' "$mode" "$command"
+    if [[ $command != *'validation_environment_verify'* || $command != *'validation_docker'* || $command == *'unix:///var/run/docker.sock'* ]]; then
+        printf 'FAIL mode=%s endpoint binding missing: %s\n' "$mode" "$command"
         failed=1
     fi
 done
@@ -41,6 +41,10 @@ full_clears_filter() {
 #!/usr/bin/env bash
 printf 'IT_FILTER=%s\n' "${IT_FILTER-}" >> "$RUNNER_ENTRY_LOG"
 exit 0
+STUB
+    cat > "$scratch/source/tests/docker-validation-environment.sh" <<'STUB'
+validation_environment_verify() { return 0; }
+validation_docker() { return 0; }
 STUB
     cat > "$scratch/bin/docker" <<'STUB'
 #!/usr/bin/env bash

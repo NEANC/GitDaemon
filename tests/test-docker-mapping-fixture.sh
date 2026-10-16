@@ -165,16 +165,17 @@ contract_mapping_driver() {
     }
     resource_docker() { docker "$@"; }
     validation_environment_verify() { return 0; }
+    validation_runner_verify() { return 0; }
     # 降权边界替身：模拟 runner 写入 PID，并按开关发送 READY 或 READY 前的 snapshot 请求。
     su() {
-        printf '%s\n' "$BASHPID" > "$SCRATCH/evidence/control/runner.pid"
+        printf 'pid\t%s\nstart_ticks\t1\nboot_id\tboot\nmanifest_sha256\tdigest\n' "$BASHPID" > "$SCRATCH/evidence/control/runner-handshake.tsv"
         case "${MAPPING_SEND:-ready}" in
             snapshot)
-                printf 'mapping-snapshot %s nonce1\n' "$MAPPING_SHA" > "$SCRATCH/evidence/control/request-1"
+                printf 'mapping-snapshot generation-1 %s %s nonce1\n' "$MAPPING_NETID" "$MAPPING_SHA" > "$SCRATCH/evidence/control/request-1"
                 ;;
             ready)
                 [[ ${MAPPING_SEND_READY:-0} == 1 ]] || return 0
-                printf 'mapping-ready %s %s nonce1\n' "$MAPPING_SHA" "$MAPPING_NETID" > "$SCRATCH/evidence/control/request-1"
+                printf 'mapping-ready generation-1 %s %s nonce1\n' "$MAPPING_NETID" "$MAPPING_SHA" > "$SCRATCH/evidence/control/request-1"
                 ;;
             *) return 0 ;;
         esac
@@ -209,7 +210,7 @@ mapping_requires_ready() {
         bash -c contract_mapping_driver > "$SCRATCH/out" 2>&1 || actual=$?
         if [[ $ready == 0 ]]; then
             printf 'NO_READY exit=%s\n' "$actual"
-            [[ ! -e $SCRATCH/evidence/control/start ]] || { printf 'start created without READY\n'; failed=1; }
+            [[ ! -e $SCRATCH/evidence/control/ack-1 ]] || { printf 'ack created without READY\n'; failed=1; }
             if grep -q -- '--comment mtest-' "$SCRATCH/rules" 2>/dev/null; then printf 'rules installed without READY\n'; failed=1; fi
             # READY 前只允许建空链并由清理撤销：断言无规则挂载且建链与撤链数量等价。
             if grep -Eq -- '-(A|I) .*(MEmtest|Mtest|MRmtest)' "$SCRATCH/rules" 2>/dev/null; then
@@ -221,7 +222,7 @@ mapping_requires_ready() {
             [[ ${created:-0} == "${removed:-0}" ]] || { printf 'chains not reversed: created=%s removed=%s\n' "$created" "$removed"; failed=1; }
         else
             printf 'WITH_READY exit=%s\n' "$actual"
-            [[ -e $SCRATCH/evidence/control/start ]] || { printf 'start missing after READY\n'; failed=1; }
+            [[ -e $SCRATCH/evidence/control/ack-1 ]] || { printf 'ack missing after READY\n'; failed=1; }
             grep -q -- '--comment mtest-dns-udp' "$SCRATCH/rules" || { printf 'mapping drop rules missing\n'; failed=1; }
             grep -q -- '-s 140.82.112.10/32 -d 140.82.112.11/32 -p tcp --dport 443' "$SCRATCH/rules" || { printf 'mapping accept rules missing\n'; failed=1; }
         fi
@@ -255,6 +256,59 @@ mapping_requires_ready() {
     done
     unset -f command
     return "$failed"
+}
+
+runner_prepares_before_ready() {
+    local profile=$WORK/profile/base.tsv control=$WORK/two-phase log=$WORK/two-phase.log
+    mkdir -p "$control"
+    IT_CONTROL_DIR=$control
+    RESOURCE_LEDGER_DIR=$control/resources
+    mapping_profile_load "$profile" || return 1
+    mapping_assets_prepare() { printf 'assets\n' >> "$log"; }
+    mapping_network_create() { printf 'network\n' >> "$log"; MP_NETWORK_ID=net-1; }
+    mapping_fixture_precheck() { printf 'inspect\n' >> "$log"; }
+    network_control() {
+        printf '%s\n' "$*" >> "$log"
+        MAPPING_ACK_GENERATION=generation-1
+    }
+    mapping_prepare "$profile" mapping-fallback product tools || return 1
+    mapping_ready "$profile" net-1 generation-1 || return 1
+    [[ $(sed -n '1p' "$log") == assets ]] || return 1
+    [[ $(sed -n '2p' "$log") == network ]] || return 1
+    [[ $(sed -n '3p' "$log") == inspect ]] || return 1
+    [[ $(sed -n '4p' "$log") == 'mapping-ready '* ]] || return 1
+}
+
+networked_start_requires_generation_ack() {
+    local profile=$WORK/profile/base.tsv control=$WORK/ack log=$WORK/start.log rc=0
+    mkdir -p "$control"
+    IT_CONTROL_DIR=$control
+    mapping_fixture_docker() { printf '%s\n' "$*" >> "$log"; }
+    mapping_activate generation-1 >/dev/null 2>&1 || rc=$?
+    [[ $rc == 65 && ! -s $log ]]
+}
+
+second_generation_rebinds_network() {
+    local profile=$WORK/profile/base.tsv log=$WORK/generations.log
+    network_control() {
+        printf '%s\n' "$*" >> "$log"
+        read -r _ MAPPING_ACK_GENERATION _ <<< "$1"
+    }
+    mapping_ready "$profile" net-1 generation-1 || return 1
+    mapping_control_request mapping-release generation-1 net-1 "$(sha256sum "$profile" | cut -d' ' -f1)" || return 1
+    mapping_ready "$profile" net-2 generation-2 || return 1
+    grep -q '^mapping-ready generation-1 net-1 ' "$log" || return 1
+    grep -q '^mapping-release generation-1 net-1 ' "$log" || return 1
+    grep -q '^mapping-ready generation-2 net-2 ' "$log"
+}
+
+scenario_keeps_control_and_ledger_root() {
+    local root=$WORK/run-root scenario=$WORK/scenario
+    IT_CONTROL_DIR=$root/control
+    RESOURCE_LEDGER_DIR=$root/control/resources
+    IT_EVIDENCE_DIR=$scenario
+    [[ $(mapping_control_dir) == "$root/control" ]] || return 1
+    [[ $(resource_ledger_dir) == "$root/control/resources" ]]
 }
 
 # 写入映射 DROP 快照：五键、源 P、指定桥、链 MEmtest；可指定计数基数用于增量样本。
@@ -395,7 +449,7 @@ mapping_network_create_registers() {
     dir=$scratch/ledger
     mkdir -p "$dir"
     profile_write "$scratch/profile.tsv"
-    unset IT_EVIDENCE_DIR
+    unset IT_EVIDENCE_DIR VE_DOCKER_ENDPOINT
     MAPPING_LEDGER_DIR=$dir
     CREATE_NOID=0
     # 兼容旧实现经 `command docker` 创建：拦截后仍只走替身，绝不触碰真实 daemon。
@@ -440,6 +494,7 @@ mapping_network_create_registers() {
             *) printf '{}\n' ;;
         esac
     }
+    validation_docker() { resource_docker "$@"; }
     id=$(mapping_network_create "$scratch/profile.tsv" "$dir") || rc=$?
     printf 'MAPPING_NETWORK_CREATE rc=%s id=%s\n' "$rc" "$id"
     [[ $rc == 0 && $id == netid-new ]] || { printf 'create+register failed\n'; failed=1; }
@@ -1276,6 +1331,10 @@ profile_write "$WORK/profile/base.tsv"
 MAPPING_NETWORK_TESTS='mapping_profile_rejects_conflict
 mapping_extra_attachment_rejected
 mapping_requires_ready
+runner_prepares_before_ready
+networked_start_requires_generation_ack
+second_generation_rebinds_network
+scenario_keeps_control_and_ledger_root
 mapping_rule_keys_exact
 mapping_counter_missing_or_duplicate_fails
 mapping_witness_pause_detected

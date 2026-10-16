@@ -1610,6 +1610,14 @@ integration_register_proxy_group() {
 
 # 单项映射 mode 只选对应场景；full（未指定）时两场景都跑。
 integration_mapping_scenarios() {
+    if [[ -n ${IT_MAPPING_ORDER:-} ]]; then
+        case "$IT_MAPPING_ORDER" in
+            fallback,direct) printf '%s\n' fallback direct ;;
+            direct,fallback) printf '%s\n' direct fallback ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
     case "${IT_MAPPING_SCENARIO:-}" in
         '') printf '%s\n' fallback direct ;;
         fallback) printf '%s\n' fallback ;;
@@ -1631,7 +1639,7 @@ integration_register_mapping_group() {
             direct) check_mapping_sync '映射场景：纯映射直连不经过代理（独立生命周期）' direct ;;
         esac
     done
-    [[ -z $IT_MAPPING_SCENARIO ]] || return 0
+    [[ -z $IT_MAPPING_SCENARIO && -z ${IT_MAPPING_ORDER:-} ]] || return 0
     check_mapping_negative '映射负例：DNS 假绿被映射判定器拒绝（fallback）' dns-false-green fallback
     check_mapping_negative '映射负例：DNS 假绿被映射判定器拒绝（direct）' dns-false-green direct
     check_mapping_negative '映射负例：代理/上游证书篡改被 TLS 层拒绝（fallback）' wrong_upstream_ca fallback

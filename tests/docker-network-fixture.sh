@@ -8,13 +8,24 @@ FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SAFE=(--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges)
 NETSAFE=(--sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv4.ip_unprivileged_port_start=0)
 CONTROL_SEQ=0
+# 返回本轮固定控制根，场景证据目录不得覆盖该值。
+mapping_control_dir() {
+    if [[ -n ${IT_CONTROL_DIR:-} ]]; then
+        printf '%s\n' "$IT_CONTROL_DIR"
+        return 0
+    fi
+    [[ -n ${IT_EVIDENCE_DIR:-} ]] || return 1
+    printf '%s\n' "$IT_EVIDENCE_DIR/control"
+}
 # 白名单覆盖所有附件，不能只检查主网络。
 policy_networks() {
     [[ $1 == "$IT_NETWORK" ]]
 }
 # 请求固定枚举操作并有限等待，握手并不作为防火墙证明。
 network_control() {
-    local i token ack control=$IT_EVIDENCE_DIR/control
+    local i token ack control action generation
+    control=$(mapping_control_dir) || return 80
+    read -r action generation _ <<< "$1"
     CONTROL_SEQ=$((CONTROL_SEQ + 1))
     while ! mkdir "$control/claim-$CONTROL_SEQ" 2>/dev/null; do
         [[ -d $control/claim-$CONTROL_SEQ ]] || return 73
@@ -26,11 +37,28 @@ network_control() {
     for ((i=0;i<100;i++)); do
         if [[ -f $control/ack-$CONTROL_SEQ ]]; then
             ack=$(cat "$control/ack-$CONTROL_SEQ") || return $?
-            [[ $ack != "$token" ]] || return 0
+            case "$action" in
+                mapping-ready|mapping-snapshot|mapping-release)
+                    [[ $ack == "$token $generation" ]] || return 65
+                    MAPPING_ACK_GENERATION=$generation
+                    return 0
+                    ;;
+                *) [[ $ack != "$token" ]] || return 0 ;;
+            esac
         fi
         sleep 0.1
     done
     return 75
+}
+
+# 发送绑定 generation、网络和档案摘要的封闭控制请求。
+mapping_control_request() {
+    local action=${1:-} generation=${2:-} network_id=${3:-} profile_sha256=${4:-}
+    case "$action" in mapping-ready|mapping-snapshot|mapping-release) ;; *) return 65 ;; esac
+    [[ -n $generation && -n $network_id && $profile_sha256 =~ ^[0-9a-f]{64}$ ]] || return 65
+    network_control "$action $generation $network_id $profile_sha256" || return $?
+    [[ ${MAPPING_ACK_GENERATION:-} == "$generation" ]] || return 65
+    return 0
 }
 # 以统一安全参数创建容器；有账本时改为 create→登记→start，短命容器显式 remove。
 # 无登记目录时保持既有 run 语义（旧契约模式），但必须留下可观测标记，绝不静默回退。

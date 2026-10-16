@@ -104,16 +104,25 @@ RECOVERY
 }
 # 清理前先保存输入关联的容器状态、日志与规则计数；删除统一走资源账本交叉验证。
 guard_cleanup() {
-    local primary=$? clean=0 item ids kind residual isolated=1 bound=1
+    local primary=$? clean=0 item ids kind residual isolated=1 bound=1 runner_pid='' wait_count=0
     trap '' TERM INT
     trap - EXIT
     set +e
     if [[ -n ${CHILD:-} ]]; then
         # 未获启动许可的 runner 只接受停止请求，不会创建业务。
         touch "$E/control/stop"
-        if [[ -f $E/control/runner.pid ]]; then
-            guard_gm kill -TERM "$(cat "$E/control/runner.pid")" 2>/dev/null
+        if [[ -f $E/control/runner-handshake.tsv ]]; then
+            runner_pid=$(awk -F'\t' '$1=="pid"{print $2}' "$E/control/runner-handshake.tsv")
+        elif [[ -f $E/control/runner.pid ]]; then
+            runner_pid=$(cat "$E/control/runner.pid")
         fi
+        [[ -z $runner_pid ]] || guard_gm kill -TERM "$runner_pid" 2>/dev/null
+        kill -TERM -- "-$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null || true
+        while kill -0 "$CHILD" 2>/dev/null && (( wait_count < 50 )); do
+            sleep 0.1
+            wait_count=$((wait_count + 1))
+        done
+        kill -KILL -- "-$CHILD" 2>/dev/null || kill -KILL "$CHILD" 2>/dev/null || true
         wait "$CHILD"; printf 'SETSID_WAIT_EXIT=%s\n' "$?" >> "$E/exit-status.txt"
     fi
     iptables-save -c > "$E/rules-before-cleanup.txt" || clean=2
@@ -194,33 +203,35 @@ guard_close_calibration() {
 guard_runner_command() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6
     local manifest=${7:-} attestation=${8:-} profile=${9:-} net=''
-    local script='' routing='--integration'
+    local script='' routing='--integration' order=${IT_MAPPING_ORDER:-}
     [[ $# -le 9 ]] || return 2
     local -a filter=(-u IT_FILTER) entry=(--integration) extra=()
     case "$mode" in
         o1) filter=(IT_FILTER=o1) ;;
         c2) filter=(IT_FILTER=c2) ;;
-        full|mapping-fallback|mapping-direct|mapping-probe)
+        full|mapping-fallback|mapping-direct|mapping-probe|mapping-sequence)
             [[ -n $manifest && -n $attestation && -n $profile ]] || return 2
-            extra=(IT_MAPPING_PROFILE="$profile")
+            extra=(IT_MAPPING=1 IT_MAPPING_PROFILE="$profile" IT_CONTROL_DIR="$evidence/control" RESOURCE_LEDGER_DIR="$evidence/control/resources")
             net="gm-$run-net"
             script='set -e'
-            if [[ $mode == full ]]; then
+            if [[ $mode == mapping-sequence ]]; then
+                [[ $order == fallback,direct || $order == direct,fallback ]] || return 2
+                extra+=(IT_MAPPING_ORDER="$order")
+                routing='--mapping-sequence'
+            elif [[ $mode == full ]]; then
                 script+=$'\n''[[ ${IT_DEFER_MAPPING:-} != 1 ]] || exit 2'
             else
                 # 单项 mapping 模式各自独立入口，不跑旧业务断言；未接线时由入口 fail-closed。
                 # 单项 mode 与集成入口共用 IT_MAPPING_SCENARIO：据此只选择对应场景，绝不退化为 full。
-                extra=(IT_MAPPING=1 IT_MAPPING_SCENARIO="${mode#mapping-}" IT_MAPPING_PROFILE="$profile")
+                extra+=(IT_MAPPING_SCENARIO="${mode#mapping-}")
                 net="gm-$run-m-net"
                 routing="--$mode"
             fi
-            script+=$'\n''endpoint=unix:///var/run/docker.sock'
-            script+=$'\n''daemon=$(grep "^daemon_id" "$2" | cut -f2)'
-            script+=$'\n''[[ -n $daemon ]] || exit 77'
-            script+=$'\n''actual=$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker --host "$endpoint" info -f '"'"'{{.ID}}'"'"')'
-            script+=$'\n''[[ $actual == "$daemon" ]] || exit 77'
+            script+=$'\n''source "$1/tests/docker-validation-environment.sh"'
+            script+=$'\n''validation_environment_verify "$2" "$3" || exit $?'
+            script+=$'\n''validation_docker info -f '"'"'{{.ID}}'"'"' >/dev/null || exit $?'
             script+=$'\n'"exec bash \"\$1/tests/test-docker-network.sh\" $routing"
-            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
+            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 GUARD_RUNNER_MANIFEST="$manifest" "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
             return 0
             ;;
         probe) entry=(--live) ;;
@@ -228,6 +239,42 @@ guard_runner_command() {
         *) return 2 ;;
     esac
     printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="gm-$run-net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 bash "$source/tests/test-docker-network.sh" "${entry[@]}"
+}
+
+# 撤销指定下标之后安装的 generation 规则，保留基础链。
+guard_remove_rules_since() {
+    local start=$1 i table rule status=0
+    local -a args keep=()
+    for ((i=${#OWN_RULES[@]}-1;i>=start;i--)); do
+        table=${OWN_RULES[i]%%|*}; rule=${OWN_RULES[i]#*|}
+        read -ra args <<< "$rule"; args[0]=-D
+        iptables -t "$table" "${args[@]}" || status=2
+    done
+    for ((i=0;i<start;i++)); do keep+=("${OWN_RULES[i]}"); done
+    OWN_RULES=("${keep[@]}")
+    return "$status"
+}
+
+# 校验 PREPARING→ACTIVE→RELEASED generation 状态与绑定字段。
+guard_mapping_generation() {
+    local action=${1:-} generation=${2:-} network_id=${3:-} profile_sha256=${4:-}
+    [[ -n $generation && -n $network_id && $profile_sha256 == "$MP_PROFILE_SHA256" ]] || return 65
+    case "$action" in
+        mapping-ready)
+            [[ ${GUARD_MAPPING_STATE:-PREPARING} != ACTIVE ]] || return 65
+            [[ $generation != "${GUARD_MAPPING_LAST_GENERATION:-}" ]] || return 65
+            GUARD_MAPPING_STATE=ACTIVE GUARD_MAPPING_GENERATION=$generation GUARD_MAPPING_NETWORK_ID=$network_id
+            ;;
+        mapping-snapshot)
+            [[ ${GUARD_MAPPING_STATE:-} == ACTIVE && $generation == "$GUARD_MAPPING_GENERATION" && $network_id == "$GUARD_MAPPING_NETWORK_ID" ]] || return 65
+            ;;
+        mapping-release)
+            [[ ${GUARD_MAPPING_STATE:-} == ACTIVE && $generation == "$GUARD_MAPPING_GENERATION" && $network_id == "$GUARD_MAPPING_NETWORK_ID" ]] || return 65
+            GUARD_MAPPING_STATE=RELEASED GUARD_MAPPING_LAST_GENERATION=$generation
+            ;;
+        *) return 65 ;;
+    esac
+    return 0
 }
 # 映射网精确策略：只放行同网所需通信，其余 INPUT/转发、跨网、外 DNS 与 IPv6 一律拒绝。
 # 源地址 P、桥接口与见证目标全部来自冻结档案，不复制旧 .4 规则。
@@ -274,7 +321,7 @@ guard_mapping_snapshot() {
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
 guard_mapping_main() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6 manifest=$7 attestation=$8 profile=$9
-    local bridge chain early returnc seq=1 ready=0 rc=0 request token nonce sha netid
+    local bridge chain early returnc seq=1 ready=0 rc=0 request nonce sha netid generation rules_start last_nonce=''
     local existing routes resources links rules table c ids parent command
     [[ -n $profile && -f $profile ]] || return 2
     mapping_profile_load "$profile" || return $?
@@ -340,36 +387,47 @@ guard_mapping_main() {
     setsid bash -c "$command" > "$E/run.log" 2>&1 &
     CHILD=$!
     guard_signal_checkpoint
-    while [[ ! -f $E/control/runner.pid ]]; do
+    while [[ ! -f $E/control/runner-handshake.tsv ]]; do
         guard_signal_checkpoint
         kill -0 "$CHILD" 2>/dev/null || break
         sleep 0.1
     done
     guard_signal_checkpoint
+    validation_runner_verify "$manifest" "$E/control/runner-handshake.tsv" || exit $?
+    touch "$E/control/prepare-start"
     while kill -0 "$CHILD" 2>/dev/null; do
         guard_signal_checkpoint
         if [[ -f $E/control/request-$seq ]]; then
-            read -r request token < "$E/control/request-$seq"
-            [[ -n $token ]] || exit 65
+            read -r request generation netid sha nonce < "$E/control/request-$seq"
+            [[ -n $nonce ]] || exit 65
+            [[ $nonce != "$last_nonce" ]] || exit 65
             case "$request" in
                 mapping-ready)
-                    [[ $ready == 0 ]] || exit 65
-                    read -r sha netid nonce <<< "$token"
-                    [[ $sha == "$MP_PROFILE_SHA256" && -n $netid && -n $nonce ]] || exit 65
+                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
+                    rules_start=${#OWN_RULES[@]}
                     guard_mapping_rules "$profile" "$netid" || exit $?
-                    printf 'network_id\t%s\n' "$netid" > "$E/control/mapping-network.tsv"
-                    touch "$E/control/start"
+                    printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$netid" "$sha" > "$E/control/mapping-network.tsv"
                     ready=1
-                    printf '%s\n' "$nonce" > "$E/control/ack-$seq.tmp"
+                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+                    last_nonce=$nonce
                     seq=$((seq + 1))
                     ;;
                 mapping-snapshot)
-                    # 隔离取证只允许在 READY 放行之后，未放行前一律拒绝。
-                    [[ $ready == 1 ]] || exit 65
+                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
                     guard_mapping_snapshot "$seq" || exit $?
-                    printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
+                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+                    last_nonce=$nonce
+                    seq=$((seq + 1))
+                    ;;
+                mapping-release)
+                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
+                    guard_remove_rules_since "$rules_start" || exit $?
+                    ready=0
+                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
+                    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+                    last_nonce=$nonce
                     seq=$((seq + 1))
                     ;;
                 *) exit 65 ;;
@@ -378,7 +436,7 @@ guard_mapping_main() {
         sleep 0.1
     done
     guard_signal_checkpoint
-    [[ $ready == 1 ]] || exit 65
+    [[ ${GUARD_MAPPING_STATE:-} == RELEASED || $mode == mapping-probe ]] || exit 65
     wait "$CHILD" || rc=$?
     guard_signal_checkpoint
     CHILD=''
@@ -388,6 +446,7 @@ guard_mapping_main() {
 # 固定入口解析、宿主预检、规则安装以及降权执行。
 guard_main() {
     local mode='' source='' image='' tools='' manifest='' attestation='' profile='' existing table chain parent bridge seq request token pid command rc=0 ids routes resources links rules
+    local generation netid sha nonce rules_start last_nonce=''
     RUN='' E='' RUNNER=''
     while (( $# )); do
         [[ $# -ge 2 ]] || return 2
@@ -400,10 +459,10 @@ guard_main() {
         shift 2
     done
     [[ $RUN =~ ^[a-zA-Z0-9-]{1,10}$ && $RUNNER == gmtest && $E == /* && $source == /* && -n $image && -n $tools ]] || return 2
-    case "$mode" in probe|o1|c2|full|startup|mapping-fallback|mapping-direct|mapping-probe) ;; *) return 2 ;; esac
+    case "$mode" in probe|o1|c2|full|startup|mapping-fallback|mapping-direct|mapping-probe|mapping-sequence) ;; *) return 2 ;; esac
     # 新 full/mapping 路径必须绑定环境授权清单，缺参即拒绝。
     case "$mode" in
-        full|mapping-fallback|mapping-direct|mapping-probe)
+        full|mapping-fallback|mapping-direct|mapping-probe|mapping-sequence)
             [[ -n $manifest && -n $attestation && -n $profile ]] || return 77 ;;
     esac
     # full 的延期请求属纯输入校验，先于 root 检查，避免延期语义与 root 耦合。
@@ -415,7 +474,16 @@ guard_main() {
         full)
             GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
             validation_environment_verify "$manifest" "$attestation" || return $?
+            mapping_profile_load "$profile" || return $?
+            [[ $MP_RUN_ID == "$RUN" ]] || return 70
             GUARD_BOUND=1
+            ;;
+        mapping-sequence)
+            GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
+            validation_environment_verify "$manifest" "$attestation" || return $?
+            GUARD_BOUND=1
+            guard_mapping_main "$mode" "$source" "$RUN" "$E" "$image" "$tools" "$manifest" "$attestation" "$profile"
+            return $?
             ;;
         mapping-fallback|mapping-direct|mapping-probe)
             GUARD_MANIFEST=$manifest GUARD_ATTESTATION=$attestation GUARD_PROFILE=$profile
@@ -471,6 +539,14 @@ guard_main() {
         printf '%s\n' "$spec" >> "$E/chains.owned"
         guard_signal_checkpoint
     done
+    if [[ $mode == full ]]; then
+        for spec in "filter|M$RUN" "raw|ME$RUN" "raw|MR$RUN"; do
+            table=${spec%%|*}; chain=${spec#*|}
+            iptables -t "$table" -N "$chain"; OWN_CHAINS+=("$spec")
+            printf '%s\n' "$spec" >> "$E/chains.owned"
+            guard_signal_checkpoint
+        done
+    fi
     guard_rule filter -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j ACCEPT
     guard_rule filter -A "$CHAIN" -i "$BR" -o "$BR" -s 172.30.243.0/24 -d 172.30.243.0/24 -j ACCEPT
     guard_rule filter -A "$CHAIN" -j DROP
@@ -492,35 +568,59 @@ guard_main() {
     setsid bash -c "$command" > "$E/run.log" 2>&1 &
     CHILD=$!
     guard_signal_checkpoint
-    while [[ ! -f $E/control/runner.pid ]]; do
+    while [[ ! -f $E/control/runner-handshake.tsv && ! -f $E/control/runner.pid ]]; do
         guard_signal_checkpoint
         kill -0 "$CHILD" 2>/dev/null || break
         sleep 0.1
     done
     guard_signal_checkpoint
-    [[ ! -f $E/control/runner.pid ]] || touch "$E/control/start"
+    if [[ -f $E/control/runner-handshake.tsv ]]; then
+        validation_runner_verify "$manifest" "$E/control/runner-handshake.tsv" || exit $?
+        touch "$E/control/prepare-start"
+    else
+        touch "$E/control/start"
+    fi
     seq=1
     while kill -0 "$CHILD" 2>/dev/null; do
         guard_signal_checkpoint
         if [[ -f $E/control/request-$seq ]]; then
-            read -r request token < "$E/control/request-$seq"
-            [[ -n $token ]] || exit 65
+            read -r request token netid sha nonce < "$E/control/request-$seq"
             case "$request" in
+                mapping-ready|mapping-snapshot|mapping-release)
+                    generation=$token
+                    [[ -n $nonce && $nonce != "$last_nonce" ]] || exit 65
+                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
+                    case "$request" in
+                        mapping-ready)
+                            rules_start=${#OWN_RULES[@]}
+                            guard_mapping_rules "$profile" "$netid" || exit $?
+                            ;;
+                        mapping-snapshot) guard_mapping_snapshot "$seq" || exit $? ;;
+                        mapping-release) guard_remove_rules_since "$rules_start" || exit $? ;;
+                    esac
+                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
+                    last_nonce=$nonce
+                    ;;
                 witness)
+                    [[ -n $token ]] || exit 65
                     pid=$(docker inspect -f '{{.State.Pid}}' "gm-$RUN-witness")
                     nsenter -t "$pid" -n iptables -t raw -N "$SEEN"
                     for spec in 'tcp 19419' 'udp 53' 'tcp 53'; do read -r proto port <<< "$spec"; nsenter -t "$pid" -n iptables -t raw -A "$SEEN" -p "$proto" --dport "$port" -j RETURN; done
                     nsenter -t "$pid" -n iptables -t raw -I PREROUTING -j "$SEEN"
                     ;;
                 close)
+                    [[ -n $token ]] || exit 65
                     guard_close_calibration
                     guard_rule raw -A "$EARLY" -d 172.30.244.0/24 -j DROP
                     guard_rule raw -A "$RETURN" -d 172.30.243.0/24 -j DROP
                     ;;
-                snapshot) guard_snapshot "$seq" ;;
+                snapshot)
+                    [[ -n $token ]] || exit 65
+                    guard_snapshot "$seq"
+                    ;;
                 *) exit 65 ;;
             esac
-            printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
+            [[ $request == mapping-* ]] || printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
             mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
             seq=$((seq + 1))
         fi

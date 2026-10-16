@@ -229,17 +229,18 @@ mapping_network_id_load() {
 # 独立 internal bridge：外部路由由 Docker 侧先隔离，guard 的精确规则是附加约束而非唯一防线。
 # 身份写入运行状态，返回 network ID。调用者由编排接线提供。
 mapping_network_create() {
-    local profile=${1:-} ledger_dir=${2:-} id state
+    local profile=${1:-} ledger_dir=${2:-} scenario=${3:-$MAPPING_LEDGER_SCENARIO} id state
     [[ -n $profile && -n $ledger_dir ]] || return 2
+    [[ $scenario == "$MAPPING_LEDGER_SCENARIO" ]] || mapping_scenario_valid "$scenario" || return 2
     mapping_profile_load "$profile" || return $?
     state=$(mapping_network_state_file 2>/dev/null) || state=''
     [[ -z $state || ! -s $state ]] || return 2
     if ! declare -F resource_create_register >/dev/null; then return 2; fi
     RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$MP_RUN_ID
-    resource_create_register network "$MAPPING_LEDGER_SCENARIO" "$MAPPING_LEDGER_ROLE" -- \
+    resource_create_register network "$scenario" "$MAPPING_LEDGER_ROLE" -- \
         resource_docker network create \
         --label "gitdaemon.run=$MP_RUN_ID" \
-        --label "gitdaemon.scenario=$MAPPING_LEDGER_SCENARIO" \
+        --label "gitdaemon.scenario=$scenario" \
         --label "gitdaemon.role=$MAPPING_LEDGER_ROLE" \
         --ipv6=false --internal --subnet "$MP_CIDR" -o "com.docker.network.bridge.name=$MP_BRIDGE" \
         "$MP_NETWORK_NAME" || return $?
@@ -254,10 +255,30 @@ mapping_network_create() {
 
 # 发送 READY 握手：payload 只引用冻结档案哈希与 network ID，不携带任意规则。
 mapping_ready() {
-    local profile=${1:-} network_id=${2:-}
+    local profile=${1:-} network_id=${2:-} generation=${3:-}
     mapping_profile_load "$profile" || return $?
-    [[ -n $network_id ]] || return 2
-    network_control "mapping-ready $MP_PROFILE_SHA256 $network_id"
+    [[ -n $network_id && -n $generation ]] || return 2
+    mapping_control_request mapping-ready "$generation" "$network_id" "$MP_PROFILE_SHA256"
+}
+
+# 准备阶段只登记离线资产与网络，不启动任何联网容器。
+mapping_prepare() {
+    local profile=${1:-} scenario=${2:-} product_image=${3:-} tools_image=${4:-} ledger
+    [[ -n $profile && -n $scenario && -n $product_image && -n $tools_image ]] || return 80
+    mapping_scenario_valid "$scenario" || return 80
+    mapping_profile_load "$profile" || return 80
+    ledger=$(resource_ledger_dir) || return 80
+    mapping_assets_prepare "$profile" "$scenario" "$product_image" "$ledger" || return 80
+    mapping_network_create "$profile" "$ledger" "$scenario" >/dev/null || return 80
+    mapping_fixture_precheck || return 80
+    return 0
+}
+
+# generation 获得 guard ACK 后才允许启动联网夹具。
+mapping_activate() {
+    local generation=${1:-}
+    [[ -n $generation && ${MAPPING_ACK_GENERATION:-} == "$generation" ]] || return 65
+    return 0
 }
 
 # 角色化策略校验：单一映射网络附件、冻结地址、非 root 只读安全属性。
@@ -580,7 +601,7 @@ mapping_probe_container() { printf 'gm-%s-probe\n' "$(mapping_fixture_run_id)"; 
 # 分段使同一 scenario 重跑不复用上一轮的计数文件与 CONNECT 日志。
 mapping_proxy_scenario_dir() {
     local scenario=${1:-}
-    mapping_scenario_valid "$scenario" || return 1
+    [[ $scenario == "$MAPPING_LEDGER_SCENARIO" ]] || mapping_scenario_valid "$scenario" || return 1
     if [[ -n ${MAPPING_PROXY_RUN_ID:-} ]]; then
         printf '%s/proxy/scenarios/%s/%s\n' "$MAPPING_ASSET_ROOT" "$scenario" "$MAPPING_PROXY_RUN_ID"
     else
@@ -875,8 +896,9 @@ mapping_fixture_ca_publish() {
 # 资产卷经资源账本创建并登记：账本目录不可解析或身份为空一律拒绝。
 # 三个卷角色固定 assets（只读资产）、ca（客户端公开 CA）、evidence（上游连接取证，rw）。
 mapping_assets_volumes_create() {
-    local ledger=${1:-} spec role volume
+    local ledger=${1:-} scenario=${2:-$MAPPING_LEDGER_SCENARIO} spec role volume
     [[ -n $ledger ]] || return 1
+    mapping_scenario_valid "$scenario" || return 1
     for spec in "$MAPPING_ASSET_VOLUME_ROLE:$(mapping_assets_volume)" \
         "$MAPPING_CA_VOLUME_ROLE:$(mapping_ca_volume)" \
         "$MAPPING_EVIDENCE_VOLUME_ROLE:$(mapping_evidence_volume)"; do
@@ -884,10 +906,10 @@ mapping_assets_volumes_create() {
         volume=${spec#*:}
         [[ -n $role && -n $volume ]] || return 1
         RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
-        resource_create_register volume "$MAPPING_LEDGER_SCENARIO" "$role" -- \
+        resource_create_register volume "$scenario" "$role" -- \
             resource_docker volume create \
             --label "gitdaemon.run=$MP_RUN_ID" \
-            --label "gitdaemon.scenario=$MAPPING_LEDGER_SCENARIO" \
+            --label "gitdaemon.scenario=$scenario" \
             --label "gitdaemon.role=$role" \
             "$volume" || return 1
         [[ -n $RESOURCE_CREATED_ID ]] || return 1
@@ -903,7 +925,7 @@ mapping_assets_prepare() {
     mapping_scenario_valid "$scenario" || return "$MAPPING_FAILURE"
     mapping_profile_load "$profile" || return "$MAPPING_FAILURE"
     mapping_state_dir >/dev/null || return "$MAPPING_FAILURE"
-    mapping_assets_volumes_create "$ledger" || return "$MAPPING_FAILURE"
+    mapping_assets_volumes_create "$ledger" "$scenario" || return "$MAPPING_FAILURE"
     script=$(mapping_asset_script) || return "$MAPPING_FAILURE"
     mapping_fixture_asset_exec "$script" "$product_image" || return "$MAPPING_FAILURE"
     mapping_fixture_asset_write 'upstream/serve.sh' "$(mapping_upstream_serve_script)" "$product_image" || return "$MAPPING_FAILURE"

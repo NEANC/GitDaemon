@@ -5,7 +5,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/docker-network-fixture.sh"
 # 局部删除统一走资源账本：按登记身份与所有权标签交叉验证后精确删除，禁止先删再核验。
 # 无账本时不具备精确删除依据，返回 2 并留下可观测标记，不声称清理成功。
 integration_remove() {
-    local kind=$1 item identity ledger_dir destination rc=0
+    local kind=$1 item identity ledger_dir destination rc=0 query_rc=0
     shift
     if ! ledger_dir=$(resource_ledger_dir); then
         resource_ledger_notice integration-remove
@@ -15,14 +15,24 @@ integration_remove() {
         [[ $item != -* && -n $item ]] || continue
         case "$kind" in
             container)
-                identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || continue
+                identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || query_rc=$?
+                if (( query_rc != 0 )); then
+                    (( query_rc == 1 )) && continue
+                    return 2
+                fi
                 [[ -n $identity ]] || continue
                 destination=$IT_EVIDENCE_DIR/control/deleted/$identity
                 mkdir -p "$destination" || return $?
                 command docker inspect "$item" > "$destination/inspect.json" || return $?
                 command docker logs "$item" > "$destination/container.log" 2>&1 || return $?
                 ;;
-            network) identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || continue ;;
+            network)
+                identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || query_rc=$?
+                if (( query_rc != 0 )); then
+                    (( query_rc == 1 )) && continue
+                    return 2
+                fi
+                ;;
             volume) identity=$item ;;
             *) continue ;;
         esac

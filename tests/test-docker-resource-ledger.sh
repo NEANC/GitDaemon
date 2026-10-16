@@ -231,6 +231,24 @@ case_inspect_failure_retains_isolation() {
     rm -rf "$S"
 }
 
+case_inspect_error_is_not_absence() {
+    ledger_setup
+    install_docker_double
+    declare_object container c1 r1 fixture product
+    resource_register container c1 fixture product || return 1
+    M_INSPECTFAIL[c1]=1
+    local rc=0
+    command() {
+        [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+        shift
+        mock_docker "$@"
+    }
+    integration_remove container c1 2>/dev/null || rc=$?
+    [[ $rc == 2 ]] || return 1
+    assert_no_delete_no_rule || return 1
+    rm -rf "$S"
+}
+
 # 已成功删除的对象凭回执幂等；正常二次清理返回 0 且不再删除。
 case_registered_delete_is_idempotent() {
     ledger_setup
@@ -614,6 +632,7 @@ for name in \
     recreated_volume_is_not_deleted \
     missing_without_receipt_fails \
     inspect_failure_retains_isolation \
+    inspect_error_is_not_absence \
     registered_delete_is_idempotent \
     signal_between_create_and_register \
     cleanup_revalidates_daemon \

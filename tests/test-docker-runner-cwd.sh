@@ -7,6 +7,7 @@ trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/source/tests" "$scratch/evidence/control" "$scratch/caller"
 touch "$scratch/evidence/control/start"
 cp "$HERE/test-docker-network.sh" "$scratch/source/tests/"
+cp "$HERE/docker-validation-environment.sh" "$scratch/source/tests/"
 cat > "$scratch/source/tests/docker-network-fixture.sh" <<'FIXTURE'
 # 只观测 runner 的当前目录，不启动网络资源。
 network_probe() {

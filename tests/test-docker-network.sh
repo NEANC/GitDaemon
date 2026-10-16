@@ -2,6 +2,7 @@
 # 网络编排行为契约与受控宿主探针入口。
 set -Eeuo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$HERE/docker-validation-environment.sh"
 # 运行真实 guard 入口；仅替换授权宿主、Docker、su 与规则等外部边界。
 contract_guard_driver() {
     source "$HERE/docker-network-guard.sh"
@@ -36,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -430,21 +431,78 @@ contract_case() {
             [[ $cmd == *'IT_MAPPING_PROFILE=prof'* ]] || { printf 'full did not bind mapping profile\n'; return 1; }
             [[ $cmd == *'test-docker-network.sh'* && $cmd == *'--integration'* ]] || { printf 'full entry not fixed integration runner\n'; return 1; }
             [[ $cmd != *'IT_MAPPING_SCENARIO='* ]] || { printf 'full leaked single mapping toggle\n'; return 1; }
-            [[ $(grep -o 'unix:///var/run/docker.sock' <<< "$cmd" | wc -l) == 1 ]] || { printf 'full endpoint not unique\n'; return 1; }
+            [[ $cmd == *'validation_environment_verify'* && $cmd == *'validation_docker'* ]] || return 1
+            [[ $cmd != *'unix:///var/run/docker.sock'* ]] || return 1
+            ;;
+        runner_checks_manifest_and_socket)
+            local cmd
+            cmd=$(guard_runner_command mapping-direct /src run1 /ev img tools man att prof) || return 1
+            [[ $cmd == *'docker-validation-environment.sh'* ]] || return 1
+            [[ $cmd == *'validation_environment_verify'* ]] || return 1
+            [[ $cmd == *'validation_docker'* ]] || return 1
+            [[ $cmd != *'unix:///var/run/docker.sock'* ]] || return 1
+            ;;
+        full_dispatches_mapping_control)
+            local cmd
+            cmd=$(guard_runner_command full /src run1 /ev img tools man att prof) || return 1
+            [[ $cmd == *'IT_CONTROL_DIR=/ev/control'* ]] || return 1
+            [[ $cmd == *'RESOURCE_LEDGER_DIR=/ev/control/resources'* ]] || return 1
+            [[ $cmd == *'IT_MAPPING=1'* ]] || return 1
+            ;;
+        mapping_sequence_order_is_closed)
+            local cmd rc=0
+            IT_MAPPING_ORDER=fallback,direct
+            cmd=$(guard_runner_command mapping-sequence /src run1 /ev img tools man att prof) || return 1
+            [[ $cmd == *'IT_MAPPING_ORDER='* && $cmd == *'fallback'* && $cmd == *'direct'* && $cmd == *'--mapping-sequence'* ]] || return 1
+            IT_MAPPING_ORDER=direct,fallback
+            guard_runner_command mapping-sequence /src run1 /ev img tools man att prof >/dev/null || return 1
+            IT_MAPPING_ORDER=fallback,fallback
+            guard_runner_command mapping-sequence /src run1 /ev img tools man att prof >/dev/null || rc=$?
+            [[ $rc == 2 ]]
+            ;;
+        stale_ready_rejected)
+            local MP_PROFILE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rc=0
+            GUARD_MAPPING_STATE=PREPARING
+            GUARD_MAPPING_LAST_GENERATION=''
+            guard_mapping_generation mapping-ready generation-1 net-1 "$MP_PROFILE_SHA256" || return 1
+            guard_mapping_generation mapping-ready generation-1 net-1 "$MP_PROFILE_SHA256" >/dev/null 2>&1 || rc=$?
+            [[ $rc == 65 ]] || return 1
+            guard_mapping_generation mapping-release generation-1 net-1 "$MP_PROFILE_SHA256" || return 1
+            rc=0
+            guard_mapping_generation mapping-ready generation-1 net-1 "$MP_PROFILE_SHA256" >/dev/null 2>&1 || rc=$?
+            [[ $rc == 65 ]] || return 1
+            rc=0
+            guard_mapping_generation mapping-ready generation-2 net-1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >/dev/null 2>&1 || rc=$?
+            [[ $rc == 65 ]]
             ;;
     esac
 }
 # 降权 runner 握手：登记 PID、等待启动许可、离开管理员私有工作目录。
 runner_handshake() {
-    trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "$IT_EVIDENCE_DIR/control/runner-status.txt"' EXIT
+    local control manifest_hash start_ticks
+    control=${IT_CONTROL_DIR:-$IT_EVIDENCE_DIR/control}
+    trap 'runner_rc=$?; printf "RUNNER_EXIT=%s\n" "$runner_rc" > "${IT_CONTROL_DIR:-$IT_EVIDENCE_DIR/control}/runner-status.txt"' EXIT
     trap 'exit 143' TERM
     trap 'exit 130' INT
-    printf '%s\n' "$$" > "$IT_EVIDENCE_DIR/control/runner.pid"
-    while [[ ! -f $IT_EVIDENCE_DIR/control/start ]]; do
-        [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
+    if [[ -z ${GUARD_RUNNER_MANIFEST:-} ]]; then
+        printf '%s\n' "$$" > "$control/runner.pid"
+        while [[ ! -f $control/start ]]; do
+            [[ ! -f $control/stop ]] || exit 143
+            sleep 0.1
+        done
+        cd -- "$HERE/.." || exit $?
+        return 0
+    fi
+    start_ticks=$(validation_proc_starttime "$$") || exit 77
+    manifest_hash=$(validation_manifest_digest "$GUARD_RUNNER_MANIFEST") || exit 77
+    printf 'pid\t%s\nstart_ticks\t%s\nboot_id\t%s\nmanifest_sha256\t%s\n' \
+        "$$" "$start_ticks" "$(validation_host_boot_id)" "$manifest_hash" > "$control/runner-handshake.tsv.tmp" || exit 80
+    mv "$control/runner-handshake.tsv.tmp" "$control/runner-handshake.tsv" || exit 80
+    while [[ ! -f $control/prepare-start ]]; do
+        [[ ! -f $control/stop ]] || exit 143
         sleep 0.1
     done
-    [[ ! -f $IT_EVIDENCE_DIR/control/stop ]] || exit 143
+    [[ ! -f $control/stop ]] || exit 143
     # 降权后切换到可访问的源码目录，不继承管理员的私有工作目录。
     cd -- "$HERE/.." || exit $?
 }
@@ -469,6 +527,11 @@ case "${1:-}" in
         # 单场景映射入口接线到集成入口：按所属场景设置 IT_MAPPING_SCENARIO，只运行对应场景。
         IT_MAPPING_SCENARIO=${1#--mapping-}
         export IT_MAPPING_SCENARIO
+        runner_handshake
+        runner_integration
+        ;;
+    --mapping-sequence)
+        case "${IT_MAPPING_ORDER:-}" in fallback,direct|direct,fallback) ;; *) exit 2 ;; esac
         runner_handshake
         runner_integration
         ;;

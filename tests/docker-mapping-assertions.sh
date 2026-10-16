@@ -346,12 +346,11 @@ mapping_scenario_fixture_prepare() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} ledger
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n ${MAPPING_PROFILE:-} && -n ${MAPPING_PRODUCT_IMAGE:-} && -n ${MAPPING_TOOLS_IMAGE:-} ]] || return "$MAPPING_ASSERT_FIXTURE"
-    ledger=$dir/control/resources
-    mapping_assets_prepare "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$ledger" || return "$MAPPING_ASSERT_FIXTURE"
+    ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources}
+    RESOURCE_LEDGER_DIR=$ledger
+    mapping_prepare "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$MAPPING_TOOLS_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_proxy_evidence_reset "$scenario" "$MAPPING_PRODUCT_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_network_create "$MAPPING_PROFILE" "$ledger" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
     mapping_negative_prepare "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_fixture_start "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$MAPPING_TOOLS_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
 }
 
@@ -398,7 +397,7 @@ mapping_scenario_release_probe() {
 # 释放顺序占位 probe(P) → READY 握手 → 从正式容器入口启动并等待可观测就绪。
 mapping_scenario_product_up() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
-    local ledger=$dir/control/resources data gitconfig snapshot_content name netid
+    local ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources} data gitconfig snapshot_content name netid
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
     netid=$(mapping_network_id_load) || return "$MAPPING_ASSERT_FIXTURE"
@@ -419,7 +418,9 @@ mapping_scenario_product_up() {
         || return "$MAPPING_ASSERT_FIXTURE"
     # 顺序占位必须先释放：产品启动前按登记身份删除 probe，产品才能取得冻结地址 P。
     mapping_scenario_release_probe || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_ready "$MAPPING_PROFILE" "$netid" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_ready "$MAPPING_PROFILE" "$netid" "$MAPPING_ASSERT_GENERATION" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_activate "$MAPPING_ASSERT_GENERATION" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_fixture_start "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$MAPPING_TOOLS_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
     name=$(mapping_scenario_product_container "$MAPPING_ASSERT_GENERATION")
     mapping_fixture_create "$scenario" "$MAPPING_ASSERT_PRODUCT_ROLE" -d --name "$name" \
         $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_P" --dns "$MP_D" \
@@ -547,33 +548,10 @@ mapping_scenario_release() {
     local kind=${1:-} scenario=${2:-} generation=${3:-} dir=${4:-} ledger id name
     [[ -n $kind && -n $scenario && -n $generation && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "${MAPPING_PROFILE:-}" || return "$MAPPING_ASSERT_FIXTURE"
-    ledger=$dir/control/resources
+    ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources}
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
-    local -a containers=(
-        "$(mapping_scenario_product_container "$generation")"
-        "$(mapping_upstream_container)"
-        "$(mapping_proxy_container)"
-        "$(mapping_dns_container)"
-        "$(mapping_probe_container)"
-    )
-    for name in "${containers[@]}"; do
-        id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$name" 2>/dev/null) || continue
-        [[ -n $id ]] || continue
-        resource_remove container "$id" || return "$MAPPING_ASSERT_FIXTURE"
-    done
-    for name in "$MP_NETWORK_NAME" "gm-${MP_RUN_ID}-neg-net"; do
-        [[ -n $name ]] || continue
-        id=$(mapping_fixture_docker network inspect -f '{{.Id}}' "$name" 2>/dev/null) || continue
-        [[ -n $id ]] || continue
-        resource_remove network "$id" || return "$MAPPING_ASSERT_FIXTURE"
-    done
-    for name in "$(mapping_scenario_data_volume "$generation")" "$(mapping_assets_volume)" \
-        "$(mapping_ca_volume)" "$(mapping_evidence_volume)"; do
-        [[ -n $name ]] || continue
-        id=$(mapping_fixture_docker volume inspect -f '{{.Name}}' "$name" 2>/dev/null) || continue
-        [[ -n $id ]] || continue
-        resource_remove volume "$id" || return "$MAPPING_ASSERT_FIXTURE"
-    done
+    resource_cleanup_scenario "$ledger" "$scenario" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_control_request mapping-release "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
 }
 
@@ -714,6 +692,8 @@ mapping_scenario_run() {
     # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
     # 分组会把证据写进映射场景的嵌套目录，主成功/清理失败校验被静默跳过。
     local IT_EVIDENCE_DIR=$dir
+    local IT_CONTROL_DIR=${IT_CONTROL_DIR:-$dir/control}
+    local RESOURCE_LEDGER_DIR=${RESOURCE_LEDGER_DIR:-$IT_CONTROL_DIR/resources}
     if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
         MAPPING_PROXY_RUN_ID=''
@@ -767,6 +747,8 @@ mapping_negative_run() {
     # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
     # 分组会把证据写进映射场景的嵌套目录，主成功/清理失败校验被静默跳过。
     local IT_EVIDENCE_DIR=$dir
+    local IT_CONTROL_DIR=${IT_CONTROL_DIR:-$dir/control}
+    local RESOURCE_LEDGER_DIR=${RESOURCE_LEDGER_DIR:-$IT_CONTROL_DIR/resources}
     if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
         MAPPING_ASSERT_CASE='' MAPPING_PROXY_RUN_ID=''
