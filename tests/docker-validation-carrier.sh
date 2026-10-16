@@ -194,6 +194,7 @@ carrier_host_snapshot_complete() {
     [[ -d $snapshot && ! -L $snapshot && -f $snapshot/complete && -f $snapshot/identity.tsv && -s $snapshot/commands.tsv ]] || return 1
     while IFS= read -r name; do
         [[ -n $name && -f $snapshot/$name.argv && -f $snapshot/$name.exit && -f $snapshot/$name.stdout && -f $snapshot/$name.stderr ]] || return 1
+        [[ $name != *-inspect-* || -f $snapshot/$name.identity ]] || return 1
         grep -qx '0' "$snapshot/$name.exit" || return 1
     done < "$snapshot/commands.tsv"
 }
@@ -233,8 +234,8 @@ carrier_create() {
     [[ $(carrier_dockerd_sha256) == "$dockerd_sha" ]] || return 77
     state_root=$(carrier_state_root); runtime_root=$(carrier_runtime_root)
     [[ $state_dir == "$state_root/$CARRIER_RUN_ID" ]] || return 77
+    carrier_host_snapshot_matches_approval "$state_dir/host-before" || return 77
     if [[ -e $state_dir ]]; then
-        carrier_host_snapshot_matches_approval "$state_dir/host-before" || return 77
         [[ ! -e $state_dir/approval.tsv && ! -e $state_dir/state.tsv && ! -e $state_dir/daemon.json && ! -e $state_dir/docker-data ]] || return 77
         find "$state_dir" -mindepth 1 -maxdepth 1 ! -name host-before -print -quit | grep -q . && return 77
     fi
@@ -531,7 +532,7 @@ carrier_host_inventory_command() {
 
 # 对列表结果逐项执行对应 inspect，并保留每个对象的独立命令证据。
 carrier_host_inventory_inspect() {
-    local snapshot=$1 kind=$2 list_name=$3 identity evidence_id
+    local snapshot=$1 kind=$2 list_name=$3 identity evidence_id name
     while IFS= read -r identity; do
         [[ -z $identity ]] && continue
         [[ $identity != -* ]] || return 80
@@ -541,8 +542,10 @@ carrier_host_inventory_inspect() {
             volume) [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] || return 80 ;;
             *) return 80 ;;
         esac
-        evidence_id=${identity#sha256:}
-        carrier_host_inventory_command "$snapshot" "$kind-inspect-$evidence_id" docker --host unix:///var/run/docker.sock "$kind" inspect "$identity" || return 80
+        evidence_id=$(printf '%s' "$identity" | sha256sum | cut -d' ' -f1) || return 80
+        name=$kind-inspect-$evidence_id
+        printf '%s\n' "$identity" > "$snapshot/$name.identity" || return 80
+        carrier_host_inventory_command "$snapshot" "$name" docker --host unix:///var/run/docker.sock "$kind" inspect "$identity" || return 80
     done < <(LC_ALL=C sort -u "$snapshot/$list_name.stdout")
 }
 
@@ -575,6 +578,7 @@ carrier_host_inventory_compare() {
     cmp -s "$before/commands.tsv" "$after/commands.tsv" || return 1
     while IFS= read -r name; do
         cmp -s "$before/$name.argv" "$after/$name.argv" || return 1
+        [[ $name != *-inspect-* ]] || cmp -s "$before/$name.identity" "$after/$name.identity" || return 1
         grep -qx '0' "$before/$name.exit" && grep -qx '0' "$after/$name.exit" || return 1
         cmp -s <(carrier_host_inventory_normalize "$name" "$before/$name.stdout") <(carrier_host_inventory_normalize "$name" "$after/$name.stdout") || return 1
         cmp -s "$before/$name.stderr" "$after/$name.stderr" || return 1
