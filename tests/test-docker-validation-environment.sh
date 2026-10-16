@@ -56,6 +56,8 @@ setup_identity_boundaries() {
     validation_passwd_lookup() { printf 'gmtest:10001:10001\n'; }
     validation_proc_starttime() { printf '777\n'; }
     validation_proc_owner() { printf '10001\n'; }
+    validation_manifest_facts() { printf '0 %s\n' "$(stat -c '%a' -- "$1")"; }
+    validation_manifest_safe_path() { [[ -f $1 ]]; }
 }
 
 # 建立 PATH 替身：记录并阻断 Docker、su、iptables 与 ip 的全部副作用。
@@ -153,6 +155,35 @@ prepare_manifest() {
         printf 'product_image_id\t%s\n' "$VALIDATION_TEST_PRODUCT_ID"
         printf 'tools_image_id\t%s\n' "$VALIDATION_TEST_TOOLS_ID"
         printf 'mapping_profile_sha256\t%s\n' "$VALIDATION_TEST_PROFILE_ID"
+    } > "$manifest"
+    chown 0:0 "$manifest"
+    chmod 644 "$manifest"
+    printf '%s\n' "$manifest"
+}
+
+# 写入 schema 2 的独立 namespace 清单。
+prepare_schema2_manifest() {
+    local scratch=$1 manifest source_digest state_digest
+    source_digest=$(frozen_all_files_digest "$scratch/source") || return 1
+    state_digest=$(printf 'carrier-state\n' | sha256sum | cut -d' ' -f1)
+    manifest=$scratch/environment-v2.tsv
+    {
+        printf 'schema_version\t2\nprofile\tisolated-netns\nrun_id\tcontract\n'
+        printf 'expires_at_epoch\t%s\n' "$((VALIDATION_TEST_NOW + 3600))"
+        printf 'machine_id\t%s\nboot_id\t%s\n' "$VALIDATION_TEST_MACHINE_ID" "$VALIDATION_TEST_BOOT_ID"
+        printf 'offline_attestation_sha256\t%s\n' "$VALIDATION_TEST_PROFILE_ID"
+        printf 'runner_user\tgmtest\nrunner_uid\t10001\nrunner_gid\t10001\n'
+        printf 'source_dir\t%s\nsource_sha256\t%s\n' "$scratch/source" "$source_digest"
+        printf 'runner_entry\ttests/test-docker-network.sh\n'
+        printf 'docker_endpoint\tunix:///run/gitdaemon-validation/contract/docker.sock\n'
+        printf 'daemon_id\t%s\n' "$VALIDATION_TEST_DAEMON"
+        printf 'socket_realpath\t/run/gitdaemon-validation/contract/docker.sock\n'
+        printf 'socket_device\t9999\nsocket_inode\t4242\nsocket_uid\t0\nsocket_gid\t10001\n'
+        printf 'product_image_id\t%s\ntools_image_id\t%s\n' "$VALIDATION_TEST_PRODUCT_ID" "$VALIDATION_TEST_TOOLS_ID"
+        printf 'mapping_profile_sha256\t%s\n' "$VALIDATION_TEST_PROFILE_ID"
+        printf 'holder_pid\t31337\nholder_start_ticks\t888\n'
+        printf 'netns_device\t4\nnetns_inode\t4001\nmntns_device\t4\nmntns_inode\t4002\n'
+        printf 'carrier_state_sha256\t%s\n' "$state_digest"
     } > "$manifest"
     chown 0:0 "$manifest"
     chmod 644 "$manifest"
@@ -292,10 +323,13 @@ case_reject_mutable_manifest() {
     install_effect_stubs "$scratch"
     manifest=$(prepare_manifest "$scratch") || return 1
     chmod 664 "$manifest"
+    validation_manifest_facts() { printf '0 664\n'; }
     validation_environment_load "$manifest" || rc=$?
     [[ $rc == 77 ]] || { printf 'writable rc=%s\n' "$rc"; return 1; }
     chmod 644 "$manifest"
+    validation_manifest_facts() { printf '0 644\n'; }
     ln -s "$manifest" "$scratch/linked.tsv"
+    validation_manifest_safe_path() { [[ $1 != "$scratch/linked.tsv" && -f $1 ]]; }
     rc=0
     validation_environment_load "$scratch/linked.tsv" || rc=$?
     [[ $rc == 77 ]] || { printf 'symlink rc=%s\n' "$rc"; return 1; }
@@ -359,6 +393,7 @@ exit 0
 STUB
     export RUNNER_ENTRY_LOG="$scratch/runner-entry.log"
     manifest=$(prepare_manifest "$scratch") || return 1
+    validation_environment_load "$manifest" || return 1
     validation_docker info -f '{{.ID}}' >/dev/null || { printf 'root docker rc=%s\n' "$?"; return 1; }
     command=$(guard_runner_command full "$scratch/source" run "$scratch/evidence" product tools \
         "$manifest" "$scratch/offline.txt" "$scratch/profile.tsv") || { printf 'command generation failed\n'; return 1; }
@@ -383,8 +418,92 @@ STUB
     rm -rf "$scratch"
 }
 
+# 私有 socket URI 必须先转换成路径，Docker argv 只含一个显式端点。
+case_private_socket_uri_is_not_stat_path() {
+    local scratch manifest rc=0
+    scratch=$(new_scratch) || return 1
+    setup_identity_boundaries
+    install_effect_stubs "$scratch"
+    validation_socket_facts() {
+        [[ $1 == /run/gitdaemon-validation/contract/docker.sock ]] || return 1
+        printf '9999 4242 0 10001 /run/gitdaemon-validation/contract/docker.sock\n'
+    }
+    manifest=$(prepare_schema2_manifest "$scratch") || return 1
+    validation_environment_load "$manifest" || rc=$?
+    [[ $rc == 0 ]] || { printf 'schema2 load rc=%s\n' "$rc"; return 1; }
+    validation_socket_binding_verify || rc=$?
+    [[ $rc == 0 ]] || { printf 'socket verify rc=%s\n' "$rc"; return 1; }
+    validation_docker info >/dev/null || return 1
+    [[ $(grep -o -- '--host' "$scratch/docker-calls" | wc -l) == 1 ]] || return 1
+    grep -q -- '--host unix:///run/gitdaemon-validation/contract/docker.sock' "$scratch/docker-calls" || return 1
+    rm -rf "$scratch"
+}
+
+# 未加载清单时不得回退默认 Docker socket。
+case_unloaded_endpoint_never_uses_default() {
+    local scratch rc=0
+    scratch=$(new_scratch) || return 1
+    install_effect_stubs "$scratch"
+    VE_DOCKER_ENDPOINT=''
+    validation_docker info >/dev/null 2>&1 || rc=$?
+    [[ $rc == 77 ]] || { printf 'unloaded endpoint rc=%s\n' "$rc"; return 1; }
+    [[ ! -s $scratch/docker-calls ]] || return 1
+    rm -rf "$scratch"
+}
+
+# schema 2 必须精确包含 30 个唯一键，schema 1 仍保持 24 键。
+case_schema2_requires_exact_30_keys() {
+    local scratch manifest candidate key rc=0
+    scratch=$(new_scratch) || return 1
+    setup_identity_boundaries
+    install_effect_stubs "$scratch"
+    manifest=$(prepare_schema2_manifest "$scratch") || return 1
+    [[ $(wc -l < "$manifest") == 30 ]] || return 1
+    validation_environment_load "$manifest" || return 1
+    while IFS=$'\t' read -r key _; do
+        candidate=$scratch/missing.tsv
+        awk -F '\t' -v key="$key" '$1 != key' "$manifest" > "$candidate"
+        chown 0:0 "$candidate"; chmod 644 "$candidate"
+        rc=0; validation_environment_load "$candidate" || rc=$?
+        [[ $rc == 2 ]] || { printf 'missing %s rc=%s\n' "$key" "$rc"; return 1; }
+    done < "$manifest"
+    candidate=$scratch/duplicate.tsv
+    cat "$manifest" > "$candidate"; head -n 1 "$manifest" >> "$candidate"
+    chown 0:0 "$candidate"; chmod 644 "$candidate"
+    rc=0; validation_environment_load "$candidate" || rc=$?
+    [[ $rc == 2 ]] || return 1
+    candidate=$scratch/unknown.tsv
+    sed 's/^holder_pid\t/unknown_key\t/' "$manifest" > "$candidate"
+    chown 0:0 "$candidate"; chmod 644 "$candidate"
+    rc=0; validation_environment_load "$candidate" || rc=$?
+    [[ $rc == 2 ]] || return 1
+    candidate=$scratch/vm.tsv
+    sed 's/^holder_pid\t/vm_uuid\t/' "$manifest" > "$candidate"
+    chown 0:0 "$candidate"; chmod 644 "$candidate"
+    rc=0; validation_environment_load "$candidate" || rc=$?
+    [[ $rc == 2 ]] || return 1
+    rm -rf "$scratch"
+}
+
+# schema 2 完整核验必须使用 namespace 身份，不再要求旧 VM UUID。
+case_schema2_verify_uses_namespace_identity() {
+    local scratch manifest rc=0
+    scratch=$(new_scratch) || return 1
+    setup_identity_boundaries
+    install_effect_stubs "$scratch"
+    printf 'offline attestation\n' > "$scratch/offline.txt"
+    VALIDATION_TEST_PROFILE_ID=$(sha256sum "$scratch/offline.txt" | cut -d' ' -f1)
+    validation_namespace_facts() { printf '31337 888 4 4001 4 4002\n'; }
+    validation_socket_facts() { printf '9999 4242 0 10001 /run/gitdaemon-validation/contract/docker.sock\n'; }
+    validation_passwd_lookup() { printf 'gmtest:10001:10001\n'; }
+    manifest=$(prepare_schema2_manifest "$scratch") || return 1
+    validation_environment_verify "$manifest" "$scratch/offline.txt" || rc=$?
+    [[ $rc == 0 ]] || { printf 'schema2 verify rc=%s\n' "$rc"; return 1; }
+    rm -rf "$scratch"
+}
+
 failed=0
-for name in load_accepts_frozen_manifest source_digest_excludes_non_inputs reject_unapproved_vm reject_stale_boot reject_runner_identity reject_remote_endpoint reject_socket_replacement reject_mutable_manifest reject_expired_manifest reject_defer_before_mutation same_vm_same_daemon; do
+for name in load_accepts_frozen_manifest source_digest_excludes_non_inputs reject_unapproved_vm reject_stale_boot reject_runner_identity reject_remote_endpoint reject_socket_replacement reject_mutable_manifest reject_expired_manifest reject_defer_before_mutation same_vm_same_daemon private_socket_uri_is_not_stat_path unloaded_endpoint_never_uses_default schema2_requires_exact_30_keys schema2_verify_uses_namespace_identity; do
     rc=0
     ( "case_$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
