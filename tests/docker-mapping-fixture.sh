@@ -209,7 +209,11 @@ mapping_state_dir() {
 mapping_network_state_file() {
     local dir generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
     dir=$(mapping_state_dir) || return 1
-    [[ -n $generation ]] || return 1
+    [[ $generation =~ ^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$ ]] || return 1
+    [[ $dir == /* && -d $dir ]] || return 1
+    [[ $(readlink -f -- "$dir") == "$dir" ]] || return 1
+    [[ ! -e $dir/generations || ( -d $dir/generations && ! -L $dir/generations ) ]] || return 1
+    [[ ! -e $dir/generations/$generation || ( -d $dir/generations/$generation && ! -L $dir/generations/$generation ) ]] || return 1
     printf '%s\n' "$dir/generations/$generation/mapping-network.tsv"
 }
 

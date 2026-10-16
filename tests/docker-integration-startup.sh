@@ -3,6 +3,9 @@
 source "$(dirname -- "${BASH_SOURCE[0]}")/docker-network-fixture.sh"
 
 integration_docker() {
+    if [[ -n ${GUARD_RUNNER_MANIFEST:-} || -n ${GUARD_RUNNER_ATTESTATION:-} ]] && [[ -z ${VE_DOCKER_ENDPOINT:-} ]]; then
+        return 77
+    fi
     if declare -F validation_docker >/dev/null && [[ -n ${VE_DOCKER_ENDPOINT:-} ]]; then
         validation_docker "$@"
         return $?

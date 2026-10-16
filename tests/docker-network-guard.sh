@@ -244,13 +244,17 @@ guard_runner_command() {
 # 撤销指定下标之后安装的 generation 规则，保留基础链。
 guard_remove_rules_since() {
     local start=$1 i table rule status=0
-    local -a args keep=()
+    local -a args keep=() retained=()
     for ((i=${#OWN_RULES[@]}-1;i>=start;i--)); do
         table=${OWN_RULES[i]%%|*}; rule=${OWN_RULES[i]#*|}
         read -ra args <<< "$rule"; args[0]=-D
-        iptables -t "$table" "${args[@]}" || status=2
+        if ! iptables -t "$table" "${args[@]}"; then
+            status=2
+            retained+=("${OWN_RULES[i]}")
+        fi
     done
     for ((i=0;i<start;i++)); do keep+=("${OWN_RULES[i]}"); done
+    for ((i=${#retained[@]}-1;i>=0;i--)); do keep+=("${retained[i]}"); done
     OWN_RULES=("${keep[@]}")
     return "$status"
 }
@@ -258,7 +262,8 @@ guard_remove_rules_since() {
 # 校验 PREPARING→ACTIVE→RELEASED generation 状态与绑定字段。
 guard_mapping_generation() {
     local action=${1:-} generation=${2:-} network_id=${3:-} profile_sha256=${4:-}
-    [[ -n $generation && -n $network_id && $profile_sha256 == "$MP_PROFILE_SHA256" ]] || return 65
+    [[ $generation =~ ^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$ ]] || return 65
+    [[ -n $network_id && $profile_sha256 == "$MP_PROFILE_SHA256" ]] || return 65
     case "$action" in
         mapping-ready)
             [[ ${GUARD_MAPPING_STATE:-PREPARING} != ACTIVE ]] || return 65
@@ -300,8 +305,8 @@ guard_mapping_release_verify() {
 guard_mapping_release() {
     local generation=${1:-} network_id=${2:-} profile_sha256=${3:-} rules_start=${4:-}
     guard_mapping_release_verify "$generation" "$network_id" "$profile_sha256" || return $?
-    guard_mapping_generation mapping-release "$generation" "$network_id" "$profile_sha256" || return $?
-    guard_remove_rules_since "$rules_start"
+    guard_remove_rules_since "$rules_start" || return $?
+    guard_mapping_generation mapping-release "$generation" "$network_id" "$profile_sha256"
 }
 # 映射网精确策略：只放行同网所需通信，其余 INPUT/转发、跨网、外 DNS 与 IPv6 一律拒绝。
 # 源地址 P、桥接口与见证目标全部来自冻结档案，不复制旧 .4 规则。
@@ -348,7 +353,7 @@ guard_mapping_snapshot() {
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
 guard_mapping_main() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6 manifest=$7 attestation=$8 profile=$9
-    local bridge chain early returnc seq=1 ready=0 rc=0 request nonce sha netid generation rules_start last_nonce=''
+    local bridge chain early returnc seq=1 ready=0 rc=0 request nonce sha netid generation rules_start last_nonce='' state
     local existing routes resources links rules table c ids parent command
     [[ -n $profile && -f $profile ]] || return 2
     mapping_profile_load "$profile" || return $?
@@ -433,8 +438,10 @@ guard_mapping_main() {
                     guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
                     rules_start=${#OWN_RULES[@]}
                     guard_mapping_rules "$profile" "$netid" || exit $?
-                    mkdir -p "$E/control/generations/$generation" || exit 80
-                    printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$netid" "$sha" > "$E/control/generations/$generation/mapping-network.tsv"
+                    IT_CONTROL_DIR=$E/control
+                    state=$(mapping_network_state_file) || exit 80
+                    mkdir -p "${state%/*}" || exit 80
+                    printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$netid" "$sha" > "$state"
                     ready=1
                     printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"

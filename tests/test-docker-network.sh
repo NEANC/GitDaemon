@@ -37,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint timeout_is_thirty_seconds; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration bound_integration_empty_endpoint_rejected full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -448,6 +448,32 @@ contract_case() {
             [[ $cmd == *'GUARD_RUNNER_MANIFEST=man'* ]] || return 1
             [[ $cmd == *'GUARD_RUNNER_ATTESTATION=att'* ]] || return 1
             ;;
+        secondary_runner_revalidates_before_integration)
+            local scratch calls rc=0
+            scratch=$(mktemp -d)
+            calls=$scratch/calls
+            IT_NETWORK_GUARD_READY=1 IT_MAPPING_SCENARIO=direct GUARD_RUNNER_MANIFEST=manifest GUARD_RUNNER_ATTESTATION=attestation VE_DOCKER_ENDPOINT=unix:///private/docker.sock
+            id() { printf '10001\n'; }
+            validation_environment_verify() { printf 'verify %s %s\n' "$1" "$2" >> "$calls"; }
+            bash() { printf 'integration\n' >> "$calls"; }
+            export -f id validation_environment_verify bash
+            ( runner_integration ) || rc=$?
+            [[ $rc == 0 ]] || return 1
+            [[ $(cat "$calls") == $'verify manifest attestation\nintegration' ]] || return 1
+            rm -rf "$scratch"
+            ;;
+        bound_integration_empty_endpoint_rejected)
+            local scratch calls rc=0
+            scratch=$(mktemp -d)
+            calls=$scratch/calls
+            GUARD_RUNNER_MANIFEST=manifest GUARD_RUNNER_ATTESTATION=attestation
+            unset VE_DOCKER_ENDPOINT
+            source "$HERE/docker-integration-startup.sh"
+            command() { printf '%s\n' "$*" >> "$calls"; }
+            integration_docker info >/dev/null 2>&1 || rc=$?
+            [[ $rc == 77 && ! -s $calls ]] || return 1
+            rm -rf "$scratch"
+            ;;
         full_dispatches_mapping_control)
             local cmd
             cmd=$(guard_runner_command full /src run1 /ev img tools man att prof) || return 1
@@ -490,6 +516,26 @@ contract_case() {
             guard_mapping_release generation-1 net-1 "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 || rc=$?
             [[ $rc == 2 && $calls == $'verify\n' && $GUARD_MAPPING_STATE == ACTIVE ]]
             ;;
+        release_failure_retains_active_rules)
+            local MP_PROFILE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rc=0
+            GUARD_MAPPING_STATE=ACTIVE GUARD_MAPPING_GENERATION=generation-1 GUARD_MAPPING_NETWORK_ID=net-1
+            OWN_RULES=('filter|-A BASE -j ACCEPT' 'filter|-A GEN-OK -j ACCEPT' 'filter|-A GEN-FAIL -j ACCEPT')
+            guard_mapping_release_verify() { return 0; }
+            iptables() { [[ $* != *GEN-FAIL* ]]; }
+            guard_mapping_release generation-1 net-1 "$MP_PROFILE_SHA256" 1 >/dev/null 2>&1 || rc=$?
+            [[ $rc == 2 && $GUARD_MAPPING_STATE == ACTIVE ]] || return 1
+            [[ ${OWN_RULES[*]} == 'filter|-A BASE -j ACCEPT filter|-A GEN-FAIL -j ACCEPT' ]]
+            ;;
+        release_success_marks_released)
+            local MP_PROFILE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            GUARD_MAPPING_STATE=ACTIVE GUARD_MAPPING_GENERATION=generation-1 GUARD_MAPPING_NETWORK_ID=net-1
+            OWN_RULES=('filter|-A BASE -j ACCEPT' 'filter|-A GEN -j ACCEPT')
+            guard_mapping_release_verify() { return 0; }
+            iptables() { return 0; }
+            guard_mapping_release generation-1 net-1 "$MP_PROFILE_SHA256" 1 || return 1
+            [[ $GUARD_MAPPING_STATE == RELEASED && $GUARD_MAPPING_LAST_GENERATION == generation-1 ]] || return 1
+            [[ ${OWN_RULES[*]} == 'filter|-A BASE -j ACCEPT' ]]
+            ;;
         timeout_is_thirty_seconds)
             [[ ${MAPPING_CONTROL_TIMEOUT_SECONDS:-} == 30 ]]
             ;;
@@ -530,6 +576,11 @@ runner_handshake() {
 runner_integration() {
     local rc=0 judge=0
     [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
+    if [[ -n ${GUARD_RUNNER_MANIFEST:-} || -n ${GUARD_RUNNER_ATTESTATION:-} ]]; then
+        [[ -n ${GUARD_RUNNER_MANIFEST:-} && -n ${GUARD_RUNNER_ATTESTATION:-} ]] || exit 77
+        validation_environment_verify "$GUARD_RUNNER_MANIFEST" "$GUARD_RUNNER_ATTESTATION" || exit $?
+        [[ -n ${VE_DOCKER_ENDPOINT:-} ]] || exit 77
+    fi
     bash "$HERE/test-docker-integration.sh" || rc=$?
     if [[ -z ${IT_MAPPING_SCENARIO:-} && -z ${IT_FILTER:-} ]]; then
         source "$HERE/docker-mapping-assertions.sh"

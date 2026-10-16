@@ -324,6 +324,43 @@ mapping_state_uses_control_root_and_archives_generation() {
     [[ $state == "$root/control/generations/generation-2/mapping-network.tsv" ]]
 }
 
+mapping_generation_rejects_invalid_or_unsafe_paths() {
+    local root=$WORK/generation-root outside=$WORK/generation-outside rc=0 state
+    mkdir -p "$root/control" "$outside"
+    IT_CONTROL_DIR=$root/control
+    for MAPPING_ASSERT_GENERATION in '' '../escape' 'generation/escape' '.hidden' 'generation--1' 'generation_1' '-generation' 'generation-'; do
+        rc=0
+        mapping_network_state_file >/dev/null 2>&1 || rc=$?
+        [[ $rc != 0 ]] || return 1
+    done
+    MAPPING_ASSERT_GENERATION=generation-1
+    state=$(mapping_network_state_file) || return 1
+    [[ $state == "$root/control/generations/generation-1/mapping-network.tsv" ]] || return 1
+    readlink() {
+        if [[ ${*: -1} == "$root/control" ]]; then
+            printf '%s\n' "$outside"
+            return 0
+        fi
+        command readlink "$@"
+    }
+    rc=0
+    mapping_network_state_file >/dev/null 2>&1 || rc=$?
+    [[ $rc != 0 ]]
+}
+
+mapping_generation_format_is_strict() {
+    local rc=0
+    MP_PROFILE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    GUARD_MAPPING_STATE=PREPARING
+    guard_mapping_generation mapping-ready generation-1 net-1 "$MP_PROFILE_SHA256" || return 1
+    GUARD_MAPPING_STATE=PREPARING
+    for generation in '../escape' 'generation/escape' '.hidden' 'generation--1' 'generation_1' '-generation' 'generation-'; do
+        rc=0
+        guard_mapping_generation mapping-ready "$generation" net-1 "$MP_PROFILE_SHA256" >/dev/null 2>&1 || rc=$?
+        [[ $rc == 65 ]] || return 1
+    done
+}
+
 # 写入映射 DROP 快照：五键、源 P、指定桥、链 MEmtest；可指定计数基数用于增量样本。
 write_mapping_snapshot_base() {
     local file=$1 base=${2:-0} bridge=${3:-mmtest}
@@ -1350,6 +1387,8 @@ networked_start_requires_generation_ack
 second_generation_rebinds_network
 scenario_keeps_control_and_ledger_root
 mapping_state_uses_control_root_and_archives_generation
+mapping_generation_rejects_invalid_or_unsafe_paths
+mapping_generation_format_is_strict
 mapping_rule_keys_exact
 mapping_counter_missing_or_duplicate_fails
 mapping_witness_pause_detected
