@@ -391,13 +391,17 @@ case_same_vm_same_daemon() {
 printf 'runner-entry %s\n' "$*" >> "$RUNNER_ENTRY_LOG"
 exit 0
 STUB
+    cat > "$scratch/source/tests/docker-validation-environment.sh" <<'STUB'
+validation_environment_verify() { return 0; }
+validation_docker() { docker --host unix:///var/run/docker.sock "$@"; }
+STUB
     export RUNNER_ENTRY_LOG="$scratch/runner-entry.log"
     manifest=$(prepare_manifest "$scratch") || return 1
     validation_environment_load "$manifest" || return 1
     validation_docker info -f '{{.ID}}' >/dev/null || { printf 'root docker rc=%s\n' "$?"; return 1; }
     command=$(guard_runner_command full "$scratch/source" run "$scratch/evidence" product tools \
         "$manifest" "$scratch/offline.txt" "$scratch/profile.tsv") || { printf 'command generation failed\n'; return 1; }
-    [[ $(grep -o 'unix:///var/run/docker.sock' <<< "$command" | wc -l) == 1 ]] || { printf 'runner command endpoint not unique: %s\n' "$command"; return 1; }
+    [[ $command != *'unix:///var/run/docker.sock'* ]] || { printf 'runner command hard-coded endpoint: %s\n' "$command"; return 1; }
     eval "$command" || rc=$?
     [[ $rc == 0 ]] || { printf 'runner command rc=%s\n' "$rc"; return 1; }
     [[ -s $scratch/runner-entry.log ]] || { printf 'runner entry not reached\n'; return 1; }

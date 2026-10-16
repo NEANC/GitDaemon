@@ -194,8 +194,8 @@ mapping_profile_load() {
 
 # 状态目录：优先证据控制目录，其次映射账本目录；两处都不存在即拒绝。
 mapping_state_dir() {
-    if [[ -n ${IT_EVIDENCE_DIR:-} ]]; then
-        printf '%s\n' "$IT_EVIDENCE_DIR/control"
+    if [[ -n ${IT_CONTROL_DIR:-} ]]; then
+        printf '%s\n' "$IT_CONTROL_DIR"
         return 0
     fi
     if [[ -n ${MAPPING_LEDGER_DIR:-} ]]; then
@@ -207,9 +207,10 @@ mapping_state_dir() {
 
 # 运行状态文件：创建后追加不可变 network ID，不反写输入档案。
 mapping_network_state_file() {
-    local dir
+    local dir generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
     dir=$(mapping_state_dir) || return 1
-    printf '%s\n' "$dir/mapping-network.tsv"
+    [[ -n $generation ]] || return 1
+    printf '%s\n' "$dir/generations/$generation/mapping-network.tsv"
 }
 
 # 读取已冻结的本轮 network ID（缺失返回非零）。
@@ -248,6 +249,7 @@ mapping_network_create() {
     [[ -n $id ]] || return 2
     MP_NETWORK_ID=$id
     if [[ -n $state ]]; then
+        mkdir -p "${state%/*}" || return 2
         printf 'network_id\t%s\n' "$id" >> "$state" || return 2
     fi
     printf '%s\n' "$id"

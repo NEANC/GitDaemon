@@ -231,7 +231,7 @@ guard_runner_command() {
             script+=$'\n''validation_environment_verify "$2" "$3" || exit $?'
             script+=$'\n''validation_docker info -f '"'"'{{.ID}}'"'"' >/dev/null || exit $?'
             script+=$'\n'"exec bash \"\$1/tests/test-docker-network.sh\" $routing"
-            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 GUARD_RUNNER_MANIFEST="$manifest" "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
+            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 GUARD_RUNNER_MANIFEST="$manifest" GUARD_RUNNER_ATTESTATION="$attestation" "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
             return 0
             ;;
         probe) entry=(--live) ;;
@@ -275,6 +275,33 @@ guard_mapping_generation() {
         *) return 65 ;;
     esac
     return 0
+}
+
+guard_mapping_release_verify() {
+    local generation=${1:-} network_id=${2:-} profile_sha256=${3:-}
+    local ledger kind ids key
+    [[ -n $generation && -n $network_id && $profile_sha256 == "$MP_PROFILE_SHA256" ]] || return 65
+    validation_environment_verify "$GUARD_MANIFEST" "$GUARD_ATTESTATION" || return 2
+    ledger=$E/control/resources
+    [[ ${RESOURCE_LEDGER_DIR:-$ledger} == "$ledger" ]] || return 2
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$RUN
+    resource_crosscheck "$ledger" || return 2
+    resource_ledger_load "$ledger" || return 2
+    for key in "${!RESOURCE_LEDGER_ACTIVE[@]}"; do
+        [[ -z ${RESOURCE_LEDGER_ACTIVE[$key]:-} ]] || return 2
+    done
+    for kind in $RESOURCE_KINDS; do
+        ids=$(resource_enumerate "$kind" "$RUN") || return 2
+        [[ -z ${ids//[[:space:]]/} ]] || return 2
+    done
+    return 0
+}
+
+guard_mapping_release() {
+    local generation=${1:-} network_id=${2:-} profile_sha256=${3:-} rules_start=${4:-}
+    guard_mapping_release_verify "$generation" "$network_id" "$profile_sha256" || return $?
+    guard_mapping_generation mapping-release "$generation" "$network_id" "$profile_sha256" || return $?
+    guard_remove_rules_since "$rules_start"
 }
 # 映射网精确策略：只放行同网所需通信，其余 INPUT/转发、跨网、外 DNS 与 IPv6 一律拒绝。
 # 源地址 P、桥接口与见证目标全部来自冻结档案，不复制旧 .4 规则。
@@ -406,7 +433,8 @@ guard_mapping_main() {
                     guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
                     rules_start=${#OWN_RULES[@]}
                     guard_mapping_rules "$profile" "$netid" || exit $?
-                    printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$netid" "$sha" > "$E/control/mapping-network.tsv"
+                    mkdir -p "$E/control/generations/$generation" || exit 80
+                    printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$netid" "$sha" > "$E/control/generations/$generation/mapping-network.tsv"
                     ready=1
                     printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
@@ -422,8 +450,7 @@ guard_mapping_main() {
                     seq=$((seq + 1))
                     ;;
                 mapping-release)
-                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
-                    guard_remove_rules_since "$rules_start" || exit $?
+                    guard_mapping_release "$generation" "$netid" "$sha" "$rules_start" || exit $?
                     ready=0
                     printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
@@ -589,14 +616,14 @@ guard_main() {
                 mapping-ready|mapping-snapshot|mapping-release)
                     generation=$token
                     [[ -n $nonce && $nonce != "$last_nonce" ]] || exit 65
-                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
+                    [[ $request == mapping-release ]] || guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
                     case "$request" in
                         mapping-ready)
                             rules_start=${#OWN_RULES[@]}
                             guard_mapping_rules "$profile" "$netid" || exit $?
                             ;;
                         mapping-snapshot) guard_mapping_snapshot "$seq" || exit $? ;;
-                        mapping-release) guard_remove_rules_since "$rules_start" || exit $? ;;
+                        mapping-release) guard_mapping_release "$generation" "$netid" "$sha" "$rules_start" || exit $? ;;
                     esac
                     printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     last_nonce=$nonce

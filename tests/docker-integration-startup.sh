@@ -2,6 +2,14 @@
 # 共享 Docker 启动边界；所有夹具命令使用同一受控网络和安全默认值。
 source "$(dirname -- "${BASH_SOURCE[0]}")/docker-network-fixture.sh"
 
+integration_docker() {
+    if declare -F validation_docker >/dev/null && [[ -n ${VE_DOCKER_ENDPOINT:-} ]]; then
+        validation_docker "$@"
+        return $?
+    fi
+    command docker "$@"
+}
+
 # 局部删除统一走资源账本：按登记身份与所有权标签交叉验证后精确删除，禁止先删再核验。
 # 无账本时不具备精确删除依据，返回 2 并留下可观测标记，不声称清理成功。
 integration_remove() {
@@ -12,10 +20,11 @@ integration_remove() {
         return 2
     fi
     for item in "$@"; do
+        query_rc=0
         [[ $item != -* && -n $item ]] || continue
         case "$kind" in
             container)
-                identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || query_rc=$?
+                identity=$(integration_docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || query_rc=$?
                 if (( query_rc != 0 )); then
                     (( query_rc == 1 )) && continue
                     return 2
@@ -23,11 +32,11 @@ integration_remove() {
                 [[ -n $identity ]] || continue
                 destination=$IT_EVIDENCE_DIR/control/deleted/$identity
                 mkdir -p "$destination" || return $?
-                command docker inspect "$item" > "$destination/inspect.json" || return $?
-                command docker logs "$item" > "$destination/container.log" 2>&1 || return $?
+                integration_docker inspect "$item" > "$destination/inspect.json" || return $?
+                integration_docker logs "$item" > "$destination/container.log" 2>&1 || return $?
                 ;;
             network)
-                identity=$(command docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || query_rc=$?
+                identity=$(integration_docker inspect -f '{{.Id}}' "$item" 2>/dev/null) || query_rc=$?
                 if (( query_rc != 0 )); then
                     (( query_rc == 1 )) && continue
                     return 2
@@ -49,27 +58,27 @@ integration_remove() {
 # 检查辅助容器实际配置，共享命名空间只允许本轮单网络目标。
 integration_helper_policy() {
     local id=$1 mode value target networks mount mounts
-    mode=$(command docker inspect -f '{{.HostConfig.NetworkMode}}' "$id") || return $?
-    value=$(command docker inspect -f '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Privileged}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}' "$id") || return $?
+    mode=$(integration_docker inspect -f '{{.HostConfig.NetworkMode}}' "$id") || return $?
+    value=$(integration_docker inspect -f '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Privileged}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}' "$id") || return $?
     case "$value" in
         '10001:10001 true false [ALL] [no-new-privileges]'|'10001:10001 true false [ALL] [no-new-privileges:true]') ;;
         *) return 1 ;;
     esac
-    [[ $(command docker inspect -f '{{.HostConfig.ExtraHosts}} {{.HostConfig.CapAdd}}' "$id") == '[] []' ]] || return 1
+    [[ $(integration_docker inspect -f '{{.HostConfig.ExtraHosts}} {{.HostConfig.CapAdd}}' "$id") == '[] []' ]] || return 1
     case "$mode" in
         none)
-            networks=$(command docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id") || return $?
+            networks=$(integration_docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id") || return $?
             [[ ${networks% } == none ]] || return 1
             ;;
         "$IT_NETWORK")
-            networks=$(command docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id") || return $?
+            networks=$(integration_docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$id") || return $?
             [[ ${networks% } == "$IT_NETWORK" ]] || return 1
-            [[ $(command docker inspect -f '{{.HostConfig.Dns}}' "$id") == "[$IT_DNS_IP]" ]] || return 1
-            [[ $(command docker inspect -f '{{index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6"}}' "$id") == 1 ]] || return 1
+            [[ $(integration_docker inspect -f '{{.HostConfig.Dns}}' "$id") == "[$IT_DNS_IP]" ]] || return 1
+            [[ $(integration_docker inspect -f '{{index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6"}}' "$id") == 1 ]] || return 1
             ;;
         container:*)
             target=${mode#container:}
-            [[ $(command docker inspect -f '{{index .Config.Labels "gitdaemon.run"}}' "$target") == "$IT_RUN_ID" ]] || return 1
+            [[ $(integration_docker inspect -f '{{index .Config.Labels "gitdaemon.run"}}' "$target") == "$IT_RUN_ID" ]] || return 1
             if [[ ${IT_MAPPING:-0} == 1 ]]; then
                 # 共享 netns 必须匹配本轮登记产品，且只允许单一映射网络附件。
                 mapping_policy_check "$target" product "$IT_MAPPING_PROFILE" || return $?
@@ -80,9 +89,9 @@ integration_helper_policy() {
         *) return 1 ;;
     esac
     if [[ $mode != none ]]; then
-        [[ $(command docker network inspect -f '{{.EnableIPv6}}' "$IT_NETWORK") == false ]] || return 1
+        [[ $(integration_docker network inspect -f '{{.EnableIPv6}}' "$IT_NETWORK") == false ]] || return 1
     fi
-    mounts=$(command docker inspect -f '{{range .Mounts}}{{.Type}} {{.Name}}{{println}}{{end}}' "$id") || return $?
+    mounts=$(integration_docker inspect -f '{{range .Mounts}}{{.Type}} {{.Name}}{{println}}{{end}}' "$id") || return $?
     while IFS= read -r mount; do
         [[ -z $mount || $mount == "volume gm-$IT_RUN_ID-"* ]] || return 1
     done <<< "$mounts"
@@ -96,7 +105,7 @@ integration_helper_run() {
     while [[ $1 != -- ]]; do options+=("$1"); shift; done
     shift
     # 创建即携带三 label，使辅助容器与其它产物一致可登记、可交叉验证。
-    create=(command docker create "${options[@]}" \
+    create=(integration_docker create "${options[@]}" \
         --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
         --label "gitdaemon.role=${IT_ROLE:-helper}")
     if [[ $detached == 1 ]]; then
@@ -115,20 +124,20 @@ integration_helper_run() {
     fi
     destination=$IT_EVIDENCE_DIR/control/helpers/$id
     mkdir -p "$destination" || return $?
-    command docker inspect "$id" > "$destination/inspect.json" || return $?
+    integration_docker inspect "$id" > "$destination/inspect.json" || return $?
     if [[ $detached == 1 ]]; then
-        command docker start "$id" >/dev/null || return $?
+        integration_docker start "$id" >/dev/null || return $?
         integration_helper_policy "$id" || policy=$?
-        identity=$(command docker exec "$id" sh -c 'printf "%s:%s" "$(id -ru)" "$(id -u)"') || policy=1
+        identity=$(integration_docker exec "$id" sh -c 'printf "%s:%s" "$(id -ru)" "$(id -u)"') || policy=1
         printf 'HELPER_UID=%s\n' "$identity" > "$destination/identity.txt"
         [[ $identity == 10001:10001 ]] || policy=1
     else
         integration_helper_policy "$id" || policy=$?
-        if [[ $policy == 0 ]]; then command docker start -ai "$id" || rc=$?; fi
-        command docker logs "$id" > "$destination/container.log" 2>&1 || policy=1
+        if [[ $policy == 0 ]]; then integration_docker start -ai "$id" || rc=$?; fi
+        integration_docker logs "$id" > "$destination/container.log" 2>&1 || policy=1
         grep -qx 'HELPER_UID=10001:10001' "$destination/container.log" || policy=1
     fi
-    command docker inspect "$id" > "$destination/inspect.json" || policy=1
+    integration_docker inspect "$id" > "$destination/inspect.json" || policy=1
     printf 'PRIMARY_EXIT=%s\nPOLICY_EXIT=%s\n' "$rc" "$policy" > "$destination/status.txt"
     if [[ $policy != 0 ]]; then
         printf 'HELPER=%s POLICY_EXIT=%s\n' "$id" "$policy" >> "$IT_EVIDENCE_DIR/control/integration-failures.log"
@@ -148,7 +157,7 @@ integration_helper_run() {
 
 # 网络容器注入受控 DNS/IPv6 设置，离线卷操作不附加网络。
 docker() {
-    if [[ ${IT_NETWORK_LIBRARY_RUN:-0} == 1 ]]; then command docker "$@"; return $?; fi
+    if [[ ${IT_NETWORK_LIBRARY_RUN:-0} == 1 ]]; then integration_docker "$@"; return $?; fi
     local sub=${1:-} arg network=none name='' entry=0 ca=0 detached=0 remove=0 entrypoint='' image='' rc=0 ledger_dir=''
     local -a args=() safe=(--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges)
     if [[ $sub == volume && ${2:-} == create ]]; then
@@ -158,14 +167,14 @@ docker() {
             # 登记要求对象自身齐备三 label；创建命令必须与入参 scenario/role 完全一致。
             RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
             resource_create_register volume "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-volume}" -- \
-                command docker volume create --label "gitdaemon.run=$IT_RUN_ID" \
+                integration_docker volume create --label "gitdaemon.run=$IT_RUN_ID" \
                 --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
                 --label "gitdaemon.role=${IT_ROLE:-volume}" "$@" || return $?
             printf '%s\n' "$RESOURCE_CREATED_ID"
             return 0
         fi
         resource_ledger_notice volume-create
-        vname=$(command docker volume create --label "gitdaemon.run=$IT_RUN_ID" "$@") || return $?
+        vname=$(integration_docker volume create --label "gitdaemon.run=$IT_RUN_ID" "$@") || return $?
         printf '%s\n' "$vname"
         return 0
     fi
@@ -175,14 +184,14 @@ docker() {
             # 与卷路径一致：网络创建命令同样携带齐备的三 label，登记入参与其逐一相符。
             RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
             resource_create_register network "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-network}" -- \
-                command docker network create --label "gitdaemon.run=$IT_RUN_ID" \
+                integration_docker network create --label "gitdaemon.run=$IT_RUN_ID" \
                 --label "gitdaemon.scenario=${IT_SCENARIO:-$IT_RUN_ID}" \
                 --label "gitdaemon.role=${IT_ROLE:-network}" "${@:3}" || return $?
             printf '%s\n' "$RESOURCE_CREATED_ID"
             return 0
         fi
         resource_ledger_notice network-create
-        nid=$(command docker "$@") || return $?
+        nid=$(integration_docker "$@") || return $?
         printf '%s\n' "$nid"
         return 0
     fi
@@ -194,7 +203,7 @@ docker() {
         fi
         return "$rc"
     fi
-    [[ $sub == run ]] || { command docker "$@"; return $?; }
+    [[ $sub == run ]] || { integration_docker "$@"; return $?; }
     shift
     [[ ${IT_NETWORK_GUARD_READY:-} == 1 && -n ${IT_DNS_IP:-} ]] || return 77
     while (( $# )); do
@@ -263,13 +272,13 @@ docker() {
             --label "gitdaemon.role=${IT_ROLE:-product}")
         RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
         resource_create_register container "${IT_SCENARIO:-$IT_RUN_ID}" "${IT_ROLE:-product}" -- \
-            command docker create "${cargs[@]}" "$image" "$@" || return $?
+            integration_docker create "${cargs[@]}" "$image" "$@" || return $?
         cid=$RESOURCE_CREATED_ID
         if [[ $detached == 1 ]]; then
-            command docker start "$cid" >/dev/null || return $?
+            integration_docker start "$cid" >/dev/null || return $?
             printf '%s\n' "$cid"
         else
-            command docker start -a "$cid" || rc=$?
+            integration_docker start -a "$cid" || rc=$?
         fi
         if [[ $remove == 1 ]]; then
             RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$IT_RUN_ID
@@ -280,5 +289,5 @@ docker() {
     resource_ledger_notice run
     if [[ $detached == 1 ]]; then args+=(-d); fi
     if [[ $remove == 1 ]]; then args+=(--rm); fi
-    command docker run --label "gitdaemon.run=$IT_RUN_ID" "${safe[@]}" --network "$network" "${args[@]}" "$image" "$@"
+    integration_docker run --label "gitdaemon.run=$IT_RUN_ID" "${safe[@]}" --network "$network" "${args[@]}" "$image" "$@"
 }

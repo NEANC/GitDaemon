@@ -311,6 +311,19 @@ scenario_keeps_control_and_ledger_root() {
     [[ $(resource_ledger_dir) == "$root/control/resources" ]]
 }
 
+mapping_state_uses_control_root_and_archives_generation() {
+    local root=$WORK/state-root scenario=$WORK/state-scenario state
+    mkdir -p "$root/control" "$scenario/control"
+    IT_CONTROL_DIR=$root/control
+    IT_EVIDENCE_DIR=$scenario
+    MAPPING_ASSERT_GENERATION=generation-1
+    state=$(mapping_network_state_file) || return 1
+    [[ $state == "$root/control/generations/generation-1/mapping-network.tsv" ]] || return 1
+    MAPPING_ASSERT_GENERATION=generation-2
+    state=$(mapping_network_state_file) || return 1
+    [[ $state == "$root/control/generations/generation-2/mapping-network.tsv" ]]
+}
+
 # 写入映射 DROP 快照：五键、源 P、指定桥、链 MEmtest；可指定计数基数用于增量样本。
 write_mapping_snapshot_base() {
     local file=$1 base=${2:-0} bridge=${3:-mmtest}
@@ -451,6 +464,7 @@ mapping_network_create_registers() {
     profile_write "$scratch/profile.tsv"
     unset IT_EVIDENCE_DIR VE_DOCKER_ENDPOINT
     MAPPING_LEDGER_DIR=$dir
+    MAPPING_GENERATION=generation-1
     CREATE_NOID=0
     # 兼容旧实现经 `command docker` 创建：拦截后仍只走替身，绝不触碰真实 daemon。
     command() {
@@ -506,11 +520,11 @@ mapping_network_create_registers() {
     grep -q -- '--ipv6=false' "$scratch/create.calls" || { printf 'mapping network enables IPv6\n'; failed=1; }
     grep -q -- 'gm-mtest-m-net$' "$scratch/create.calls" || { printf 'network name is not the last argument\n'; failed=1; }
     grep -q $'register\tnetwork\tnetid-new\tmtest\tmapping\tnetwork\t' "$dir/ledger.tsv" || { printf 'ledger record missing\n'; failed=1; }
-    grep -qx $'network_id\tnetid-new' "$dir/mapping-network.tsv" || { printf 'state id missing\n'; failed=1; }
+    grep -qx $'network_id\tnetid-new' "$dir/generations/generation-1/mapping-network.tsv" || { printf 'state id missing\n'; failed=1; }
     # 创建返回空身份：network ID 核验失败即拒绝，且不写账本。
     local dir2=$scratch/ledger2
     mkdir -p "$dir2"
-    MAPPING_LEDGER_DIR=$dir2 CREATE_NOID=1
+    MAPPING_LEDGER_DIR=$dir2 MAPPING_GENERATION=generation-2 CREATE_NOID=1
     rc=0
     id=$(mapping_network_create "$scratch/profile.tsv" "$dir2") || rc=$?
     printf 'MAPPING_NETWORK_NOID rc=%s\n' "$rc"
@@ -1335,6 +1349,7 @@ runner_prepares_before_ready
 networked_start_requires_generation_ack
 second_generation_rebinds_network
 scenario_keeps_control_and_ledger_root
+mapping_state_uses_control_root_and_archives_generation
 mapping_rule_keys_exact
 mapping_counter_missing_or_duplicate_fails
 mapping_witness_pause_detected

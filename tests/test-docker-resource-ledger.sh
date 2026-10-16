@@ -249,6 +249,36 @@ case_inspect_error_is_not_absence() {
     rm -rf "$S"
 }
 
+case_integration_remove_resets_inspect_status() {
+    ledger_setup
+    install_docker_double
+    IT_EVIDENCE_DIR=$S
+    IT_RUN_ID=r1
+    declare_object container c1 r1 fixture product
+    resource_register container c1 fixture product || return 1
+    local rc=0
+    command() {
+        [[ $1 == docker ]] || { builtin command "$@"; return $?; }
+        shift
+        mock_docker "$@"
+    }
+    integration_remove container missing c1 2>/dev/null || rc=$?
+    [[ $rc == 0 ]] || return 1
+    grep -qx 'rm c1' "$DELETE_CALLS" || return 1
+    rm -rf "$S"
+}
+
+case_verify_object_compares_run_label() {
+    ledger_setup
+    install_docker_double
+    declare_object container c1 other fixture product
+    local rc=0
+    RESOURCE_RUN=r1
+    resource_verify_object container c1 fixture product '' 2>/dev/null || rc=$?
+    [[ $rc == 2 ]]
+    rm -rf "$S"
+}
+
 # 已成功删除的对象凭回执幂等；正常二次清理返回 0 且不再删除。
 case_registered_delete_is_idempotent() {
     ledger_setup
@@ -633,6 +663,8 @@ for name in \
     missing_without_receipt_fails \
     inspect_failure_retains_isolation \
     inspect_error_is_not_absence \
+    integration_remove_resets_inspect_status \
+    verify_object_compares_run_label \
     registered_delete_is_idempotent \
     signal_between_create_and_register \
     cleanup_revalidates_daemon \

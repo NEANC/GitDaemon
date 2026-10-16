@@ -35,7 +35,7 @@ resource_run() {
 
 # Docker 外部边界：默认直连命令行，绕过启动包装器以避免删除递归。
 resource_docker() {
-    if declare -F validation_docker >/dev/null; then
+    if declare -F validation_docker >/dev/null && [[ -n ${VE_DOCKER_ENDPOINT:-} ]]; then
         validation_docker "$@"
         return $?
     fi
@@ -185,6 +185,7 @@ resource_verify_object() {
     [[ $current == "$identity" ]] || return 2
     labels=$(resource_inspect_labels "$kind" "$identity") || return 2
     IFS=$'\t' read -r run scenario_now role_now <<< "$labels"
+    [[ $run == "$(resource_run)" ]] || return 2
     [[ $scenario_now == "$scenario" ]] || return 2
     [[ $role_now == "$role" ]] || return 2
     if [[ $kind == volume ]]; then

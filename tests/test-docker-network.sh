@@ -37,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint timeout_is_thirty_seconds; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -442,6 +442,12 @@ contract_case() {
             [[ $cmd == *'validation_docker'* ]] || return 1
             [[ $cmd != *'unix:///var/run/docker.sock'* ]] || return 1
             ;;
+        secondary_integration_binds_private_endpoint)
+            local cmd
+            cmd=$(guard_runner_command mapping-direct /src run1 /ev img tools man att prof) || return 1
+            [[ $cmd == *'GUARD_RUNNER_MANIFEST=man'* ]] || return 1
+            [[ $cmd == *'GUARD_RUNNER_ATTESTATION=att'* ]] || return 1
+            ;;
         full_dispatches_mapping_control)
             local cmd
             cmd=$(guard_runner_command full /src run1 /ev img tools man att prof) || return 1
@@ -474,6 +480,18 @@ contract_case() {
             rc=0
             guard_mapping_generation mapping-ready generation-2 net-1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >/dev/null 2>&1 || rc=$?
             [[ $rc == 65 ]]
+            ;;
+        release_verifies_ledger_and_endpoint)
+            local MP_PROFILE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa calls=''
+            GUARD_MAPPING_STATE=ACTIVE GUARD_MAPPING_GENERATION=generation-1 GUARD_MAPPING_NETWORK_ID=net-1
+            guard_mapping_release_verify() { calls+=$'verify\n'; return 2; }
+            guard_remove_rules_since() { calls+="remove\n"; }
+            rc=0
+            guard_mapping_release generation-1 net-1 "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 || rc=$?
+            [[ $rc == 2 && $calls == $'verify\n' && $GUARD_MAPPING_STATE == ACTIVE ]]
+            ;;
+        timeout_is_thirty_seconds)
+            [[ ${MAPPING_CONTROL_TIMEOUT_SECONDS:-} == 30 ]]
             ;;
     esac
 }

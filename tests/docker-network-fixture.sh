@@ -8,6 +8,7 @@ FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SAFE=(--user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges)
 NETSAFE=(--sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv4.ip_unprivileged_port_start=0)
 CONTROL_SEQ=0
+MAPPING_CONTROL_TIMEOUT_SECONDS=30
 # 返回本轮固定控制根，场景证据目录不得覆盖该值。
 mapping_control_dir() {
     if [[ -n ${IT_CONTROL_DIR:-} ]]; then
@@ -23,7 +24,7 @@ policy_networks() {
 }
 # 请求固定枚举操作并有限等待，握手并不作为防火墙证明。
 network_control() {
-    local i token ack control action generation
+    local token ack control action generation deadline
     control=$(mapping_control_dir) || return 80
     read -r action generation _ <<< "$1"
     CONTROL_SEQ=$((CONTROL_SEQ + 1))
@@ -34,7 +35,8 @@ network_control() {
     token=$BASHPID-$CONTROL_SEQ-$RANDOM
     printf '%s %s\n' "$1" "$token" > "$control/claim-$CONTROL_SEQ/request" || return $?
     mv "$control/claim-$CONTROL_SEQ/request" "$control/request-$CONTROL_SEQ" || return $?
-    for ((i=0;i<100;i++)); do
+    deadline=$((SECONDS + MAPPING_CONTROL_TIMEOUT_SECONDS))
+    while (( SECONDS < deadline )); do
         if [[ -f $control/ack-$CONTROL_SEQ ]]; then
             ack=$(cat "$control/ack-$CONTROL_SEQ") || return $?
             case "$action" in
