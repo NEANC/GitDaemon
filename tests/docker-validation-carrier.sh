@@ -49,8 +49,20 @@ carrier_start_dockerd() { local holder=$1; shift; nsenter --target "$holder" --n
 carrier_process_alive() { kill -0 "$1" 2>/dev/null; }
 carrier_sleep() { sleep "$1"; }
 carrier_stop_process() { kill -TERM "$1" 2>/dev/null || return 0; }
+carrier_wait_process() {
+    local pid=$1 attempt
+    for ((attempt=0; attempt<CARRIER_DOCKERD_READY_ATTEMPTS; attempt++)); do
+        carrier_process_alive "$pid" || return 0
+        carrier_sleep 0.1
+    done
+    return 80
+}
 carrier_remove_tree() { rm -rf -- "$1"; }
 carrier_configure_socket() { chown "0:$2" "$1" && chmod 660 "$1"; }
+carrier_configure_directory() { chown "$2:$3" "$1" && chmod "$4" "$1"; }
+carrier_docker_context() { command docker context show 2>/dev/null; }
+carrier_host_socket_facts() { carrier_socket_facts /var/run/docker.sock; }
+carrier_host_daemon_id() { carrier_host_readonly_query docker --host unix:///var/run/docker.sock info --format '{{.ID}}'; }
 
 # root 所有且不可由组或其他用户写入。
 carrier_file_guard() {
@@ -106,10 +118,10 @@ carrier_approval_load() {
             allowed_order) CARRIER_ALLOWED_ORDER=$value ;;
         esac
     done
-    [[ $CARRIER_RUN_ID =~ ^[A-Za-z0-9-]{1,32}$ ]] || return 2
+    [[ $CARRIER_RUN_ID =~ ^[A-Za-z0-9-]{1,10}$ ]] || return 2
     [[ $CARRIER_HOST_MACHINE_ID =~ ^[0-9A-Fa-f]{16,64}$ ]] || return 2
     [[ $CARRIER_HOST_BOOT_ID =~ ^[0-9A-Fa-f-]{16,64}$ ]] || return 2
-    [[ $CARRIER_RUNNER_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 2
+    [[ $CARRIER_RUNNER_USER == gmtest ]] || return 2
     case "$CARRIER_ALLOWED_MODE" in
         mapping-probe|mapping-fallback|mapping-direct|full) [[ $CARRIER_ALLOWED_ORDER == none ]] || return 2 ;;
         mapping-sequence) [[ $CARRIER_ALLOWED_ORDER == fallback,direct || $CARRIER_ALLOWED_ORDER == direct,fallback ]] || return 2 ;;
@@ -155,8 +167,14 @@ carrier_wait_dockerd() {
 # 只撤销本次 create 已产生的进程和目录。
 carrier_create_rollback() {
     local holder=${1:-} dockerd=${2:-} state_dir=${3:-} run_dir=${4:-}
-    [[ -z $dockerd ]] || carrier_stop_process "$dockerd"
-    [[ -z $holder ]] || carrier_stop_process "$holder"
+    if [[ -n $dockerd ]]; then
+        carrier_stop_process "$dockerd" || return 80
+        carrier_wait_process "$dockerd" || return 80
+    fi
+    if [[ -n $holder ]]; then
+        carrier_stop_process "$holder" || return 80
+        carrier_wait_process "$holder" || return 80
+    fi
     [[ -z $run_dir || ! -e $run_dir ]] || carrier_remove_tree "$run_dir"
     [[ -z $state_dir || ! -e $state_dir ]] || carrier_remove_tree "$state_dir"
 }
@@ -185,11 +203,17 @@ carrier_create() {
     [[ $(carrier_path_sha256 "$tools_archive") == "$tools_archive_sha" ]] || return 77
     [[ $(carrier_dockerd_sha256) == "$dockerd_sha" ]] || return 77
     state_root=$(carrier_state_root); runtime_root=$(carrier_runtime_root)
-    [[ $state_dir == "$state_root/$CARRIER_RUN_ID" && ! -e $state_dir ]] || return 77
+    [[ $state_dir == "$state_root/$CARRIER_RUN_ID" ]] || return 77
+    if [[ -e $state_dir ]]; then
+        [[ -d $state_dir && ! -L $state_dir && -d $state_dir/host-before && -f $state_dir/host-before/complete ]] || return 77
+        [[ ! -e $state_dir/approval.tsv && ! -e $state_dir/state.tsv && ! -e $state_dir/daemon.json && ! -e $state_dir/docker-data ]] || return 77
+        find "$state_dir" -mindepth 1 -maxdepth 1 ! -name host-before -print -quit | grep -q . && return 77
+    fi
     run_dir=$runtime_root/$CARRIER_RUN_ID
     [[ ! -e $run_dir ]] || return 77
     mkdir -p "$state_dir" "$run_dir" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
-    chmod 700 "$state_dir" "$run_dir" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
+    carrier_configure_directory "$state_dir" 0 0 700 || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
+    carrier_configure_directory "$run_dir" 0 "$CARRIER_RUNNER_GID" 710 || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
     approval_copy=$state_dir/approval.tsv
     cp -- "$approval" "$approval_copy" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
     chmod 600 "$approval_copy" || { carrier_create_rollback '' '' "$state_dir" "$run_dir"; return 80; }
@@ -385,6 +409,7 @@ carrier_run() {
     [[ $CM_SOCKET_DEVICE == "$CS_SOCKET_DEVICE" && $CM_SOCKET_INODE == "$CS_SOCKET_INODE" && $CM_SOCKET_UID == "$CS_SOCKET_UID" && $CM_SOCKET_GID == "$CS_SOCKET_GID" ]] || return 77
     requested_order=${order:-none}
     [[ $mode == "$CARRIER_ALLOWED_MODE" && $requested_order == "$CARRIER_ALLOWED_ORDER" ]] || return 77
+    [[ $mode != mapping-sequence ]] || return 77
     [[ $(carrier_now_epoch) -le CARRIER_EXPIRES_AT_EPOCH ]] || return 77
     [[ $CS_RUN_ID == "$CARRIER_RUN_ID" && $CS_MACHINE_ID == "$CARRIER_HOST_MACHINE_ID" && $CS_BOOT_ID == "$CARRIER_HOST_BOOT_ID" ]] || return 77
     carrier_holder_verify "$state" || return $?
@@ -428,13 +453,27 @@ carrier_cleanup() {
 
 # 恢复要求操作者显式确认 runner 已停止，再复用同一身份核验边界。
 carrier_recover() {
-    local state=${1:-} evidence=${2:-} confirmation=${3:-} recovery
+    local state=${1:-} evidence=${2:-} confirmation=${3:-} recovery binding run digest actual rc=0 summary
     [[ $# == 3 && $evidence == /* ]] || return 2
     [[ $confirmation == --runner-stopped ]] || return 64
     carrier_holder_verify "$state" || return $?
+    [[ $evidence == "$(dirname "$state")/evidence" && -d $evidence && ! -L $evidence ]] || return 77
     recovery=$evidence/recover.sh
-    [[ -f $recovery && ! -L $recovery ]] || return 77
-    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- bash "$recovery" "$confirmation"
+    binding=$evidence/recovery-binding.tsv
+    carrier_file_guard "$recovery" || return 77
+    carrier_file_guard "$binding" || return 77
+    run=$(awk -F '\t' '$1 == "run_id" {print $2}' "$binding")
+    digest=$(awk -F '\t' '$1 == "recover_sha256" {print $2}' "$binding")
+    [[ $(wc -l < "$binding") == 2 && $run == "$CS_RUN_ID" && $digest =~ ^[0-9a-f]{64}$ ]] || return 77
+    actual=$(carrier_path_sha256 "$recovery")
+    [[ $actual == "$digest" ]] || return 77
+    carrier_effect nsenter --target "$CS_HOLDER_PID" --net --mount -- bash "$recovery" "$confirmation" || rc=$?
+    summary=$evidence/recovery-summary.tsv
+    {
+        printf 'run_id\t%s\nrecover_sha256\t%s\nrecover_exit\t%s\n' "$CS_RUN_ID" "$digest" "$rc"
+    } > "$summary.tmp" || return 2
+    chmod 600 "$summary.tmp" && mv "$summary.tmp" "$summary" || return 2
+    return "$rc"
 }
 
 # 固定宿主只读 Docker argv 清单。
@@ -467,13 +506,33 @@ carrier_host_inventory_inspect() {
         [[ -z $identity ]] && continue
         [[ $identity != -* ]] || return 80
         case "$kind" in
-            container|network|image) [[ $identity =~ ^[0-9a-f]{12,64}$ ]] || return 80 ;;
+            container|network) [[ $identity =~ ^[0-9a-f]{64}$ ]] || return 80 ;;
+            image) [[ $identity =~ ^sha256:[0-9a-f]{64}$ ]] || return 80 ;;
             volume) [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] || return 80 ;;
             *) return 80 ;;
         esac
         carrier_host_inventory_command "$snapshot" "$kind-inspect-$index" docker --host unix:///var/run/docker.sock "$kind" inspect "$identity" || return 80
         index=$((index + 1))
     done < "$snapshot/$list_name.stdout"
+}
+
+# 规范化宿主快照的无语义顺序、规则计数与工具时间戳。
+carrier_host_inventory_normalize() {
+    local name=$1 path=$2
+    case "$name" in
+        iptables|ip6tables)
+            sed -E '/^# (Generated|Completed) /d; s/^\[[0-9]+:[0-9]+\][[:space:]]*//' "$path" | LC_ALL=C sort ;;
+        *) LC_ALL=C sort "$path" ;;
+    esac
+}
+
+# 核验宿主 socket 与 daemon 仍为同一登记身份。
+carrier_host_identity_verify() {
+    local expected_socket=$1 expected_daemon=$2 actual_socket actual_daemon
+    actual_socket=$(carrier_host_socket_facts) || return 77
+    [[ $actual_socket == "$expected_socket" ]] || return 77
+    actual_daemon=$(carrier_host_daemon_id) || return 80
+    [[ $actual_daemon == "$expected_daemon" ]] || return 77
 }
 
 # 比较完整前后命令集合与输出，不把查询失败当作空集合。
@@ -486,17 +545,22 @@ carrier_host_inventory_compare() {
     while IFS= read -r name; do
         cmp -s "$before/$name.argv" "$after/$name.argv" || return 1
         grep -qx '0' "$before/$name.exit" && grep -qx '0' "$after/$name.exit" || return 1
-        cmp -s "$before/$name.stdout" "$after/$name.stdout" || return 1
+        cmp -s <(carrier_host_inventory_normalize "$name" "$before/$name.stdout") <(carrier_host_inventory_normalize "$name" "$after/$name.stdout") || return 1
         cmp -s "$before/$name.stderr" "$after/$name.stderr" || return 1
     done < "$before/commands.tsv"
 }
 
 # 宿主盘点只接受 root、宿主 namespace 和 before/after 固定阶段。
 carrier_host_inventory() {
-    local approval=${1:-} state_dir=${2:-} phase=${3:-} snapshot identity
+    local approval=${1:-} state_dir=${2:-} phase=${3:-} snapshot identity socket daemon context key before
     [[ $# == 3 && -n $approval && -n $state_dir ]] || return 2
     [[ $phase == before || $phase == after ]] || return 2
     [[ $(carrier_current_uid) == 0 ]] || return 77
+    for key in DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH; do
+        [[ -z ${!key:-} ]] || return 77
+    done
+    context=$(carrier_docker_context) || context=''
+    [[ -z $context || $context == default || $context == unix:///var/run/docker.sock ]] || return 77
     carrier_approval_load "$approval" || return $?
     [[ $(carrier_host_machine_id) == "$CARRIER_HOST_MACHINE_ID" ]] || return 77
     [[ $(carrier_host_boot_id) == "$CARRIER_HOST_BOOT_ID" ]] || return 77
@@ -505,9 +569,26 @@ carrier_host_inventory() {
     [[ ! -e $snapshot ]] || return 77
     mkdir -p "$snapshot" || return 80
     identity=$(carrier_host_namespace | tr '\n' ' ')
+    socket=$(carrier_host_socket_facts) || return 77
+    read -r socket_device socket_inode socket_uid socket_gid socket_mode socket_realpath <<< "$socket"
+    [[ $socket_realpath == /var/run/docker.sock && $socket_uid == 0 && $socket_mode =~ ^0?660$ ]] || return 77
+    daemon=$(carrier_host_daemon_id) || return 80
+    [[ -n $daemon ]] || return 80
+    if [[ $phase == after ]]; then
+        before=$state_dir/host-before/identity.tsv
+        [[ -f $state_dir/host-before/complete && -f $before ]] || return 77
+        grep -Fqx $'socket_realpath\t'"$socket_realpath" "$before" || return 77
+        grep -Fqx $'socket_device\t'"$socket_device" "$before" || return 77
+        grep -Fqx $'socket_inode\t'"$socket_inode" "$before" || return 77
+        grep -Fqx $'socket_uid\t'"$socket_uid" "$before" || return 77
+        grep -Fqx $'socket_gid\t'"$socket_gid" "$before" || return 77
+        grep -Fqx $'daemon_id\t'"$daemon" "$before" || return 77
+    fi
     {
         printf 'machine_id\t%s\nboot_id\t%s\n' "$CARRIER_HOST_MACHINE_ID" "$CARRIER_HOST_BOOT_ID"
         printf 'namespace\t%s\n' "$identity"
+        printf 'socket_realpath\t%s\nsocket_device\t%s\nsocket_inode\t%s\nsocket_uid\t%s\nsocket_gid\t%s\n' "$socket_realpath" "$socket_device" "$socket_inode" "$socket_uid" "$socket_gid"
+        printf 'daemon_id\t%s\n' "$daemon"
     } > "$snapshot/identity.tsv" || return 80
     : > "$snapshot/commands.tsv"
     carrier_host_inventory_command "$snapshot" docker-info docker --host unix:///var/run/docker.sock info --format '{{.ID}}' || return 80
@@ -527,6 +608,7 @@ carrier_host_inventory() {
     carrier_host_inventory_command "$snapshot" address6 ip -6 address show || return 80
     carrier_host_inventory_command "$snapshot" iptables iptables-save || return 80
     carrier_host_inventory_command "$snapshot" ip6tables ip6tables-save || return 80
+    carrier_host_identity_verify "$socket" "$daemon" || return $?
     [[ $(carrier_host_machine_id) == "$CARRIER_HOST_MACHINE_ID" && $(carrier_host_boot_id) == "$CARRIER_HOST_BOOT_ID" ]] || return 77
     [[ "$(carrier_current_namespace | tr '\n' ' ')" == "$identity" ]] || return 77
     : > "$snapshot/complete" || return 80

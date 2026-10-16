@@ -55,9 +55,15 @@ setup_boundaries() {
     carrier_process_alive() { return 0; }
     carrier_sleep() { :; }
     carrier_stop_process() { printf 'stop:%s\n' "$1" >> "$scratch/mutations"; }
+    carrier_wait_process() { printf 'wait:%s\n' "$1" >> "$scratch/mutations"; }
     carrier_remove_tree() { printf 'remove:%s\n' "$1" >> "$scratch/mutations"; rm -rf -- "$1"; }
     carrier_configure_socket() { :; }
+    carrier_configure_directory() { :; }
+    carrier_docker_context() { printf 'default\n'; }
+    carrier_host_socket_facts() { printf '8 9001 0 0 660 /var/run/docker.sock\n'; }
+    carrier_host_daemon_id() { printf 'probe\n' >> "$scratch/host-daemon-probes"; printf 'daemon-host-0001\n'; }
     carrier_host_readonly_query() {
+        printf '%s\n' "$*" >> "$scratch/host-queries"
         case "$*" in
             *' container ls '*|*' network ls '*|*' volume ls '*|*' image ls '*) return 0 ;;
             *) printf 'snapshot:%s\n' "$*" ;;
@@ -66,6 +72,11 @@ setup_boundaries() {
     carrier_path_sha256() { printf '%s\n' "$TEST_SHA"; }
     carrier_source_sha256() { printf '%s\n' "$TEST_SHA"; }
     carrier_dockerd_sha256() { printf '%s\n' "$TEST_SHA"; }
+}
+
+# 记录目录权限与属主调整。
+record_directory_access() {
+    printf 'dir-access:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" >> "$SCRATCH/mutations"
 }
 
 # create 必须复制审批、创建完整状态，并将 dockerd 的独立路径固化到状态。
@@ -128,36 +139,40 @@ case_run_uses_fixed_approval_copy() {
     rm -rf "$scratch"
 }
 
-# sequence 授权必须把已核验顺序作为环境参数传给同一九参数 guard。
+# sequence 保留审批解析，但在 B 接通 guard 前拒绝执行。
 case_sequence_passes_approved_order_to_guard() {
-    local scratch approval state manifest args
+    local scratch approval state manifest rc=0
     scratch=$(new_scratch); setup_boundaries "$scratch"
     approval=$scratch/approval.tsv; write_approval "$approval" mapping-sequence direct,fallback
     state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
     carrier_test_state_write "$approval" "$state" "$manifest"
     carrier_current_namespace() { printf '4 3001 4 3002\n'; }
-    carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-sequence "$scratch/evidence" direct,fallback || return 1
-    args=$(cat "$scratch/mutations")
-    [[ $args == *'env IT_MAPPING_ORDER=direct,fallback bash '*'/docker-network-guard.sh --mode mapping-sequence '* ]] || return 1
+    carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-sequence "$scratch/evidence" direct,fallback || rc=$?
+    [[ $rc == 77 && ! -s $scratch/mutations ]] || return 1
     rm -rf "$scratch"
 }
 
 # cleanup 与 recover 只能在身份完整时进入 holder，recover 还要求显式 runner-stopped。
 case_cleanup_and_recover_are_identity_bound() {
-    local scratch approval state manifest rc=0
+    local scratch approval state manifest rc=0 digest
     scratch=$(new_scratch); setup_boundaries "$scratch"
     approval=$scratch/approval.tsv; write_approval "$approval" full none
     state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
     carrier_test_state_write "$approval" "$state" "$manifest"
     carrier_current_namespace() { printf '4 3001 4 3002\n'; }
-    mkdir -p "$scratch/final" "$scratch/recovery"
-    : > "$scratch/recovery/recover.sh"
+    mkdir -p "$scratch/final" "$scratch/recovery" "$scratch/evidence"
+    : > "$scratch/evidence/recover.sh"
+    chmod 600 "$scratch/evidence/recover.sh"
+    digest=$(sha256sum "$scratch/evidence/recover.sh" | cut -d' ' -f1)
+    printf 'run_id\tcontract\nrecover_sha256\t%s\n' "$digest" > "$scratch/evidence/recovery-binding.tsv"
+    chmod 600 "$scratch/evidence/recovery-binding.tsv"
+    carrier_path_sha256() { sha256sum "$1" | cut -d' ' -f1; }
     carrier_cleanup "$state" "$scratch/final" || return 1
-    carrier_recover "$state" "$scratch/recovery" --runner-stopped || return 1
-    rc=0; carrier_recover "$state" "$scratch/recovery" --unsafe || rc=$?
+    carrier_recover "$state" "$scratch/evidence" --runner-stopped || return 1
+    rc=0; carrier_recover "$state" "$scratch/evidence" --unsafe || rc=$?
     [[ $rc == 64 ]] || return 1
     grep -q '^nsenter --target 31337 --net --mount -- bash .*/docker-validation-carrier.sh internal-cleanup ' "$scratch/mutations" || return 1
-    grep -q '^nsenter --target 31337 --net --mount -- bash .*/recover.sh --runner-stopped$' "$scratch/mutations" || return 1
+    grep -q '^nsenter --target 31337 --net --mount -- bash .*/evidence/recover.sh --runner-stopped$' "$scratch/mutations" || return 1
     rm -rf "$scratch"
 }
 
@@ -227,6 +242,34 @@ case_approval_mode_order_pair_is_closed() {
     write_approval "$approval" full fallback,direct
     rc=0; carrier_approval_load "$approval" || rc=$?
     [[ $rc == 2 && ! -s $scratch/mutations ]] || return 1
+    rm -rf "$scratch"
+}
+
+# 审批身份边界必须与当前 guard 的 run 和 runner 约束一致。
+case_approval_aligns_guard_identity_boundary() {
+    local scratch approval rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"; approval=$scratch/approval.tsv
+    write_approval "$approval" mapping-probe none
+    sed -i 's/run_id\tcontract/run_id\t12345678901/' "$approval"
+    carrier_approval_load "$approval" || rc=$?
+    [[ $rc == 2 ]] || return 1
+    write_approval "$approval" mapping-probe none
+    sed -i 's/runner_user\tgmtest/runner_user\tother/' "$approval"
+    rc=0; carrier_approval_load "$approval" || rc=$?
+    [[ $rc == 2 ]] || return 1
+    rm -rf "$scratch"
+}
+
+# sequence 在 B 接通 guard 前不得产生运行副作用。
+case_sequence_run_is_deferred_to_b() {
+    local scratch approval state manifest rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" mapping-sequence direct,fallback
+    state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
+    carrier_test_state_write "$approval" "$state" "$manifest"
+    carrier_current_namespace() { printf '4 3001 4 3002\n'; }
+    carrier_run "$state" "$manifest" "$scratch/attestation" "$scratch/profile" mapping-sequence "$scratch/evidence" direct,fallback || rc=$?
+    [[ $rc == 77 && ! -s $scratch/mutations ]] || return 1
     rm -rf "$scratch"
 }
 
@@ -344,17 +387,67 @@ case_independent_dockerd_paths() {
 }
 
 case_create_waits_for_dockerd_and_rolls_back_exactly() {
-    local scratch approval rc=0 calls=0
+    local scratch approval rc=0
     scratch=$(new_scratch); setup_boundaries "$scratch"
     approval=$scratch/input.tsv; write_approval "$approval" mapping-probe none
     mkdir -p "$scratch/state" "$scratch/run"
-    carrier_daemon_id() { calls=$((calls + 1)); return 1; }
+    carrier_daemon_id() { printf 'probe\n' >> "$scratch/probes"; return 1; }
     carrier_process_alive() { return 0; }
+    CARRIER_DOCKERD_READY_ATTEMPTS=3
     carrier_create "$approval" "$scratch/state/contract" || rc=$?
     [[ $rc == 80 && ! -e $scratch/state/contract && ! -e $scratch/run/contract ]] || return 1
+    [[ $(wc -l < "$scratch/probes") == 3 ]] || return 1
     grep -q '^stop:31338$' "$scratch/mutations" || return 1
     grep -q '^stop:31337$' "$scratch/mutations" || return 1
+    grep -q '^wait:31338$' "$scratch/mutations" || return 1
+    grep -q '^wait:31337$' "$scratch/mutations" || return 1
+    [[ $(grep -nE '^(stop|wait|remove):' "$scratch/mutations" | cut -d: -f2- | tr '\n' ' ') == 'stop:31338 wait:31338 stop:31337 wait:31337 '* ]] || return 1
     [[ $(grep -c '^remove:' "$scratch/mutations") == 2 ]] || return 1
+    rm -rf "$scratch"
+}
+
+# run 目录必须仅向获批 runner 组开放遍历。
+case_create_grants_runner_traverse_without_write() {
+    local scratch approval
+    scratch=$(new_scratch); setup_boundaries "$scratch"; SCRATCH=$scratch
+    approval=$scratch/input.tsv; write_approval "$approval" mapping-probe none
+    mkdir -p "$scratch/state" "$scratch/run"
+    carrier_configure_directory() { record_directory_access "$@"; }
+    carrier_create "$approval" "$scratch/state/contract" || return 1
+    grep -Fqx "dir-access:$scratch/run/contract:0:10001:710" "$scratch/mutations" || return 1
+    rm -rf "$scratch"
+}
+
+# recover 只接受固定 run 证据根、root 安全脚本及绑定摘要，并产出结果摘要。
+case_recover_binds_fixed_root_owner_digest_and_run() {
+    local scratch approval state manifest recovery rc=0 digest
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" full none
+    state=$scratch/state.tsv; manifest=$scratch/manifest.tsv
+    carrier_test_state_write "$approval" "$state" "$manifest"
+    carrier_current_namespace() { printf '4 3001 4 3002\n'; }
+    mkdir -p "$scratch/state/contract"
+    mv "$state" "$scratch/state/contract/state.tsv"
+    state=$scratch/state/contract/state.tsv
+    recovery=$scratch/state/contract/evidence
+    mkdir -p "$recovery"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$recovery/recover.sh"
+    chmod 600 "$recovery/recover.sh"
+    digest=$(sha256sum "$recovery/recover.sh" | cut -d' ' -f1)
+    printf 'run_id\tcontract\nrecover_sha256\t%s\n' "$digest" > "$recovery/recovery-binding.tsv"
+    chmod 600 "$recovery/recovery-binding.tsv"
+    carrier_path_sha256() { sha256sum "$1" | cut -d' ' -f1; }
+    carrier_recover "$state" "$recovery" --runner-stopped || return 1
+    grep -Fqx $'run_id\tcontract' "$recovery/recovery-summary.tsv" || return 1
+    grep -Fqx $'recover_exit\t0' "$recovery/recovery-summary.tsv" || return 1
+    mkdir -p "$scratch/foreign"
+    cp "$recovery/recover.sh" "$scratch/foreign/recover.sh"
+    cp "$recovery/recovery-binding.tsv" "$scratch/foreign/recovery-binding.tsv"
+    carrier_recover "$state" "$scratch/foreign" --runner-stopped || rc=$?
+    [[ $rc == 77 ]] || return 1
+    printf 'tamper\n' >> "$recovery/recover.sh"
+    rc=0; carrier_recover "$state" "$recovery" --runner-stopped || rc=$?
+    [[ $rc == 77 ]] || return 1
     rm -rf "$scratch"
 }
 
@@ -486,8 +579,84 @@ case_host_inventory_compares_every_command() {
     rm -rf "$scratch"
 }
 
+# before 快照根不能阻止同一 run 的后续 carrier_create。
+case_host_inventory_root_does_not_conflict_with_create() {
+    local scratch approval
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/input.tsv; write_approval "$approval" mapping-probe none
+    mkdir -p "$scratch/state" "$scratch/run"
+    carrier_host_namespace() { printf '4 4001 4 4002\n'; }
+    carrier_host_inventory "$approval" "$scratch/state/contract" before || return 1
+    carrier_create "$approval" "$scratch/state/contract" || return 1
+    [[ -f $scratch/state/contract/host-before/complete && -f $scratch/state/contract/state.tsv ]] || return 1
+    rm -rf "$scratch"
+}
+
+# 宿主盘点拒绝 Docker 环境覆盖，并绑定宿主 socket 与 daemon 身份。
+case_host_inventory_rejects_overrides_and_pins_socket_daemon() {
+    local scratch approval identity rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" full none
+    carrier_host_namespace() { printf '4 4001 4 4002\n'; }
+    mkdir -p "$scratch/state"
+    DOCKER_HOST=tcp://192.0.2.1:2375 carrier_host_inventory "$approval" "$scratch/state" before || rc=$?
+    [[ $rc == 77 && ! -e $scratch/state/host-before ]] || return 1
+    unset DOCKER_HOST
+    carrier_host_socket_facts() { printf '8 9001 0 0 660 /var/run/docker.sock\n'; }
+    carrier_host_inventory "$approval" "$scratch/state" before || return 1
+    identity=$scratch/state/host-before/identity.tsv
+    grep -Fqx $'daemon_id\tdaemon-host-0001' "$identity" || return 1
+    grep -Fqx $'socket_inode\t9001' "$identity" || return 1
+    [[ $(wc -l < "$scratch/host-daemon-probes") -ge 2 ]] || return 1
+    rm -rf "$scratch"
+}
+
+# after 快照必须匹配 before 的宿主 socket 与 daemon 身份。
+case_host_inventory_after_matches_before_identity() {
+    local scratch approval rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"
+    approval=$scratch/approval.tsv; write_approval "$approval" full none
+    carrier_host_namespace() { printf '4 4001 4 4002\n'; }
+    mkdir -p "$scratch/state"
+    carrier_host_inventory "$approval" "$scratch/state" before || return 1
+    carrier_host_socket_facts() { printf '8 9002 0 0 660 /var/run/docker.sock\n'; }
+    carrier_host_inventory "$approval" "$scratch/state" after || rc=$?
+    [[ $rc == 77 && ! -f $scratch/state/host-after/complete ]] || return 1
+    rm -rf "$scratch"
+}
+
+# --no-trunc 资源 ID 必须使用精确 SHA-256 形态。
+case_host_inventory_requires_sha256_ids() {
+    local scratch rc=0
+    scratch=$(new_scratch); setup_boundaries "$scratch"; mkdir -p "$scratch/snapshot"
+    printf 'abcdefabcdef\n' > "$scratch/snapshot/containers.stdout"
+    carrier_host_inventory_inspect "$scratch/snapshot" container containers || rc=$?
+    [[ $rc == 80 ]] || return 1
+    printf 'sha256:%064d\n' 0 > "$scratch/snapshot/images.stdout"
+    carrier_host_inventory_inspect "$scratch/snapshot" image images || return 1
+    rm -rf "$scratch"
+}
+
+# 比较前必须规范化排序并去除规则计数噪声，实际规则变化仍失败。
+case_host_inventory_normalizes_and_sorts_rules() {
+    local scratch before after rc=0
+    scratch=$(new_scratch); before=$scratch/state/host-before; after=$scratch/state/host-after
+    mkdir -p "$before" "$after"; : > "$before/complete"; : > "$after/complete"
+    printf 'iptables\n' > "$before/commands.tsv"; cp "$before/commands.tsv" "$after/commands.tsv"
+    printf 'iptables-save \n' > "$before/iptables.argv"; cp "$before/iptables.argv" "$after/iptables.argv"
+    printf '0\n' > "$before/iptables.exit"; cp "$before/iptables.exit" "$after/iptables.exit"
+    : > "$before/iptables.stderr"; : > "$after/iptables.stderr"
+    printf '[1:2] -A B -j DROP\n[3:4] -A A -j ACCEPT\n' > "$before/iptables.stdout"
+    printf '[9:8] -A A -j ACCEPT\n[7:6] -A B -j DROP\n' > "$after/iptables.stdout"
+    carrier_host_inventory_compare "$scratch/state" || return 1
+    printf '[9:8] -A A -j DROP\n[7:6] -A B -j DROP\n' > "$after/iptables.stdout"
+    carrier_host_inventory_compare "$scratch/state" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    rm -rf "$scratch"
+}
+
 failed=0
-for name in create_builds_bound_state create_rejects_frozen_input_hash_drift create_waits_for_dockerd_and_rolls_back_exactly run_enters_holder_with_real_guard_args run_requires_host_self_namespace run_uses_fixed_approval_copy run_validates_manifest_attestation_and_profile sequence_passes_approved_order_to_guard cleanup_and_recover_are_identity_bound run_rejects_state_hash_drift verify_binds_holder_namespace_and_dockerd_paths approval_requires_exact_21_keys approval_mode_order_pair_is_closed approval_validates_every_field run_requires_exact_approved_mode_order run_binds_approval_through_state_and_manifest reject_host_namespace reject_reused_holder_pid reject_socket_replacement socket_permissions_reject_world_access independent_dockerd_paths mount_propagation_private host_inventory_uses_closed_readonly_argv host_inventory_rejects_runner_and_foreign_namespace host_inventory_pins_host_identity host_inventory_uses_approved_identity host_inventory_has_no_business_delete_path host_inventory_writes_immutable_snapshot host_inventory_compares_every_command; do
+for name in create_builds_bound_state create_rejects_frozen_input_hash_drift create_waits_for_dockerd_and_rolls_back_exactly create_grants_runner_traverse_without_write run_enters_holder_with_real_guard_args run_requires_host_self_namespace run_uses_fixed_approval_copy run_validates_manifest_attestation_and_profile sequence_passes_approved_order_to_guard sequence_run_is_deferred_to_b cleanup_and_recover_are_identity_bound recover_binds_fixed_root_owner_digest_and_run run_rejects_state_hash_drift verify_binds_holder_namespace_and_dockerd_paths approval_requires_exact_21_keys approval_mode_order_pair_is_closed approval_aligns_guard_identity_boundary approval_validates_every_field run_requires_exact_approved_mode_order run_binds_approval_through_state_and_manifest reject_host_namespace reject_reused_holder_pid reject_socket_replacement socket_permissions_reject_world_access independent_dockerd_paths mount_propagation_private host_inventory_uses_closed_readonly_argv host_inventory_rejects_runner_and_foreign_namespace host_inventory_pins_host_identity host_inventory_uses_approved_identity host_inventory_has_no_business_delete_path host_inventory_writes_immutable_snapshot host_inventory_compares_every_command host_inventory_root_does_not_conflict_with_create host_inventory_rejects_overrides_and_pins_socket_daemon host_inventory_after_matches_before_identity host_inventory_requires_sha256_ids host_inventory_normalizes_and_sorts_rules; do
     rc=0
     ( "case_$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
