@@ -59,7 +59,7 @@ guard_gm() {
 # 为本次失败生成独立恢复脚本；冻结账本及库哈希，只按登记账本精确恢复。
 # 恢复脚本复用同一资源库，先复核同一 VM/runner/socket/daemon 并要求 runner 已停止。
 guard_write_recovery() {
-    local ledger_dir=$E/control/resources lib_hash='' ledger_hash=''
+    local ledger_dir=$E/control/resources lib_hash='' ledger_hash='' recovery_hash
     lib_hash=$(sha256sum "$GUARD_DIR/docker-resource-ledger.sh" 2>/dev/null | cut -d' ' -f1)
     [[ ! -f $ledger_dir/ledger.tsv ]] || ledger_hash=$(sha256sum "$ledger_dir/ledger.tsv" | cut -d' ' -f1)
     {
@@ -93,6 +93,14 @@ resource_cleanup "$LEDGER_DIR" || exit 2
 guard_remove_rules
 RECOVERY
     } > "$E/recover.sh"
+    chmod 600 "$E/recover.sh" || return 2
+    recovery_hash=$(sha256sum "$E/recover.sh" 2>/dev/null | cut -d' ' -f1)
+    [[ $recovery_hash =~ ^[0-9a-f]{64}$ ]] || return 2
+    {
+        printf 'run_id\t%s\nrecover_sha256\t%s\n' "$RUN" "$recovery_hash"
+    } > "$E/recovery-binding.tsv.tmp" || return 2
+    chmod 600 "$E/recovery-binding.tsv.tmp" || return 2
+    mv "$E/recovery-binding.tsv.tmp" "$E/recovery-binding.tsv" || return 2
 }
 # 清理前先保存输入关联的容器状态、日志与规则计数；删除统一走资源账本交叉验证。
 guard_cleanup() {

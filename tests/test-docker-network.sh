@@ -36,7 +36,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -85,6 +85,20 @@ contract_case() {
             grep -q -- '-D\|-X' "$SCRATCH/rules" && return 1
             [[ -s $SCRATCH/evidence/recover.sh ]] || return 1
             rm -rf "$SCRATCH"
+            ;;
+        cleanup_writes_recovery_binding)
+            local E RUN=contract RUNNER=gmtest digest
+            E=$(mktemp -d)
+            GUARD_SOURCE=$(cd "$HERE/.." && pwd)
+            GUARD_MANIFEST=''
+            GUARD_ATTESTATION=''
+            guard_write_recovery || return 1
+            [[ -f $E/recover.sh && -f $E/recovery-binding.tsv ]] || return 1
+            digest=$(sha256sum "$E/recover.sh" | cut -d' ' -f1)
+            [[ $(wc -l < "$E/recovery-binding.tsv") == 2 ]] || return 1
+            grep -Fqx $'run_id\tcontract' "$E/recovery-binding.tsv" || return 1
+            grep -Fqx $'recover_sha256\t'"$digest" "$E/recovery-binding.tsv" || return 1
+            rm -rf "$E"
             ;;
         cleanup_failure_keeps_isolation)
             local E RUN=contract RUNNER=gmtest primary actual fault fault_kind phase expected

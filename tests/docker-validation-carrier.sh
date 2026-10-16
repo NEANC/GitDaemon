@@ -176,7 +176,36 @@ carrier_create_rollback() {
         carrier_wait_process "$holder" || return 80
     fi
     [[ -z $run_dir || ! -e $run_dir ]] || carrier_remove_tree "$run_dir"
-    [[ -z $state_dir || ! -e $state_dir ]] || carrier_remove_tree "$state_dir"
+    if [[ -n $state_dir && -e $state_dir ]]; then
+        if carrier_host_snapshot_complete "$state_dir/host-before"; then
+            [[ ! -e $state_dir/approval.tsv ]] || carrier_remove_tree "$state_dir/approval.tsv"
+            [[ ! -e $state_dir/state.tsv ]] || carrier_remove_tree "$state_dir/state.tsv"
+            [[ ! -e $state_dir/state.tsv.tmp ]] || carrier_remove_tree "$state_dir/state.tsv.tmp"
+            [[ ! -e $state_dir/daemon.json ]] || carrier_remove_tree "$state_dir/daemon.json"
+            [[ ! -e $state_dir/docker-data ]] || carrier_remove_tree "$state_dir/docker-data"
+        else
+            carrier_remove_tree "$state_dir"
+        fi
+    fi
+}
+
+carrier_host_snapshot_complete() {
+    local snapshot=${1:-} name
+    [[ -d $snapshot && ! -L $snapshot && -f $snapshot/complete && -f $snapshot/identity.tsv && -s $snapshot/commands.tsv ]] || return 1
+    while IFS= read -r name; do
+        [[ -n $name && -f $snapshot/$name.argv && -f $snapshot/$name.exit && -f $snapshot/$name.stdout && -f $snapshot/$name.stderr ]] || return 1
+        grep -qx '0' "$snapshot/$name.exit" || return 1
+    done < "$snapshot/commands.tsv"
+}
+
+carrier_host_snapshot_matches_approval() {
+    local snapshot=${1:-} identity namespace
+    carrier_host_snapshot_complete "$snapshot" || return 1
+    identity=$snapshot/identity.tsv
+    namespace=$(carrier_host_namespace | tr '\n' ' ') || return 1
+    grep -Fqx $'machine_id\t'"$CARRIER_HOST_MACHINE_ID" "$identity" || return 1
+    grep -Fqx $'boot_id\t'"$CARRIER_HOST_BOOT_ID" "$identity" || return 1
+    grep -Fqx $'namespace\t'"$namespace" "$identity" || return 1
 }
 
 # 创建固定审批副本、独立 holder/dockerd，并原子写入完整状态。
@@ -205,7 +234,7 @@ carrier_create() {
     state_root=$(carrier_state_root); runtime_root=$(carrier_runtime_root)
     [[ $state_dir == "$state_root/$CARRIER_RUN_ID" ]] || return 77
     if [[ -e $state_dir ]]; then
-        [[ -d $state_dir && ! -L $state_dir && -d $state_dir/host-before && -f $state_dir/host-before/complete ]] || return 77
+        carrier_host_snapshot_matches_approval "$state_dir/host-before" || return 77
         [[ ! -e $state_dir/approval.tsv && ! -e $state_dir/state.tsv && ! -e $state_dir/daemon.json && ! -e $state_dir/docker-data ]] || return 77
         find "$state_dir" -mindepth 1 -maxdepth 1 ! -name host-before -print -quit | grep -q . && return 77
     fi
@@ -412,6 +441,7 @@ carrier_run() {
     [[ $mode != mapping-sequence ]] || return 77
     [[ $(carrier_now_epoch) -le CARRIER_EXPIRES_AT_EPOCH ]] || return 77
     [[ $CS_RUN_ID == "$CARRIER_RUN_ID" && $CS_MACHINE_ID == "$CARRIER_HOST_MACHINE_ID" && $CS_BOOT_ID == "$CARRIER_HOST_BOOT_ID" ]] || return 77
+    [[ $evidence == "$(dirname "$state")/evidence" ]] || return 77
     carrier_holder_verify "$state" || return $?
     guard_path=$(dirname "${BASH_SOURCE[0]}")/docker-network-guard.sh
     if [[ $mode == mapping-sequence ]]; then
@@ -501,7 +531,7 @@ carrier_host_inventory_command() {
 
 # 对列表结果逐项执行对应 inspect，并保留每个对象的独立命令证据。
 carrier_host_inventory_inspect() {
-    local snapshot=$1 kind=$2 list_name=$3 identity index=0
+    local snapshot=$1 kind=$2 list_name=$3 identity evidence_id
     while IFS= read -r identity; do
         [[ -z $identity ]] && continue
         [[ $identity != -* ]] || return 80
@@ -511,9 +541,9 @@ carrier_host_inventory_inspect() {
             volume) [[ $identity =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$ ]] || return 80 ;;
             *) return 80 ;;
         esac
-        carrier_host_inventory_command "$snapshot" "$kind-inspect-$index" docker --host unix:///var/run/docker.sock "$kind" inspect "$identity" || return 80
-        index=$((index + 1))
-    done < "$snapshot/$list_name.stdout"
+        evidence_id=${identity#sha256:}
+        carrier_host_inventory_command "$snapshot" "$kind-inspect-$evidence_id" docker --host unix:///var/run/docker.sock "$kind" inspect "$identity" || return 80
+    done < <(LC_ALL=C sort -u "$snapshot/$list_name.stdout")
 }
 
 # 规范化宿主快照的无语义顺序、规则计数与工具时间戳。
@@ -521,8 +551,9 @@ carrier_host_inventory_normalize() {
     local name=$1 path=$2
     case "$name" in
         iptables|ip6tables)
-            sed -E '/^# (Generated|Completed) /d; s/^\[[0-9]+:[0-9]+\][[:space:]]*//' "$path" | LC_ALL=C sort ;;
-        *) LC_ALL=C sort "$path" ;;
+            sed -E '/^# (Generated|Completed) /d; s/^\[[0-9]+:[0-9]+\][[:space:]]*//' "$path" ;;
+        containers|networks|volumes|images) LC_ALL=C sort -u "$path" ;;
+        *) cat "$path" ;;
     esac
 }
 
@@ -562,6 +593,7 @@ carrier_host_inventory() {
     context=$(carrier_docker_context) || context=''
     [[ -z $context || $context == default || $context == unix:///var/run/docker.sock ]] || return 77
     carrier_approval_load "$approval" || return $?
+    [[ $state_dir == "$(carrier_state_root)/$CARRIER_RUN_ID" ]] || return 77
     [[ $(carrier_host_machine_id) == "$CARRIER_HOST_MACHINE_ID" ]] || return 77
     [[ $(carrier_host_boot_id) == "$CARRIER_HOST_BOOT_ID" ]] || return 77
     [[ "$(carrier_current_namespace | tr '\n' ' ')" == "$(carrier_host_namespace | tr '\n' ' ')" ]] || return 77
