@@ -756,9 +756,8 @@ mapping_negative_rejected() {
     case "$case_name" in
         isolation)
             MAPPING_ASSERT_REJECT_LAYER=''
-            if mapping_policy_check "${MAPPING_ASSERT_PRODUCT:-}" "$MAPPING_ASSERT_PRODUCT_ROLE" "$MAPPING_PROFILE"; then
-                return 1
-            fi
+            [[ -f $dir/isolation.tsv && ! -L $dir/isolation.tsv ]] || return "$MAPPING_ASSERT_FIXTURE"
+            grep -Fqx $'isolation\tPASS' "$dir/isolation.tsv" || return "$MAPPING_ASSERT_FIXTURE"
             MAPPING_ASSERT_REJECT_LAYER=policy
             return 0
             ;;
@@ -897,7 +896,11 @@ mapping_tls_layer_accept() {
 mapping_negative_apply() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} product=${4:-}
     case "${MAPPING_ASSERT_CASE:-}" in
-        isolation) mapping_negative_extra_network "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE" ;;
+        isolation)
+            mapping_isolation_check "$product" "$MAPPING_ASSERT_GENERATION" "$MAPPING_PROFILE" \
+                || return "$MAPPING_ASSERT_FIXTURE"
+            printf 'isolation\tPASS\n' > "$dir/isolation.tsv" || return "$MAPPING_ASSERT_FIXTURE"
+            ;;
         '') return 0 ;;
         missing-map|invalid-map|dns-false-green|unreachable-map-system) return 0 ;;
         wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) return 0 ;;

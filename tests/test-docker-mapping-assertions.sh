@@ -221,6 +221,7 @@ sa_doubles() {
     mapping_negative_wrong_ca() { return 0; }
     mapping_negative_wrong_san() { return 0; }
     mapping_negative_extra_network() { return 0; }
+    mapping_isolation_check() { return 0; }
     mapping_policy_check() {
         if [[ ${D_EXTRA_NETWORK:-0} == 1 ]]; then return 1; fi
         return 0
