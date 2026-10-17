@@ -282,6 +282,8 @@ mapping_prepare() {
     mapping_profile_load "$profile" || return 80
     ledger=$(resource_ledger_dir) || return 80
     mapping_assets_prepare "$profile" "$scenario" "$product_image" "$ledger" || return 80
+    mapping_evidence_volume_prepare "$tools_image" || return 80
+    mapping_evidence_volume_verify "$tools_image" || return 80
     mapping_network_create "$profile" "$ledger" "$scenario" >/dev/null || return 80
     mapping_fixture_precheck || return 80
     return 0
@@ -602,6 +604,108 @@ mapping_ca_volume() {
 # 上游连接取证卷（rw）：资产卷对上游只读，须另挂一个可写卷承载 requests.log/serve.log。
 mapping_evidence_volume() {
     printf 'gm-%s-mapping-evidence\n' "$(mapping_fixture_run_id)"
+}
+
+# 创建、登记、运行并删除一个封闭的 network-none 证据卷助手。
+mapping_evidence_helper_run() {
+    local role=${1:-} image=${2:-} mount=${3:-} script=${4:-} output=${5:-}
+    local scenario=${MPF_SCENARIO:-$MAPPING_LEDGER_SCENARIO} id rc=0 remove_rc=0
+    [[ -n $role && -n $image && -n $script && -n $output ]] || return "$MAPPING_FAILURE"
+    mapping_scenario_valid "$scenario" || return "$MAPPING_FAILURE"
+    RESOURCE_LEDGER_DIR=$(resource_ledger_dir) RESOURCE_RUN=$(mapping_fixture_run_id)
+    resource_create_register container "$scenario" "$role" -- \
+        resource_docker create \
+        --label "gitdaemon.run=$RESOURCE_RUN" \
+        --label "gitdaemon.scenario=$scenario" \
+        --label "gitdaemon.role=$role" \
+        $MAPPING_SAFE_OPTIONS --network none \
+        ${mount:+-v "$mount"} --entrypoint /bin/sh "$image" -c "$script" || return "$MAPPING_FAILURE"
+    id=$RESOURCE_CREATED_ID
+    [[ -n $id ]] || return "$MAPPING_FAILURE"
+    resource_docker start -a "$id" > "$output" 2>&1 || rc=$?
+    resource_remove container "$id" || remove_rc=$?
+    (( rc == 0 && remove_rc == 0 )) || return "$MAPPING_FAILURE"
+    return 0
+}
+
+# 以镜像内 10001 所有目录的空卷 copy-up 初始化本轮证据卷。
+mapping_evidence_volume_prepare() {
+    local image=${1:-} volume ledger scenario check_output init_output
+    [[ -n $image ]] || return "$MAPPING_FAILURE"
+    volume=$(mapping_evidence_volume) || return "$MAPPING_FAILURE"
+    ledger=$(resource_ledger_dir) || return "$MAPPING_FAILURE"
+    scenario=${MPF_SCENARIO:-$MAPPING_LEDGER_SCENARIO}
+    check_output=$(mktemp) || return "$MAPPING_FAILURE"
+    init_output=$(mktemp) || { rm -f "$check_output"; return "$MAPPING_FAILURE"; }
+    if ! mapping_evidence_helper_run evidence-image-check "$image" '' \
+        "test -d '$MAPPING_FIXTURE_MOUNT' && test ! -L '$MAPPING_FIXTURE_MOUNT' && test -w '$MAPPING_FIXTURE_MOUNT' && stat -c '%u:%g' '$MAPPING_FIXTURE_MOUNT'" "$check_output"; then
+        rm -f "$check_output" "$init_output"
+        return "$MAPPING_FAILURE"
+    fi
+    if ! grep -Fxq '10001:10001' "$check_output"; then
+        rm -f "$check_output" "$init_output"
+        return "$MAPPING_FAILURE"
+    fi
+    if resource_exists volume "$volume"; then
+        rm -f "$check_output" "$init_output"
+        return "$MAPPING_FAILURE"
+    elif [[ $? != 1 ]]; then
+        rm -f "$check_output" "$init_output"
+        return "$MAPPING_FAILURE"
+    fi
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$(mapping_fixture_run_id)
+    resource_create_register volume "$scenario" "$MAPPING_EVIDENCE_VOLUME_ROLE" -- \
+        resource_docker volume create \
+        --label "gitdaemon.run=$RESOURCE_RUN" \
+        --label "gitdaemon.scenario=$scenario" \
+        --label "gitdaemon.role=$MAPPING_EVIDENCE_VOLUME_ROLE" \
+        "$volume" || { rm -f "$check_output" "$init_output"; return "$MAPPING_FAILURE"; }
+    if ! mapping_evidence_helper_run evidence-init "$image" "$volume:$MAPPING_FIXTURE_MOUNT" \
+        "test \"\$(stat -c '%u:%g' '$MAPPING_FIXTURE_MOUNT')\" = 10001:10001" "$init_output"; then
+        rm -f "$check_output" "$init_output"
+        return "$MAPPING_FAILURE"
+    fi
+    rm -f "$check_output" "$init_output"
+    return 0
+}
+
+# 在实际 /ev 挂载下验证属主、读写、追加、比对、删除和 FIFO 生命周期。
+mapping_evidence_volume_verify() {
+    local image=${1:-} volume output mounts id scenario token script rc=0 remove_rc=0
+    [[ -n $image && -n ${IT_EVIDENCE_DIR:-} ]] || return "$MAPPING_FAILURE"
+    volume=$(mapping_evidence_volume) || return "$MAPPING_FAILURE"
+    scenario=${MPF_SCENARIO:-$MAPPING_LEDGER_SCENARIO}
+    token="mapping-evidence-$(mapping_fixture_run_id)-$$"
+    output=$IT_EVIDENCE_DIR/mapping-evidence-volume.txt
+    script="set -eu; test \"\$(stat -c '%u:%g' /ev)\" = 10001:10001; printf 'payload' > '/ev/$token.file'; printf '%s' '-append' >> '/ev/$token.file'; printf 'payload-append' > '/ev/$token.expected'; cmp '/ev/$token.file' '/ev/$token.expected'; rm '/ev/$token.expected'; mkfifo '/ev/$token.fifo'; test -p '/ev/$token.fifo'; rm '/ev/$token.fifo'; cat '/ev/$token.file'; rm '/ev/$token.file'; printf '\nuid=10001 gid=10001\nowner=10001:10001\nwrite=PASS\nfifo=PASS\n'"
+    RESOURCE_LEDGER_DIR=$(resource_ledger_dir) RESOURCE_RUN=$(mapping_fixture_run_id)
+    resource_create_register container "$scenario" evidence-verify -- \
+        resource_docker create \
+        --label "gitdaemon.run=$RESOURCE_RUN" \
+        --label "gitdaemon.scenario=$scenario" \
+        --label 'gitdaemon.role=evidence-verify' \
+        $MAPPING_SAFE_OPTIONS --network none -v "$volume:$MAPPING_EVIDENCE_MOUNT" \
+        --entrypoint /bin/sh "$image" -c "$script" || return "$MAPPING_FAILURE"
+    id=$RESOURCE_CREATED_ID
+    [[ -n $id ]] || return "$MAPPING_FAILURE"
+    mounts=$(resource_docker inspect -f '{{json .Mounts}}' "$id" 2>/dev/null) || rc=$?
+    if (( rc == 0 )); then
+        [[ $mounts == *'"Destination":"/ev"'* && $mounts == *'"RW":true'* ]] || rc=1
+    fi
+    if (( rc == 0 )); then
+        mkdir -p "$IT_EVIDENCE_DIR" || rc=1
+    fi
+    if (( rc == 0 )); then
+        resource_docker start -a "$id" > "$output.tmp" 2>&1 || rc=$?
+    fi
+    if (( rc == 0 )); then
+        grep -Fxq 'owner=10001:10001' "$output.tmp" && \
+            grep -Fxq 'write=PASS' "$output.tmp" && grep -Fxq 'fifo=PASS' "$output.tmp" || rc=1
+    fi
+    if (( rc == 0 )); then mv "$output.tmp" "$output" || rc=1; else rm -f "$output.tmp"; fi
+    resource_remove container "$id" || remove_rc=$?
+    (( rc == 0 && remove_rc == 0 )) || return "$MAPPING_FAILURE"
+    return 0
 }
 
 # 夹具容器名：上游 U、代理 X、DNS D、校准探针 P。
@@ -970,8 +1074,7 @@ mapping_assets_volumes_create() {
     [[ -n $ledger ]] || return 1
     mapping_scenario_valid "$scenario" || return 1
     for spec in "$MAPPING_ASSET_VOLUME_ROLE:$(mapping_assets_volume)" \
-        "$MAPPING_CA_VOLUME_ROLE:$(mapping_ca_volume)" \
-        "$MAPPING_EVIDENCE_VOLUME_ROLE:$(mapping_evidence_volume)"; do
+        "$MAPPING_CA_VOLUME_ROLE:$(mapping_ca_volume)"; do
         role=${spec%%:*}
         volume=${spec#*:}
         [[ -n $role && -n $volume ]] || return 1

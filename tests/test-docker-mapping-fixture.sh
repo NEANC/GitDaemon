@@ -792,6 +792,8 @@ tls_env() {
     tls_local_base || return 1
     mapping_fixture_docker() { tls_docker "$@"; }
     resource_docker() { tls_docker "$@"; }
+    resource_lock() { mkdir -p "$1"; }
+    resource_unlock() { return 0; }
     mapping_fixture_ca_publish() {
         cp "$TLS_ASSETS/upstream/tls/ca.crt" "$TLS_DIR/ca/upstream-ca.crt" || return 1
         cp "$TLS_ASSETS/proxy/tls/ca.crt" "$TLS_DIR/ca/proxy-ca.crt" || return 1
@@ -1621,6 +1623,131 @@ PY
     return "$failed"
 }
 
+evidence_volume_contract_setup() {
+    EVIDENCE_DIR=$(mktemp -d)
+    IT_EVIDENCE_DIR=$EVIDENCE_DIR/evidence
+    RESOURCE_LEDGER_DIR=$EVIDENCE_DIR/ledger
+    MP_RUN_ID=mtest
+    MPF_RUN_ID=mtest
+    MPF_SCENARIO=mapping-fallback
+    mkdir -p "$IT_EVIDENCE_DIR" "$RESOURCE_LEDGER_DIR"
+    : > "$EVIDENCE_DIR/calls"
+    EVIDENCE_CREATE_COUNT=0
+    EVIDENCE_START_RC=0
+    EVIDENCE_VOLUME_CREATED=0
+    resource_create_register() {
+        local kind=$1 scenario=$2 role=$3
+        shift 3
+        [[ ${1:-} != -- ]] || shift
+        EVIDENCE_CREATE_COUNT=$((EVIDENCE_CREATE_COUNT + 1))
+        printf 'create\t%s\t%s\t%s\t%s\n' "$kind" "$scenario" "$role" "$*" >> "$EVIDENCE_DIR/calls"
+        RESOURCE_CREATED_ID="created-$EVIDENCE_CREATE_COUNT"
+        [[ $kind != volume || $role != evidence ]] || EVIDENCE_VOLUME_CREATED=1
+        return 0
+    }
+    resource_docker() {
+        printf 'docker\t%s\n' "$*" >> "$EVIDENCE_DIR/calls"
+        case "$*" in
+            'start -a created-1')
+                printf '10001:10001\n'
+                return "$EVIDENCE_START_RC"
+                ;;
+            'start -a created-4')
+                printf 'uid=10001 gid=10001\nowner=10001:10001\nwrite=PASS\nfifo=PASS\n'
+                return "$EVIDENCE_START_RC"
+                ;;
+            *'{{json .Mounts}}'*) printf '[{"Destination":"/ev","RW":true}]\n' ;;
+            *) return 0 ;;
+        esac
+    }
+    resource_exists() {
+        [[ $1 == volume && $2 == gm-mtest-mapping-evidence && $EVIDENCE_VOLUME_CREATED == 1 ]]
+    }
+    resource_remove() {
+        printf 'remove\t%s\t%s\n' "$1" "$2" >> "$EVIDENCE_DIR/calls"
+        return 0
+    }
+}
+
+evidence_volume_initialized_before_ev_mount() {
+    local failed=0 image_line volume_line init_line verify_line
+    evidence_volume_contract_setup
+    mapping_evidence_volume_prepare tools || failed=1
+    image_line=$(grep -n $'create\tcontainer\tmapping-fallback\tevidence-image-check\t' "$EVIDENCE_DIR/calls" | cut -d: -f1)
+    volume_line=$(grep -n $'create\tvolume\tmapping-fallback\tevidence\t' "$EVIDENCE_DIR/calls" | cut -d: -f1)
+    init_line=$(grep -n $'create\tcontainer\tmapping-fallback\tevidence-init\t' "$EVIDENCE_DIR/calls" | cut -d: -f1)
+    mapping_evidence_volume_verify tools || failed=1
+    verify_line=$(grep -n $'create\tcontainer\tmapping-fallback\tevidence-verify\t' "$EVIDENCE_DIR/calls" | cut -d: -f1)
+    [[ $image_line -lt $volume_line && $volume_line -lt $init_line && $init_line -lt $verify_line ]] || failed=1
+    grep -q -- "-v gm-mtest-mapping-evidence:/var/lib/git-daemon" "$EVIDENCE_DIR/calls" || failed=1
+    grep -q -- "-v gm-mtest-mapping-evidence:/ev" "$EVIDENCE_DIR/calls" || failed=1
+    rm -rf "$EVIDENCE_DIR"
+    return "$failed"
+}
+
+evidence_volume_owner_is_10001() {
+    local failed=0
+    evidence_volume_contract_setup
+    mapping_evidence_volume_prepare tools || failed=1
+    mapping_evidence_volume_verify tools || failed=1
+    grep -q "stat -c '%u:%g'.*/var/lib/git-daemon" "$EVIDENCE_DIR/calls" || failed=1
+    grep -q "stat -c '%u:%g'.*/ev" "$EVIDENCE_DIR/calls" || failed=1
+    grep -q '^owner=10001:10001$' "$IT_EVIDENCE_DIR/mapping-evidence-volume.txt" || failed=1
+    rm -rf "$EVIDENCE_DIR"
+    return "$failed"
+}
+
+evidence_volume_actual_write_required() {
+    local failed=0
+    evidence_volume_contract_setup
+    mapping_evidence_volume_prepare tools || failed=1
+    mapping_evidence_volume_verify tools || failed=1
+    grep -q 'mkfifo.*/ev/' "$EVIDENCE_DIR/calls" || failed=1
+    grep -q 'cmp.*/ev/' "$EVIDENCE_DIR/calls" || failed=1
+    grep -q '^write=PASS$' "$IT_EVIDENCE_DIR/mapping-evidence-volume.txt" || failed=1
+    grep -q '^fifo=PASS$' "$IT_EVIDENCE_DIR/mapping-evidence-volume.txt" || failed=1
+    rm -rf "$EVIDENCE_DIR"
+    return "$failed"
+}
+
+evidence_volume_wrong_owner_stops_start() {
+    local failed=0
+    evidence_volume_contract_setup
+    EVIDENCE_START_RC=1
+    if mapping_evidence_volume_prepare tools; then failed=1; fi
+    grep -q $'remove\tcontainer\tcreated-' "$EVIDENCE_DIR/calls" || failed=1
+    rm -rf "$EVIDENCE_DIR"
+    return "$failed"
+}
+
+evidence_volume_readonly_stops_start() {
+    local failed=0
+    evidence_volume_contract_setup
+    mapping_evidence_volume_prepare tools || failed=1
+    EVIDENCE_START_RC=1
+    if mapping_evidence_volume_verify tools; then failed=1; fi
+    rm -rf "$EVIDENCE_DIR"
+    return "$failed"
+}
+
+evidence_helper_keeps_safe_options() {
+    local failed=0
+    evidence_volume_contract_setup
+    mapping_evidence_volume_prepare tools || failed=1
+    mapping_evidence_volume_verify tools || failed=1
+    while IFS= read -r line; do
+        [[ $line == *'--user 10001:10001'* ]] || failed=1
+        [[ $line == *'--network none'* ]] || failed=1
+        [[ $line == *'--read-only'* ]] || failed=1
+        [[ $line == *'--cap-drop ALL'* ]] || failed=1
+        [[ $line == *'--security-opt no-new-privileges'* ]] || failed=1
+        [[ $line == *'net.ipv6.conf.all.disable_ipv6=1'* ]] || failed=1
+        [[ $line != *'--rm'* && $line != *'chmod 777'* && $line != *'--user 0'* ]] || failed=1
+    done < <(grep $'create\tcontainer\t' "$EVIDENCE_DIR/calls")
+    rm -rf "$EVIDENCE_DIR"
+    return "$failed"
+}
+
 mkdir -p "$WORK/profile"
 profile_write "$WORK/profile/base.tsv"
 
@@ -1646,6 +1773,12 @@ mapping_snapshot_requires_ready'
 
 MAPPING_TLS_TESTS='upstream_evidence_volume_writable
 negative_injection_replaces_files
+evidence_volume_initialized_before_ev_mount
+evidence_volume_owner_is_10001
+evidence_volume_actual_write_required
+evidence_volume_wrong_owner_stops_start
+evidence_volume_readonly_stops_start
+evidence_helper_keeps_safe_options
 relay_transfers_both_directions
 relay_preserves_binary_payload
 proxy_ports_have_distinct_fifos
@@ -1672,9 +1805,17 @@ proxy_restart_preserves_other_port
 relay_timeout_and_term_reap_children
 proxy_repeated_connections_work'
 
+MAPPING_EVIDENCE_VOLUME_TESTS='evidence_volume_initialized_before_ev_mount
+evidence_volume_owner_is_10001
+evidence_volume_actual_write_required
+evidence_volume_wrong_owner_stops_start
+evidence_volume_readonly_stops_start
+evidence_helper_keeps_safe_options'
+
 case "${1:-all}" in
     network) TESTS=$MAPPING_NETWORK_TESTS ;;
     proxy-relay) TESTS=$MAPPING_PROXY_RELAY_TESTS ;;
+    evidence-volume) TESTS=$MAPPING_EVIDENCE_VOLUME_TESTS ;;
     tls-proxy) TESTS=$MAPPING_TLS_TESTS ;;
     all) TESTS="$MAPPING_NETWORK_TESTS
 $MAPPING_TLS_TESTS" ;;
