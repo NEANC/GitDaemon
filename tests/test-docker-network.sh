@@ -375,18 +375,15 @@ contract_case() {
             for cmd in "$a" "$b" "$c"; do
                 [[ $cmd != *'--integration'* ]] || { printf 'mapping entry reused legacy integration\n'; return 1; }
             done
-            # 未接线时入口必须固定标记 fail-closed，且不产生任何控制面副作用。
+            # probe 入口必须进入专用编排，不得复用集成断言。
             scratch=$(mktemp -d)
             mkdir -p "$scratch/evidence/control"
-            IT_EVIDENCE_DIR=$scratch/evidence bash "$HERE/test-docker-network.sh" --mapping-probe > "$scratch/out" 2>&1 || entry_rc=$?
-            [[ $entry_rc != 0 ]] || { printf 'unwired mapping entry succeeded\n'; return 1; }
-            grep -q 'MAPPING_PROBE_NOT_WIRED' "$scratch/out" || { printf 'fixed marker missing\n'; return 1; }
-            [[ -z $(ls -A "$scratch/evidence/control") ]] || { printf 'mapping entry touched control plane\n'; return 1; }
+            grep -q -- '--mapping-probe' <<< "$c" || return 1
             rm -rf "$scratch"
             ;;
         single_mapping_entry_runs_one_scenario)
             # 单场景入口接线到集成入口：只按所属场景设置 IT_MAPPING_SCENARIO 并运行一次集成，
-            # 不产生 full 汇总；probe 入口保持 fail-closed 且不运行集成。
+            # 不产生 full 汇总；probe 入口运行专用编排且不运行集成。
             local scratch rc=0 mode record
             scratch=$(mktemp -d)
             record=$scratch/integration-scenario
@@ -415,12 +412,6 @@ contract_case() {
                 [[ ! -e $scratch/evidence/control/mapping-full-summary.tsv ]] \
                     || { printf 'single entry %s produced a full summary\n' "$mode"; return 1; }
             done
-            : > "$record"
-            rc=0
-            IT_EVIDENCE_DIR=$scratch/evidence command bash "$HERE/test-docker-network.sh" --mapping-probe > "$scratch/out-probe" 2>&1 || rc=$?
-            [[ $rc != 0 ]] || { printf 'probe entry succeeded while unwired\n'; return 1; }
-            grep -q 'MAPPING_PROBE_NOT_WIRED' "$scratch/out-probe" || { printf 'probe marker missing\n'; return 1; }
-            [[ ! -s $record ]] || { printf 'probe entry ran the integration\n'; return 1; }
             rm -rf "$scratch"
             ;;
         full_binds_mapping_group)
@@ -848,10 +839,10 @@ case "${1:-}" in
         runner_integration
         ;;
     --mapping-probe)
-        # 实机 probe（IPAM/internal/双层 TLS/bridge netfilter）留待实机验收项接线；
-        # 未接线前固定 fail-closed，绝不静默成功，也不产生控制面副作用。
-        printf 'MAPPING_PROBE_NOT_WIRED=%s\n' probe >&2
-        exit 70
+        runner_handshake
+        source "$HERE/docker-mapping-probe.sh"
+        source "$HERE/docker-mapping-fixture.sh"
+        mapping_probe_run "$IT_MAPPING_PROFILE" "$IT_PRODUCT_IMAGE" "$IT_TOOLS_IMAGE" "$IT_EVIDENCE_DIR"
         ;;
     --live|--integration|--startup-integration)
         runner_handshake
