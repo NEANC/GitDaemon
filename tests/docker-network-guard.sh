@@ -351,18 +351,47 @@ guard_mapping_snapshot() {
     return 0
 }
 
+# 固定目录的设备号、inode 与规范路径，供 READY 状态写入各阶段复核。
+guard_mapping_directory_identity() {
+    local directory=$1 canonical device inode
+    [[ -d $directory && ! -L $directory ]] || return 1
+    canonical=$(readlink -f -- "$directory") || return 1
+    [[ $canonical == "$directory" ]] || return 1
+    read -r device inode < <(stat -Lc '%d %i' -- "$directory") || return 1
+    [[ -n $device && -n $inode ]] || return 1
+    printf '%s\t%s\t%s\n' "$device" "$inode" "$canonical"
+}
+
 guard_mapping_state_write() {
-    local state=$1 generation=$2 network_id=$3 profile_sha256=$4 temporary
+    local state=$1 generation=$2 network_id=$3 profile_sha256=$4 temporary parent generations runner_gid identity
+    parent=${state%/*}
+    generations=${parent%/*}
     ! mapping_path_is_symlink "$state" || return 80
-    temporary=$(mktemp "${state%/*}/.mapping-network.XXXXXXXX") || return 80
+    runner_gid=$(id -g "$RUNNER") || return 80
+    identity=$(guard_mapping_directory_identity "$generations") || return 80
+    chown -h "0:$runner_gid" "$generations" || return 80
+    chmod 1770 "$generations" || return 80
+    [[ $(guard_mapping_directory_identity "$generations") == "$identity" ]] || return 80
+    identity=$(guard_mapping_directory_identity "$parent") || return 80
+    chown -h "0:$runner_gid" "$parent" || return 80
+    chmod 750 "$parent" || return 80
+    [[ $(guard_mapping_directory_identity "$parent") == "$identity" ]] || return 80
+    temporary=$(mktemp "$parent/.mapping-network.XXXXXXXX") || return 80
     if ! printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$network_id" "$profile_sha256" > "$temporary"; then
         rm -f -- "$temporary"
         return 80
     fi
-    if mapping_path_is_symlink "$state" || ! mv -T -- "$temporary" "$state"; then
+    if [[ $(guard_mapping_directory_identity "$parent") != "$identity" ]] || mapping_path_is_symlink "$state" || ! mv -T -- "$temporary" "$state"; then
         rm -f -- "$temporary"
         return 80
     fi
+    if [[ $(guard_mapping_directory_identity "$parent") != "$identity" ]] || mapping_path_is_symlink "$state" || [[ ! -f $state ]]; then
+        return 80
+    fi
+    chown -h "0:$runner_gid" "$state" || return 80
+    chmod 640 "$state" || return 80
+    [[ $(guard_mapping_directory_identity "$parent") == "$identity" ]] || return 80
+    guard_gm test -r "$state" || return 80
     return 0
 }
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
@@ -407,7 +436,8 @@ guard_mapping_main() {
     mkdir -p "$E"
     chmod 755 "$E"
     mkdir "$E/control"
-    chown "$RUNNER" "$E/control"
+    chown "0:$(id -g "$RUNNER")" "$E/control"
+    chmod 1770 "$E/control"
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
     sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
     if [[ -d $source/.git ]]; then

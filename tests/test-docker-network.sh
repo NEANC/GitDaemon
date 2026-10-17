@@ -37,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf mapping_state_write_rejects_generation_parent_replacement mapping_state_is_runner_readonly_and_readable full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -521,6 +521,55 @@ STUB
             guard_mapping_state_write "$state" generation-1 net-1 profile >/dev/null 2>&1 || rc=$?
             [[ $rc == 80 ]] || return 1
             [[ $(cat "$outside") == unchanged ]] || return 1
+            rm -rf "$scratch"
+            ;;
+        # generation 父目录身份在收权后漂移时，必须在原子替换前拒绝。
+        mapping_state_write_rejects_generation_parent_replacement)
+            local scratch state count moves rc=0
+            scratch=$(mktemp -d)
+            state=$scratch/generations/generation-1/mapping-network.tsv
+            count=$scratch/stat-count
+            moves=$scratch/moves
+            mkdir -p "${state%/*}"
+            printf '0\n' > "$count"
+            RUNNER=gmtest
+            id() { printf '10001\n'; }
+            chown() { return 0; }
+            chmod() { return 0; }
+            stat() {
+                local current
+                current=$(cat "$count")
+                current=$((current + 1))
+                printf '%s\n' "$current" > "$count"
+                if (( current == 1 )); then printf '9 101\n'; else printf '9 202\n'; fi
+            }
+            mv() { printf 'mv\n' >> "$moves"; command mv "$@"; }
+            guard_mapping_state_write "$state" generation-1 net-1 profile >/dev/null 2>&1 || rc=$?
+            [[ $rc == 80 && ! -e $state && ! -e $moves ]] || return 1
+            rm -rf "$scratch"
+            ;;
+        # root 写入后的目录不可由 runner 替换，state 仅向 runner 提供只读访问。
+        mapping_state_is_runner_readonly_and_readable)
+            local scratch state permissions owners runner_calls rc=0
+            scratch=$(mktemp -d)
+            state=$scratch/generations/generation-1/mapping-network.tsv
+            permissions=$scratch/permissions
+            owners=$scratch/owners
+            runner_calls=$scratch/runner-calls
+            mkdir -p "${state%/*}"
+            RUNNER=gmtest
+            id() { printf '10001\n'; }
+            chown() { printf '%s\n' "$*" >> "$owners"; }
+            chmod() { printf '%s\n' "$*" >> "$permissions"; command chmod "$@"; }
+            guard_gm() { printf '%s\n' "$*" >> "$runner_calls"; [[ $1 == test && $2 == -r && -r $3 ]]; }
+            guard_mapping_state_write "$state" generation-1 net-1 profile >/dev/null 2>&1 || rc=$?
+            [[ $rc == 0 ]] || return 1
+            grep -Fqx -- "-h 0:10001 ${state%/*}" "$owners" || return 1
+            grep -Fqx -- "-h 0:10001 $state" "$owners" || return 1
+            grep -Fqx -- "750 ${state%/*}" "$permissions" || return 1
+            grep -Fqx -- "640 $state" "$permissions" || return 1
+            grep -Fqx -- "test -r $state" "$runner_calls" || return 1
+            [[ $(cat "$state") == $'generation\tgeneration-1\nnetwork_id\tnet-1\nprofile_sha256\tprofile' ]] || return 1
             rm -rf "$scratch"
             ;;
         full_dispatches_mapping_control)
