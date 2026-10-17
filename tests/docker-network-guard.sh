@@ -397,12 +397,13 @@ guard_mapping_state_write() {
 
 # 以 root 独占临时文件和不可覆盖硬链接原子发布 ACK。
 guard_mapping_ack_publish() {
-    local control=$1 identity=$2 ack_seq=$3 nonce=$4 generation=$5 target temporary
+    local control=$1 identity=$2 ack_seq=$3 nonce=$4 generation=$5 target temporary runner_gid
     target=$control/ack-$ack_seq
     [[ $(guard_mapping_directory_identity "$control") == "$identity" ]] || return 80
     [[ ! -e $target && ! -L $target ]] || return 80
+    runner_gid=$(id -g "$RUNNER") || return 80
     temporary=$(mktemp "$control/.ack-$ack_seq.XXXXXXXX") || return 80
-    if ! chown -h 0:0 "$temporary" || ! chmod 600 "$temporary" || ! printf '%s %s\n' "$nonce" "$generation" > "$temporary"; then
+    if ! chown -h "0:$runner_gid" "$temporary" || ! chmod 640 "$temporary" || ! printf '%s %s\n' "$nonce" "$generation" > "$temporary"; then
         rm -f -- "$temporary"
         return 80
     fi
@@ -412,6 +413,8 @@ guard_mapping_ack_publish() {
     fi
     rm -f -- "$temporary" || return 80
     [[ $(guard_mapping_directory_identity "$control") == "$identity" && -f $target && ! -L $target ]] || return 80
+    guard_gm test -r "$target" || return 80
+    guard_gm test ! -w "$target" || return 80
     return 0
 }
 
