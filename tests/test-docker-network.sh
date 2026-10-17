@@ -37,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf mapping_state_write_rejects_generation_parent_replacement mapping_state_is_runner_readonly_and_readable full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf mapping_state_write_rejects_generation_parent_replacement mapping_state_is_runner_readonly_and_readable full_dispatches_mapping_control full_mapping_ready_uses_safe_state_handler mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -578,6 +578,32 @@ STUB
             [[ $cmd == *'IT_CONTROL_DIR=/ev/control'* ]] || return 1
             [[ $cmd == *'RESOURCE_LEDGER_DIR=/ev/control/resources'* ]] || return 1
             [[ $cmd == *'IT_MAPPING=1'* ]] || return 1
+            ;;
+        full_mapping_ready_uses_safe_state_handler)
+            local scratch rc=0
+            scratch=$(mktemp -d)
+            FULL_READY_TRACE=$scratch/trace
+            RUN=fullrun E=$scratch/evidence RUNNER=gmtest
+            GUARD_MAPPING_STATE=PREPARING GUARD_MAPPING_LAST_GENERATION=''
+            MP_PROFILE_SHA256=profile
+            mkdir -p "$E/control"
+            guard_mapping_rules() { printf 'rules\n' >> "$FULL_READY_TRACE"; }
+            guard_mapping_state_write() { printf 'state %s %s %s %s\n' "$@" >> "$FULL_READY_TRACE"; }
+            mv() { printf 'ack\n' >> "$FULL_READY_TRACE"; command mv "$@"; }
+            export FULL_READY_TRACE
+            seq=1 last_nonce=''
+            guard_full_mapping_request mapping-ready generation-1 net-1 profile nonce-1 || rc=$?
+            [[ $rc == 0 ]] || return 1
+            [[ $(cat "$FULL_READY_TRACE") == $'rules\nstate '"$E/control/generations/generation-1/mapping-network.tsv"$' generation-1 net-1 profile\nack' ]] || return 1
+            [[ $GUARD_MAPPING_STATE == ACTIVE && ${rules_start:-} == 0 && -f $E/control/ack-1 ]] || return 1
+            : > "$FULL_READY_TRACE"
+            rm -rf "$E/control"
+            id() { printf '10001\n'; }
+            chown() { printf 'owner %s\n' "$*" >> "$FULL_READY_TRACE"; }
+            chmod() { printf 'mode %s\n' "$*" >> "$FULL_READY_TRACE"; }
+            guard_mapping_control_prepare || return 1
+            [[ $(cat "$FULL_READY_TRACE") == $'owner 0:10001 '"$E/control"$'\nmode 1770 '"$E/control" ]] || return 1
+            rm -rf "$scratch"
             ;;
         mapping_sequence_order_is_closed)
             local cmd rc=0

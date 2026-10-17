@@ -394,6 +394,53 @@ guard_mapping_state_write() {
     guard_gm test -r "$state" || return 80
     return 0
 }
+
+# 创建 root:runner 1770 控制根，供 runner 新建请求且不能替换其他主体的目录项。
+guard_mapping_control_prepare() {
+    local runner_gid
+    runner_gid=$(id -g "$RUNNER") || return 80
+    mkdir "$E/control" || return 80
+    chown "0:$runner_gid" "$E/control" || return 80
+    chmod 1770 "$E/control" || return 80
+}
+
+# 激活 READY：先迁移状态并安装规则，再通过安全写入器固化本代 network state。
+guard_mapping_ready_activate() {
+    local generation=$1 network_id=$2 profile_sha256=$3
+    guard_mapping_generation mapping-ready "$generation" "$network_id" "$profile_sha256" || return $?
+    rules_start=${#OWN_RULES[@]}
+    guard_mapping_rules "$GUARD_PROFILE" "$network_id" || return $?
+    IT_CONTROL_DIR=$E/control
+    state=$(MAPPING_ASSERT_GENERATION="$generation" mapping_network_state_file) || return 80
+    mkdir -p "${state%/*}" || return 80
+    guard_mapping_state_write "$state" "$generation" "$network_id" "$profile_sha256" || return $?
+    return 0
+}
+
+# 统一处理专用 mapping 与 full 的三类 mapping 控制请求，并在成功后写 ACK。
+guard_mapping_request_handle() {
+    local request=$1 generation=$2 network_id=$3 profile_sha256=$4 nonce=$5
+    [[ -n $nonce && $nonce != "$last_nonce" ]] || return 65
+    case "$request" in
+        mapping-ready) guard_mapping_ready_activate "$generation" "$network_id" "$profile_sha256" || return $? ;;
+        mapping-snapshot)
+            guard_mapping_generation "$request" "$generation" "$network_id" "$profile_sha256" || return $?
+            guard_mapping_snapshot "$seq" || return $?
+            ;;
+        mapping-release) guard_mapping_release "$generation" "$network_id" "$profile_sha256" "$rules_start" || return $? ;;
+        *) return 65 ;;
+    esac
+    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp" || return 80
+    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq" || return 80
+    last_nonce=$nonce
+    seq=$((seq + 1))
+    return 0
+}
+
+# full 控制循环只通过统一处理器分派 mapping 请求。
+guard_full_mapping_request() {
+    guard_mapping_request_handle "$@"
+}
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
 guard_mapping_main() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6 manifest=$7 attestation=$8 profile=$9
@@ -435,9 +482,7 @@ guard_mapping_main() {
     done
     mkdir -p "$E"
     chmod 755 "$E"
-    mkdir "$E/control"
-    chown "0:$(id -g "$RUNNER")" "$E/control"
-    chmod 1770 "$E/control"
+    guard_mapping_control_prepare || return $?
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
     sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
     if [[ -d $source/.git ]]; then
@@ -476,38 +521,11 @@ guard_mapping_main() {
         guard_signal_checkpoint
         if [[ -f $E/control/request-$seq ]]; then
             read -r request generation netid sha nonce < "$E/control/request-$seq"
-            [[ -n $nonce ]] || exit 65
-            [[ $nonce != "$last_nonce" ]] || exit 65
             case "$request" in
-                mapping-ready)
-                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
-                    rules_start=${#OWN_RULES[@]}
-                    guard_mapping_rules "$profile" "$netid" || exit $?
-                    IT_CONTROL_DIR=$E/control
-                    state=$(mapping_network_state_file) || exit 80
-                    mkdir -p "${state%/*}" || exit 80
-                    guard_mapping_state_write "$state" "$generation" "$netid" "$sha" || exit $?
-                    ready=1
-                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
-                    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
-                    last_nonce=$nonce
-                    seq=$((seq + 1))
-                    ;;
-                mapping-snapshot)
-                    guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
-                    guard_mapping_snapshot "$seq" || exit $?
-                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
-                    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
-                    last_nonce=$nonce
-                    seq=$((seq + 1))
-                    ;;
-                mapping-release)
-                    guard_mapping_release "$generation" "$netid" "$sha" "$rules_start" || exit $?
-                    ready=0
-                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
-                    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
-                    last_nonce=$nonce
-                    seq=$((seq + 1))
+                mapping-ready|mapping-snapshot|mapping-release)
+                    guard_mapping_request_handle "$request" "$generation" "$netid" "$sha" "$nonce" || exit $?
+                    [[ $request != mapping-ready ]] || ready=1
+                    [[ $request != mapping-release ]] || ready=0
                     ;;
                 *) exit 65 ;;
             esac
@@ -598,7 +616,11 @@ guard_main() {
     rules=$(iptables-save) || return $?
     for chain in "$CHAIN" "$EARLY" "$RETURN"; do if grep -w "$chain" <<< "$rules"; then return 70; fi; done
     mkdir -p "$E"; chmod 755 "$E"
-    mkdir "$E/control"; chown "$RUNNER" "$E/control"
+    if [[ $mode == full ]]; then
+        guard_mapping_control_prepare || return $?
+    else
+        mkdir "$E/control"; chown "$RUNNER" "$E/control"
+    fi
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
     sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
     if [[ -d $source/.git ]]; then
@@ -667,18 +689,7 @@ guard_main() {
             case "$request" in
                 mapping-ready|mapping-snapshot|mapping-release)
                     generation=$token
-                    [[ -n $nonce && $nonce != "$last_nonce" ]] || exit 65
-                    [[ $request == mapping-release ]] || guard_mapping_generation "$request" "$generation" "$netid" "$sha" || exit $?
-                    case "$request" in
-                        mapping-ready)
-                            rules_start=${#OWN_RULES[@]}
-                            guard_mapping_rules "$profile" "$netid" || exit $?
-                            ;;
-                        mapping-snapshot) guard_mapping_snapshot "$seq" || exit $? ;;
-                        mapping-release) guard_mapping_release "$generation" "$netid" "$sha" "$rules_start" || exit $? ;;
-                    esac
-                    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
-                    last_nonce=$nonce
+                    guard_full_mapping_request "$request" "$generation" "$netid" "$sha" "$nonce" || exit $?
                     ;;
                 witness)
                     [[ -n $token ]] || exit 65
@@ -699,9 +710,11 @@ guard_main() {
                     ;;
                 *) exit 65 ;;
             esac
-            [[ $request == mapping-* ]] || printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
-            mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
-            seq=$((seq + 1))
+            if [[ $request != mapping-* ]]; then
+                printf '%s\n' "$token" > "$E/control/ack-$seq.tmp"
+                mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"
+                seq=$((seq + 1))
+            fi
         fi
         sleep 0.1
     done
