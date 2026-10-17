@@ -4,6 +4,8 @@
 # 判定器不设替身，因此 DNS 假绿、缺计数、system 成功等样本必须被真实判定逻辑拒绝。
 set -Eeuo pipefail
 HERE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$HERE/docker-resource-ledger.sh"
+source "$HERE/docker-network-fixture.sh"
 source "$HERE/docker-mapping-fixture.sh"
 source "$HERE/docker-mapping-assertions.sh"
 source "$HERE/../scripts/git-mirror-sync.sh"
@@ -31,10 +33,12 @@ profile_write() {
 mkdir -p "$WORK"
 profile_write "$WORK/profile.tsv"
 MAPPING_PROFILE=$WORK/profile.tsv
+MAPPING_MANIFEST=$WORK/manifest.tsv
 MAPPING_PRODUCT_IMAGE=product
 MAPPING_TOOLS_IMAGE=tools
 MAPPING_ASSET_ROOT=$WORK/assets
-export MAPPING_PROFILE MAPPING_PRODUCT_IMAGE MAPPING_TOOLS_IMAGE MAPPING_ASSET_ROOT LOG_FILE
+printf 'manifest\n' > "$MAPPING_MANIFEST"
+export MAPPING_PROFILE MAPPING_MANIFEST MAPPING_PRODUCT_IMAGE MAPPING_TOOLS_IMAGE MAPPING_ASSET_ROOT LOG_FILE
 
 # 证据文件 samples 使用的可变字段。
 EV_UNIQUE=''
@@ -147,6 +151,7 @@ sa_doubles() {
         local dir=$3
         [[ ${D_FIXTURE_FAIL:-0} == 0 ]] || return 80
         mkdir -p "$dir/control" || return 80
+        printf 'inputs\n' > "$dir/inputs.sha256" || return 80
         printf 'network_id\t%s\n' "${D_NETWORK_ID:-netid-double}" > "$dir/control/mapping-network.tsv"
         # 负例缺陷选择走真实逻辑，只有证书替换/额外网络边界被替换。
         mapping_negative_prepare "$1" "$2" "$dir" || return 80
@@ -179,6 +184,7 @@ sa_doubles() {
         printf '%s\n' "${D_UNIQUE:-}" > "$3/control/unique-commit"
         printf '%s\n' "${D_UNIQUE:-}"
     }
+    mapping_network_id_load() { printf '%s\n' "${D_NETWORK_ID:-netid-double}"; }
     mapping_scenario_upstream_refs() { printf '%s\n' "${D_REFS_EXPECTED:-}"; }
     mapping_scenario_upstream_head() { printf '%s\n' "${D_HEAD_EXPECTED:-}"; }
     mapping_scenario_sync_exec() {
@@ -207,6 +213,7 @@ sa_doubles() {
         printf '%s\tAAAA\tNXDOMAIN\n' "$MAPPING_UPSTREAM_HOST"
         printf '%s\tA\t%s\n' "$MAPPING_PROXY_HOST" "$proxy"
     }
+    mapping_dns_set() { return 0; }
     if [[ $keep_release != 1 ]]; then
         mapping_scenario_release() { return 0; }
     fi
@@ -533,15 +540,20 @@ sa_negative_overrides() {
             ;;
         dns-false-green)
             D_SYNC_EXIT=0
-            # 映射成功文案齐全，唯一缺陷是被造假的 DNS 状态；判定器必须因 dns.txt 本身拒绝。
-            D_LOG=$'同步传输路径：直连加动态地址映射\n'
+            D_LOG=$'传输失败：直连加动态地址映射；尝试下一路径\n同步传输路径：直连系统 DNS\n'
             ;;
         unreachable-map-system)
             D_SYNC_EXIT=0
             D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n传输失败：直连加动态地址映射；尝试下一路径\n同步传输路径：直连系统 DNS\n'
             ;;
-        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san)
+        wrong_proxy_ca|wrong_proxy_san)
             D_SYNC_EXIT=1
+            D_ACCEPT_AFTER=$D_ACCEPT_BEFORE D_REJECT_AFTER=$D_REJECT_BEFORE
+            D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n传输失败：直连加动态地址映射；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
+            ;;
+        wrong_upstream_ca|wrong_upstream_san)
+            D_SYNC_EXIT=1
+            D_ACCEPT_AFTER=$((D_ACCEPT_BEFORE + 1)) D_REJECT_AFTER=$D_REJECT_BEFORE
             D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n传输失败：直连加动态地址映射；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
             ;;
         isolation)
@@ -827,9 +839,12 @@ scenario_repeated_run_succeeds() {
     rs_install
     sa_doubles 1
     sa_lifecycle_defaults fallback
+    resource_cleanup_scenario() { : > "$RS_STORE"; }
+    mapping_control_request() { return 0; }
     mapping_scenario_fixture_prepare() {
         local kind=$1 scenario=$2 dir=$3 ledger=$dir/control/resources
         mkdir -p "$dir/control" || return 80
+        printf 'inputs\n' > "$dir/inputs.sha256" || return 80
         mapping_network_create "$MAPPING_PROFILE" "$ledger" >/dev/null || return 80
         RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
         resource_create_register container "$kind" upstream -- \

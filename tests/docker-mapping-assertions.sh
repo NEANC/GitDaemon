@@ -442,6 +442,12 @@ mapping_scenario_product_up() {
 mapping_scenario_apply_negative() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} product=${4:-}
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    case "${MAPPING_ASSERT_CASE:-}" in
+        wrong_proxy_ca) mapping_negative_wrong_ca proxy-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
+        wrong_proxy_san) MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san proxy || return "$MAPPING_ASSERT_FIXTURE" ;;
+        wrong_upstream_ca) mapping_negative_wrong_ca upstream-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
+        wrong_upstream_san) MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san upstream || return "$MAPPING_ASSERT_FIXTURE" ;;
+    esac
     mapping_negative_apply "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
 }
@@ -514,17 +520,43 @@ mapping_scenario_local_fsck() {
     return 0
 }
 
+# 解析单次 dig 原始证据：命令失败、缺 SERVER、SERVFAIL、NODATA 都是夹具失败。
+mapping_dns_query() {
+    local client=${1:-} resolver=${2:-} name=${3:-} rrtype=${4:-} raw=${5:-} dig_rc=${6:-0}
+    local status server answer
+    [[ -n $client && -n $resolver && -n $name && $rrtype =~ ^(A|AAAA)$ && -f $raw && ! -L $raw ]] \
+        || return "$MAPPING_ASSERT_FIXTURE"
+    [[ $dig_rc == 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
+    status=$(sed -n 's/.*status: \([A-Z][A-Z]*\),.*/\1/p' "$raw" | head -n 1)
+    server=$(sed -n 's/^;; SERVER: \([^#[:space:]]*\).*/\1/p' "$raw" | head -n 1)
+    answer=$(sed -n 's/.*ANSWER: \([0-9][0-9]*\).*/\1/p' "$raw" | head -n 1)
+    [[ -n $status && -n $server ]] || return "$MAPPING_ASSERT_FIXTURE"
+    case "$status" in
+        NXDOMAIN) printf '%s\t%s\tNXDOMAIN\n' "$name" "$rrtype" ;;
+        NOERROR)
+            [[ ${answer:-0} -gt 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
+            awk -v name="$name" -v type="$rrtype" '$4 == type { print name "\t" type "\t" $5; found=1 } END { if (!found) exit 1 }' "$raw" \
+                || return "$MAPPING_ASSERT_FIXTURE"
+            ;;
+        *) return "$MAPPING_ASSERT_FIXTURE" ;;
+    esac
+    return 0
+}
+
 # 受控 DNS 状态取证：github.com 必须 NXDOMAIN（证明成功不依赖系统 DNS），gm-proxy 指向 X。
 mapping_scenario_dns_state() {
-    local kind=${1:-} scenario=${2:-} dir=${3:-} gh4 gh6 proxy
+    local kind=${1:-} scenario=${2:-} dir=${3:-} spec name type raw rc
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
-    gh4=$(mapping_fixture_docker exec "$(mapping_dns_container)" dig +short +time=1 +tries=1 github.com A 2>/dev/null) || gh4=''
-    gh6=$(mapping_fixture_docker exec "$(mapping_dns_container)" dig +short +time=1 +tries=1 github.com AAAA 2>/dev/null) || gh6=''
-    proxy=$(mapping_fixture_docker exec "$(mapping_dns_container)" dig +short +time=1 +tries=1 "$MAPPING_PROXY_HOST" A 2>/dev/null) || proxy=''
-    printf 'github.com\tA\t%s\n' "${gh4:-NXDOMAIN}"
-    printf 'github.com\tAAAA\t%s\n' "${gh6:-NXDOMAIN}"
-    printf '%s\tA\t%s\n' "$MAPPING_PROXY_HOST" "$proxy"
+    for spec in 'github.com A' 'github.com AAAA' "$MAPPING_PROXY_HOST A"; do
+        read -r name type <<< "$spec"
+        raw=$dir/dig-$name-$type.txt
+        rc=0
+        mapping_fixture_docker exec "${MAPPING_ASSERT_PRODUCT:-$(mapping_dns_container)}" \
+            dig +time=1 +tries=1 "@$MP_D" "$name" "$type" > "$raw" 2>&1 || rc=$?
+        mapping_dns_query "${MAPPING_ASSERT_PRODUCT:-dns}" "$MP_D" "$name" "$type" "$raw" "$rc" \
+            || return "$MAPPING_ASSERT_FIXTURE"
+    done
     return 0
 }
 
@@ -535,6 +567,7 @@ mapping_scenario_dns_restore() {
     MAPPING_DNS_FAKE_HOST=''
     MAPPING_DNS_FAKE_IP=''
     [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_dns_set nxdomain "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     file=$dir/dns.restore
     mapping_scenario_dns_state "$kind" "$scenario" "$dir" > "$file" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_assert_dns_file "$file" || rc="$MAPPING_ASSERT_FAIL"
@@ -618,8 +651,8 @@ mapping_scenario_identity_write() {
     [[ -n $image && -n $profile_sha ]] || return "$MAPPING_ASSERT_FIXTURE"
     unique=$(sed -n '1p' "$dir/control/unique-commit" 2>/dev/null) || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n $unique ]] || return "$MAPPING_ASSERT_FIXTURE"
-    input_sha=$(mapping_scenario_hash_of "$dir/inputs.sha256") || input_sha=$profile_sha
-    manifest_sha=$(mapping_scenario_hash_of "${MAPPING_MANIFEST:-}") || manifest_sha=$profile_sha
+    input_sha=$(mapping_scenario_hash_of "$dir/inputs.sha256") || return "$MAPPING_ASSERT_FIXTURE"
+    manifest_sha=$(mapping_scenario_hash_of "${MAPPING_MANIFEST:-}") || return "$MAPPING_ASSERT_FIXTURE"
     file=$dir/identity.tsv
     {
         printf 'run_id\t%s\n' "$MP_RUN_ID"
@@ -670,6 +703,11 @@ mapping_scenario_evidence() {
     mapping_scenario_apply_negative "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_sync_exec "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_proxy_after "$kind" "$scenario" "$dir" > "$dir/proxy.after" || return "$MAPPING_ASSERT_FIXTURE"
+    case "${MAPPING_ASSERT_CASE:-}" in
+        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san)
+            mapping_tls_layer_write "$MAPPING_ASSERT_CASE" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+            ;;
+    esac
     mapping_scenario_upstream_count "$kind" "$scenario" "$dir" > "$dir/upstream.after" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.log" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_local_refs "$kind" "$scenario" "$dir" > "$dir/refs.actual" || return "$MAPPING_ASSERT_FIXTURE"
@@ -713,7 +751,8 @@ mapping_scenario_run() {
 # 同时把被拒层次写入 MAPPING_ASSERT_REJECT_LAYER：sync 为底层同步层，mapping 为映射判定层，
 # policy 为配置审计层。
 mapping_negative_rejected() {
-    local case_name=${1:-} kind=${2:-} dir=${3:-}
+    local case_name=${1:-} kind=${2:-} dir=${3:-} sync_exit system_line
+    [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     case "$case_name" in
         isolation)
             MAPPING_ASSERT_REJECT_LAYER=''
@@ -723,7 +762,23 @@ mapping_negative_rejected() {
             MAPPING_ASSERT_REJECT_LAYER=policy
             return 0
             ;;
+        dns-false-green)
+            mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+            sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return "$MAPPING_ASSERT_FIXTURE"
+            [[ $sync_exit == 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
+            system_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_SYSTEM")
+            [[ -n $system_line ]] || return "$MAPPING_ASSERT_FIXTURE"
+            if mapping_assert_result "$kind" "$dir"; then return 1; fi
+            return 0
+            ;;
+        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san)
+            mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+            mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return "$MAPPING_ASSERT_FIXTURE"
+            if mapping_assert_result "$kind" "$dir"; then return 1; fi
+            return 0
+            ;;
         *)
+            mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             if mapping_assert_result "$kind" "$dir"; then return 1; fi
             return 0
             ;;
@@ -778,14 +833,7 @@ mapping_negative_prepare() {
         invalid-map) MAPPING_ASSERT_SNAPSHOT_MODE=reserved ;;
         dns-false-green) MAPPING_ASSERT_SNAPSHOT_MODE=none MAPPING_ASSERT_DNS_MODE=upstream ;;
         unreachable-map-system) MAPPING_ASSERT_SNAPSHOT_MODE=unallocated MAPPING_ASSERT_DNS_MODE=upstream ;;
-        wrong_proxy_ca) MAPPING_ASSERT_SNAPSHOT_MODE=valid
-            mapping_negative_wrong_ca proxy-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
-        wrong_proxy_san) MAPPING_ASSERT_SNAPSHOT_MODE=valid
-            MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san proxy || return "$MAPPING_ASSERT_FIXTURE" ;;
-        wrong_upstream_ca) MAPPING_ASSERT_SNAPSHOT_MODE=valid
-            mapping_negative_wrong_ca upstream-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
-        wrong_upstream_san) MAPPING_ASSERT_SNAPSHOT_MODE=valid
-            MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san upstream || return "$MAPPING_ASSERT_FIXTURE" ;;
+        wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
         isolation) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
         *) return "$MAPPING_ASSERT_FIXTURE" ;;
     esac
@@ -795,6 +843,54 @@ mapping_negative_prepare() {
         MAPPING_DNS_FAKE_IP=$MP_U
     fi
     return 0
+}
+
+# 写入 TLS 失败层证据：代理证书错误不得产生 CONNECT，上游证书错误必须已有 CONNECT。
+mapping_tls_layer_write() {
+    local case_name=${1:-} dir=${2:-} before after request_exit layer expected
+    [[ -n $case_name && -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    before=$(mapping_proxy_baseline_total "$dir/proxy.before") || return "$MAPPING_ASSERT_FIXTURE"
+    after=$(mapping_proxy_baseline_total "$dir/proxy.after") || return "$MAPPING_ASSERT_FIXTURE"
+    request_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return "$MAPPING_ASSERT_FIXTURE"
+    (( request_exit != 0 )) || return "$MAPPING_ASSERT_FIXTURE"
+    layer=$(mapping_proxy_layer_verdict "$before" "$after" "$request_exit") || return "$MAPPING_ASSERT_FIXTURE"
+    case "$case_name" in
+        wrong_proxy_ca|wrong_proxy_san) expected=outer-failure ;;
+        wrong_upstream_ca|wrong_upstream_san) expected=inner-failure ;;
+        *) return "$MAPPING_ASSERT_FIXTURE" ;;
+    esac
+    [[ $layer == "$expected" ]] || return "$MAPPING_ASSERT_FIXTURE"
+    {
+        printf 'case\t%s\n' "$case_name"
+        printf 'layer\t%s\n' "$layer"
+        printf 'connect_delta\t%s\n' "$((after - before))"
+        printf 'request_exit\t%s\n' "$request_exit"
+    } > "$dir/tls-layer.tsv.tmp" || return "$MAPPING_ASSERT_FIXTURE"
+    mv -- "$dir/tls-layer.tsv.tmp" "$dir/tls-layer.tsv" || return "$MAPPING_ASSERT_FIXTURE"
+    return 0
+}
+
+# 严格验收 TLS 分层证据，拒绝缺项、重复项、未知项和错误的 CONNECT 增量。
+mapping_tls_layer_accept() {
+    local case_name=${1:-} file=${2:-} key value
+    local seen_case='' seen_layer='' seen_delta='' seen_exit=''
+    [[ -n $case_name && -f $file && ! -L $file && -r $file ]] || return 1
+    while IFS=$'\t' read -r key value || [[ -n $key ]]; do
+        [[ -n $key && -n $value ]] || return 1
+        case "$key" in
+            case) [[ -z $seen_case ]] || return 1; seen_case=$value ;;
+            layer) [[ -z $seen_layer ]] || return 1; seen_layer=$value ;;
+            connect_delta) [[ -z $seen_delta ]] || return 1; seen_delta=$value ;;
+            request_exit) [[ -z $seen_exit ]] || return 1; seen_exit=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ $seen_case == "$case_name" && $seen_exit =~ ^[1-9][0-9]*$ && $seen_delta =~ ^[0-9]+$ ]] || return 1
+    case "$case_name" in
+        wrong_proxy_ca|wrong_proxy_san) [[ $seen_layer == outer-failure && $seen_delta == 0 ]] ;;
+        wrong_upstream_ca|wrong_upstream_san) [[ $seen_layer == inner-failure && $seen_delta -gt 0 ]] ;;
+        *) return 1 ;;
+    esac
 }
 
 # 负例默认缺陷：产品运行后施加的缺陷（额外网络附件）。
