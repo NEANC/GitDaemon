@@ -1030,7 +1030,7 @@ proxy_accept_dials_frozen_u() {
     dir=$(mktemp -d)
     printf '0\n' > "$dir/accept.count"
     : > "$dir/dials"
-    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_tls_start() { MAPPING_PROXY_CONNECTION_LIMIT=1; exec 3>"$dir/replies"; }
     mapping_proxy_dial() { printf '%s:%s\n' "$1" "$2" >> "$dir/dials"; return 0; }
     mapping_proxy_relay() { return 0; }
     printf 'CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n' \
@@ -1061,7 +1061,7 @@ proxy_reject_never_dials() {
     printf '0\n' > "$dir/reject.count"
     printf '0\n' > "$dir/accept.count"
     : > "$dir/dials"
-    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_tls_start() { MAPPING_PROXY_CONNECTION_LIMIT=1; exec 3>"$dir/replies"; }
     mapping_proxy_dial() { printf '%s:%s\n' "$1" "$2" >> "$dir/dials"; return 0; }
     mapping_proxy_relay() { return 0; }
     printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
@@ -1089,7 +1089,7 @@ proxy_other_authority_never_dials() {
     local dir failed=0 rc=0 spec mode port target
     dir=$(mktemp -d)
     : > "$dir/dials"
-    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_tls_start() { MAPPING_PROXY_CONNECTION_LIMIT=1; exec 3>"$dir/replies"; }
     mapping_proxy_dial() { printf '%s:%s\n' "$1" "$2" >> "$dir/dials"; return 0; }
     mapping_proxy_relay() { return 0; }
     for spec in \
@@ -1119,7 +1119,7 @@ proxy_other_authority_never_dials() {
 proxy_bad_count_fails() {
     local dir failed=0 rc=0 scenario_dir
     dir=$(mktemp -d)
-    mapping_proxy_tls_start() { exec 3>"$dir/replies"; }
+    mapping_proxy_tls_start() { MAPPING_PROXY_CONNECTION_LIMIT=1; exec 3>"$dir/replies"; }
     mapping_proxy_dial() { return 0; }
     mapping_proxy_relay() { return 0; }
     printf 'not-a-number\n' > "$dir/accept.count"
@@ -1400,6 +1400,227 @@ wrong_upstream_san() {
     tls_negative_case inner-failure 1 60
 }
 
+# 通过真实 TCP 套接字运行中继并逐字节核对两个方向。
+relay_round_trip() {
+    local client_file=$1 server_file=$2 dir port server_pid rc=0
+    dir=$(mktemp -d)
+    python - "$dir/port" "$dir/upstream" "$client_file" "$server_file" <<'PY' &
+import pathlib
+import socket
+import sys
+
+port_file, received_file, client_file, server_file = map(pathlib.Path, sys.argv[1:])
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+port_file.write_text(str(listener.getsockname()[1]), encoding="ascii")
+connection, _ = listener.accept()
+received = bytearray()
+while True:
+    chunk = connection.recv(3)
+    if not chunk:
+        break
+    received.extend(chunk)
+received_file.write_bytes(received)
+payload = server_file.read_bytes()
+for offset in range(0, len(payload), 2):
+    connection.sendall(payload[offset:offset + 2])
+connection.shutdown(socket.SHUT_WR)
+connection.close()
+listener.close()
+PY
+    server_pid=$!
+    for _ in {1..100}; do
+        [[ ! -s $dir/port ]] || break
+        sleep 0.02
+    done
+    port=$(cat "$dir/port") || return 1
+    (
+        coproc perl -MIO::Socket::INET -e '
+            $socket = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $ARGV[0], Proto => "tcp") or exit 1;
+            while (read(STDIN, $chunk, 3)) { print {$socket} $chunk or exit 1; }
+            shutdown($socket, 1) or exit 1;
+            while (read($socket, $chunk, 3)) { print STDOUT $chunk or exit 1; }
+            close($socket) or exit 1;
+        ' "$port"
+        MAPPING_PROXY_DIAL_PID=$COPROC_PID
+        coproc_in=${COPROC[1]}
+        coproc_out=${COPROC[0]}
+        exec 4>&"$coproc_in" 5<&"$coproc_out"
+        exec {coproc_in}>&- {coproc_out}<&-
+        MAPPING_PROXY_RELAY_TIMEOUT=2 mapping_proxy_relay < "$client_file" 3> "$dir/client"
+    ) || rc=$?
+    wait "$server_pid" || rc=1
+    cmp "$client_file" "$dir/upstream" || rc=1
+    cmp "$server_file" "$dir/client" || rc=1
+    rm -rf "$dir"
+    return "$rc"
+}
+
+# 双向中继在一侧发送结束后仍接收另一侧响应。
+relay_transfers_both_directions() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    printf 'client-request-in-parts' > "$dir/client"
+    printf 'server-response-in-parts' > "$dir/server"
+    relay_round_trip "$dir/client" "$dir/server" || rc=$?
+    rm -rf "$dir"
+    return "$rc"
+}
+
+# 双向中继不经 Shell 变量传递二进制载荷。
+relay_preserves_binary_payload() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    printf 'client\000one\377two\000tail' > "$dir/client"
+    printf 'server\000three\376four\000tail' > "$dir/server"
+    relay_round_trip "$dir/client" "$dir/server" || rc=$?
+    rm -rf "$dir"
+    return "$rc"
+}
+
+# 两个代理端口使用各自运行目录和 FIFO。
+proxy_ports_have_distinct_fifos() {
+    local dir failed=0
+    dir=$(mktemp -d)
+    mapping_proxy_tls_start() {
+        mkdir -p "$MAPPING_PROXY_RUNTIME_DIR"
+        : > "$MAPPING_PROXY_RUNTIME_DIR/in"
+        : > "$MAPPING_PROXY_RUNTIME_DIR/out"
+        printf '%s\n' "$MAPPING_PROXY_RUNTIME_DIR" >> "$dir/runtime-dirs"
+        exec 3>"$dir/replies"
+    }
+    mapping_proxy_tls_stop() { exec 3>&-; }
+    mapping_proxy_dial() { return 0; }
+    mapping_proxy_relay() { return 0; }
+    MAPPING_PROXY_ONCE=1 printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | MAPPING_PROXY_ONCE=1 mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" 140.82.112.11 accept || failed=1
+    MAPPING_PROXY_ONCE=1 printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | MAPPING_PROXY_ONCE=1 mapping_proxy_serve 8444 "$dir/cert" "$dir/key" "$dir/reject.count" 140.82.112.11 reject || failed=1
+    grep -Fxq "$dir/rt/8443" "$dir/runtime-dirs" || failed=1
+    grep -Fxq "$dir/rt/8444" "$dir/runtime-dirs" || failed=1
+    [[ -e $dir/rt/8443/in && -e $dir/rt/8444/in ]] || failed=1
+    rm -rf "$dir"
+    return "$failed"
+}
+
+# 重启一个端口时不删除另一个端口的运行状态。
+proxy_restart_preserves_other_port() {
+    local dir failed=0
+    dir=$(mktemp -d)
+    mkdir -p "$dir/rt/8444"
+    printf 'keep\n' > "$dir/rt/8444/in"
+    mapping_proxy_tls_start() {
+        mkdir -p "$MAPPING_PROXY_RUNTIME_DIR"
+        rm -f "$MAPPING_PROXY_RUNTIME_DIR/in" "$MAPPING_PROXY_RUNTIME_DIR/out"
+        : > "$MAPPING_PROXY_RUNTIME_DIR/in"
+        : > "$MAPPING_PROXY_RUNTIME_DIR/out"
+        exec 3>"$dir/replies"
+    }
+    mapping_proxy_dial() { return 0; }
+    mapping_proxy_relay() { return 0; }
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\n' \
+        | MAPPING_PROXY_ONCE=1 mapping_proxy_serve 8443 "$dir/cert" "$dir/key" "$dir/accept.count" 140.82.112.11 accept || failed=1
+    [[ $(cat "$dir/rt/8444/in") == keep ]] || failed=1
+    rm -rf "$dir"
+    return "$failed"
+}
+
+# 中继超时后回收两个方向的泵进程和连接描述符。
+relay_timeout_and_term_reap_children() {
+    local dir port server_pid rc=0
+    dir=$(mktemp -d)
+    python - "$dir/port" <<'PY' &
+import pathlib
+import socket
+import sys
+import time
+
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+pathlib.Path(sys.argv[1]).write_text(str(listener.getsockname()[1]), encoding="ascii")
+connection, _ = listener.accept()
+time.sleep(3)
+connection.close()
+listener.close()
+PY
+    server_pid=$!
+    for _ in {1..100}; do [[ ! -s $dir/port ]] || break; sleep 0.02; done
+    port=$(cat "$dir/port") || return 1
+    (
+        coproc perl -MIO::Socket::INET -e '$socket = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $ARGV[0], Proto => "tcp") or exit 1; sleep 3; close($socket)' "$port"
+        MAPPING_PROXY_DIAL_PID=$COPROC_PID
+        coproc_in=${COPROC[1]}
+        coproc_out=${COPROC[0]}
+        exec 4>&"$coproc_in" 5<&"$coproc_out"
+        exec {coproc_in}>&- {coproc_out}<&-
+        MAPPING_PROXY_RELAY_TIMEOUT=1 mapping_proxy_relay </dev/null 3>"$dir/out"
+    ) && rc=1 || [[ $? == 80 ]] || rc=1
+    wait "$server_pid" || true
+    [[ -z $(jobs -pr) ]] || rc=1
+    rm -rf "$dir"
+    return "$rc"
+}
+
+# 同一端口连续处理连接时分别计数且保持响应。
+proxy_repeated_connections_work() {
+    local dir failed=0 upstream_port upstream_pid connection=0
+    dir=$(mktemp -d)
+    python - "$dir/upstream-port" "$dir/upstream-requests" <<'PY' &
+import pathlib
+import socket
+import sys
+
+port_file = pathlib.Path(sys.argv[1])
+requests_file = pathlib.Path(sys.argv[2])
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(2)
+port_file.write_text(str(listener.getsockname()[1]), encoding="ascii")
+with requests_file.open("wb") as output:
+    for attempt in range(2):
+        connection, _ = listener.accept()
+        payload = connection.recv(5)
+        output.write(payload + b"\n")
+        connection.sendall(b"reply" + str(attempt + 1).encode("ascii"))
+        connection.shutdown(socket.SHUT_WR)
+        connection.close()
+listener.close()
+PY
+    upstream_pid=$!
+    for _ in {1..100}; do [[ ! -s $dir/upstream-port ]] || break; sleep 0.02; done
+    upstream_port=$(cat "$dir/upstream-port") || return 1
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\nreq1' > "$dir/request-1"
+    printf 'CONNECT github.com:443 HTTP/1.1\r\n\r\nreq2' > "$dir/request-2"
+    mapping_proxy_tls_start() {
+        connection=$((connection + 1))
+        exec 0<"$dir/request-$connection"
+        exec 3>"$dir/client-$connection"
+    }
+    mapping_proxy_tls_stop() { exec 3>&- 0<&-; }
+    mapping_proxy_dial() {
+        exec 4<>"/dev/tcp/127.0.0.1/$upstream_port"
+        exec 5<&4
+    }
+    MAPPING_PROXY_CONNECTION_LIMIT=2 mapping_proxy_serve 8443 "$dir/cert" "$dir/key" \
+        "$dir/accept.count" 140.82.112.11 accept || failed=1
+    wait "$upstream_pid" || failed=1
+    [[ $(cat "$dir/accept.count") == 2 ]] || failed=1
+    cmp -s "$dir/upstream-requests" <(printf 'req1\nreq2\n') || failed=1
+    grep -q 'reply1' "$dir/client-1" || failed=1
+    grep -q 'reply2' "$dir/client-2" || failed=1
+    if [[ $failed != 0 ]]; then
+        printf 'REAL_PROXY count=%s requests=%q client1=%q client2=%q\n' \
+            "$(cat "$dir/accept.count" 2>/dev/null || printf missing)" \
+            "$(cat "$dir/upstream-requests" 2>/dev/null || true)" \
+            "$(cat "$dir/client-1" 2>/dev/null || true)" \
+            "$(cat "$dir/client-2" 2>/dev/null || true)"
+    fi
+    rm -rf "$dir"
+    return "$failed"
+}
+
 mkdir -p "$WORK/profile"
 profile_write "$WORK/profile/base.tsv"
 
@@ -1425,6 +1646,12 @@ mapping_snapshot_requires_ready'
 
 MAPPING_TLS_TESTS='upstream_evidence_volume_writable
 negative_injection_replaces_files
+relay_transfers_both_directions
+relay_preserves_binary_payload
+proxy_ports_have_distinct_fifos
+proxy_restart_preserves_other_port
+relay_timeout_and_term_reap_children
+proxy_repeated_connections_work
 proxy_accept_dials_frozen_u
 proxy_reject_never_dials
 proxy_other_authority_never_dials
@@ -1438,8 +1665,16 @@ wrong_proxy_san
 wrong_upstream_ca
 wrong_upstream_san'
 
+MAPPING_PROXY_RELAY_TESTS='relay_transfers_both_directions
+relay_preserves_binary_payload
+proxy_ports_have_distinct_fifos
+proxy_restart_preserves_other_port
+relay_timeout_and_term_reap_children
+proxy_repeated_connections_work'
+
 case "${1:-all}" in
     network) TESTS=$MAPPING_NETWORK_TESTS ;;
+    proxy-relay) TESTS=$MAPPING_PROXY_RELAY_TESTS ;;
     tls-proxy) TESTS=$MAPPING_TLS_TESTS ;;
     all) TESTS="$MAPPING_NETWORK_TESTS
 $MAPPING_TLS_TESTS" ;;

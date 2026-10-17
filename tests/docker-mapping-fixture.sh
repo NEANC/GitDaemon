@@ -716,15 +716,58 @@ mapping_proxy_reply() {
 
 # 拨号边界：只接受字面量地址，直接连冻结 U:443，不解析 CONNECT 目标主机名。
 mapping_proxy_dial() {
-    local ip=${1:-} port=${2:-}
+    local ip=${1:-} port=${2:-} coproc_in coproc_out
     mapping_proxy_upstream_literal "$ip" || return 1
     [[ $port == "$MAPPING_UPSTREAM_PORT" ]] || return 1
-    exec 4<>"/dev/tcp/$ip/$port"
+    coproc { timeout 60 busybox nc -q 60 "$ip" "$port"; }
+    MAPPING_PROXY_DIAL_PID=$COPROC_PID
+    coproc_in=${COPROC[1]}
+    coproc_out=${COPROC[0]}
+    exec 4>&"$coproc_in" 5<&"$coproc_out"
+    exec {coproc_in}>&- {coproc_out}<&-
 }
 
 # 中继边界：内层 TLS 不终结，仅透传字节。
 mapping_proxy_relay() {
-    timeout 60 cat <&4 >&3
+    local relay_timeout=${MAPPING_PROXY_RELAY_TIMEOUT:-60} upload_pid download_pid dial_pid=${MAPPING_PROXY_DIAL_PID:-} completed='' first_rc=0 second_rc=0 interrupted=0
+    [[ $relay_timeout =~ ^[1-9][0-9]*$ ]] || return "$MAPPING_FAILURE"
+    timeout "$relay_timeout" cat <&0 >&4 &
+    upload_pid=$!
+    timeout "$relay_timeout" cat <&5 >&3 &
+    download_pid=$!
+    trap 'interrupted=1; kill -TERM "$upload_pid" "$download_pid" ${dial_pid:-} 2>/dev/null || true' TERM INT HUP
+    wait -n -p completed "$upload_pid" "$download_pid" || first_rc=$?
+    if [[ $completed == "$download_pid" ]]; then
+        kill -TERM "$upload_pid" 2>/dev/null || true
+        wait "$upload_pid" 2>/dev/null || true
+    else
+        exec 4>&-
+        wait "$download_pid" || second_rc=$?
+    fi
+    trap - TERM INT HUP
+    kill -TERM "$upload_pid" "$download_pid" 2>/dev/null || true
+    wait "$upload_pid" 2>/dev/null || true
+    wait "$download_pid" 2>/dev/null || true
+    exec 4>&- 5<&- 3>&-
+    if [[ $dial_pid =~ ^[1-9][0-9]*$ ]]; then
+        wait "$dial_pid" 2>/dev/null || true
+    fi
+    MAPPING_PROXY_DIAL_PID=''
+    (( interrupted == 0 && first_rc == 0 && second_rc == 0 )) || return "$MAPPING_FAILURE"
+    return 0
+}
+
+# 回收当前端口的单连接 TLS 子进程与 FIFO。
+mapping_proxy_tls_stop() {
+    local dir=${MAPPING_PROXY_RUNTIME_DIR:-} pid=${MAPPING_PROXY_TLS_PID:-}
+    exec 3>&- 0<&-
+    if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+    MAPPING_PROXY_TLS_PID=''
+    [[ -z $dir ]] || rm -f "$dir/in" "$dir/out"
+    return 0
 }
 
 # TLS 接受边界：openssl s_server 终结外层 TLS，请求走 fd 0、响应走 fd 3。
@@ -738,7 +781,7 @@ mapping_proxy_tls_start() {
     mkfifo "$dir/in" "$dir/out" || return 1
     in_fifo=$dir/in
     out_fifo=$dir/out
-    openssl s_server -quiet -accept "$port" -cert "$cert" -key "$key" <"$in_fifo" >"$out_fifo" 2>/dev/null &
+    openssl s_server -quiet -naccept 1 -accept "$port" -cert "$cert" -key "$key" <"$in_fifo" >"$out_fifo" 2>/dev/null &
     MAPPING_PROXY_TLS_PID=$!
     exec 3>"$in_fifo"
     exec 0<"$out_fifo"
@@ -758,7 +801,7 @@ mapping_proxy_loop() {
             CONNECT\ *) ;;
             *)
                 mapping_proxy_reply 405 || return "$MAPPING_FAILURE"
-                continue
+                return 0
                 ;;
         esac
         target=${line#CONNECT }
@@ -768,20 +811,21 @@ mapping_proxy_loop() {
         if [[ $target != "$MAPPING_PROXY_AUTHORITY" ]]; then
             mapping_proxy_record "$count_file" "$target" "$mode" "$dial_target" || return "$MAPPING_FAILURE"
             mapping_proxy_reply 502 || return "$MAPPING_FAILURE"
-            continue
+            return 0
         fi
         if [[ $mode != accept ]]; then
             mapping_proxy_record "$count_file" "$target" "$mode" "$dial_target" || return "$MAPPING_FAILURE"
             mapping_proxy_reply 403 || return "$MAPPING_FAILURE"
-            continue
+            return 0
         fi
         mapping_proxy_record "$count_file" "$target" "$mode" "$upstream:$MAPPING_UPSTREAM_PORT" || return "$MAPPING_FAILURE"
         if ! mapping_proxy_dial "$upstream" "$MAPPING_UPSTREAM_PORT"; then
             mapping_proxy_reply 502 || return "$MAPPING_FAILURE"
-            continue
+            return 0
         fi
         mapping_proxy_reply 200 || return "$MAPPING_FAILURE"
-        mapping_proxy_relay || true
+        mapping_proxy_relay || return "$MAPPING_FAILURE"
+        return 0
     done
     return 0
 }
@@ -789,7 +833,7 @@ mapping_proxy_loop() {
 # 代理进程入口（接口 D）：读数损坏返回 80，用法错误返回 2。
 # 参数：<端口> <证书> <私钥> <计数文件> <上游地址> <accept|reject>
 mapping_proxy_serve() {
-    local port=${1:-} cert=${2:-} key=${3:-} count_file=${4:-} upstream=${5:-} mode=${6:-}
+    local port=${1:-} cert=${2:-} key=${3:-} count_file=${4:-} upstream=${5:-} mode=${6:-} rc=0 connections=0
     [[ $# == 6 && $port =~ ^[0-9]{1,5}$ && -n $cert && -n $key && -n $count_file ]] || return "$MAPPING_USAGE"
     case " $MAPPING_PROXY_MODES " in
         *" $mode "*) ;;
@@ -799,10 +843,23 @@ mapping_proxy_serve() {
     mkdir -p "$(dirname -- "$count_file")" || return "$MAPPING_FAILURE"
     [[ -e $count_file ]] || printf '0\n' > "$count_file" || return "$MAPPING_FAILURE"
     mapping_proxy_count_read "$count_file" >/dev/null || return "$MAPPING_FAILURE"
-    MAPPING_PROXY_RUNTIME_DIR=$(dirname -- "$count_file")/rt
-    mapping_proxy_tls_start "$port" "$cert" "$key" || return "$MAPPING_FAILURE"
-    mapping_proxy_loop "$count_file" "$upstream" "$mode"
-    return $?
+    MAPPING_PROXY_RUNTIME_DIR=$(dirname -- "$count_file")/rt/$port
+    trap 'mapping_proxy_tls_stop; exit "$MAPPING_FAILURE"' TERM INT HUP
+    while :; do
+        mapping_proxy_tls_start "$port" "$cert" "$key" || { trap - TERM INT HUP; return "$MAPPING_FAILURE"; }
+        rc=0
+        mapping_proxy_loop "$count_file" "$upstream" "$mode" || rc=$?
+        mapping_proxy_tls_stop
+        [[ $rc == 0 ]] || { trap - TERM INT HUP; return "$MAPPING_FAILURE"; }
+        connections=$((connections + 1))
+        [[ ${MAPPING_PROXY_ONCE:-0} != 1 ]] || break
+        if [[ ${MAPPING_PROXY_CONNECTION_LIMIT:-} =~ ^[1-9][0-9]*$ ]] \
+            && (( connections >= MAPPING_PROXY_CONNECTION_LIMIT )); then
+            break
+        fi
+    done
+    trap - TERM INT HUP
+    return 0
 }
 
 # 分层判据：外层 TLS 失败时不得增长；内层 TLS 失败必须有合法 CONNECT 但请求失败。
@@ -861,7 +918,7 @@ mapping_proxy_script() {
     printf 'MAPPING_USAGE=%q\n' "$MAPPING_USAGE"
     declare -f mapping_proxy_upstream_literal mapping_proxy_count_strict mapping_proxy_count_read \
         mapping_proxy_count_bump mapping_proxy_log_path_from_count mapping_proxy_record \
-        mapping_proxy_reply mapping_proxy_dial mapping_proxy_relay mapping_proxy_tls_start \
+        mapping_proxy_reply mapping_proxy_dial mapping_proxy_relay mapping_proxy_tls_stop mapping_proxy_tls_start \
         mapping_proxy_loop mapping_proxy_serve
     printf 'mapping_proxy_serve "$@"\n'
 }
