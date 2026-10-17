@@ -205,16 +205,23 @@ mapping_state_dir() {
     return 1
 }
 
+mapping_path_is_symlink() {
+    [[ -L $1 ]]
+}
+
 # 运行状态文件：创建后追加不可变 network ID，不反写输入档案。
 mapping_network_state_file() {
-    local dir generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
+    local dir file generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
     dir=$(mapping_state_dir) || return 1
     [[ $generation =~ ^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$ ]] || return 1
     [[ $dir == /* && -d $dir ]] || return 1
     [[ $(readlink -f -- "$dir") == "$dir" ]] || return 1
     [[ ! -e $dir/generations || ( -d $dir/generations && ! -L $dir/generations ) ]] || return 1
     [[ ! -e $dir/generations/$generation || ( -d $dir/generations/$generation && ! -L $dir/generations/$generation ) ]] || return 1
-    printf '%s\n' "$dir/generations/$generation/mapping-network.tsv"
+    file=$dir/generations/$generation/mapping-network.tsv
+    ! mapping_path_is_symlink "$file" || return 1
+    [[ ! -e $file || -f $file ]] || return 1
+    printf '%s\n' "$file"
 }
 
 # 读取已冻结的本轮 network ID（缺失返回非零）。
@@ -238,7 +245,7 @@ mapping_network_create() {
     [[ -n $profile && -n $ledger_dir ]] || return 2
     [[ $scenario == "$MAPPING_LEDGER_SCENARIO" ]] || mapping_scenario_valid "$scenario" || return 2
     mapping_profile_load "$profile" || return $?
-    state=$(mapping_network_state_file 2>/dev/null) || state=''
+    state=$(mapping_network_state_file 2>/dev/null) || return 2
     [[ -z $state || ! -s $state ]] || return 2
     if ! declare -F resource_create_register >/dev/null; then return 2; fi
     RESOURCE_LEDGER_DIR=$ledger_dir RESOURCE_RUN=$MP_RUN_ID

@@ -231,7 +231,7 @@ guard_runner_command() {
             script+=$'\n''validation_environment_verify "$2" "$3" || exit $?'
             script+=$'\n''validation_docker info -f '"'"'{{.ID}}'"'"' >/dev/null || exit $?'
             script+=$'\n'"exec bash \"\$1/tests/test-docker-network.sh\" $routing"
-            printf '%q ' env "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 GUARD_RUNNER_MANIFEST="$manifest" GUARD_RUNNER_ATTESTATION="$attestation" "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
+            printf '%q ' env -u VE_DOCKER_ENDPOINT "${filter[@]}" IT_RUN_ID="$run" IT_EVIDENCE_DIR="$evidence" IT_NETWORK="$net" IT_WITNESS_NETWORK="gm-$run-w-net" IT_DNS_IP=172.30.243.53 IT_TOOLS_IMAGE="$tools" IT_PRODUCT_IMAGE="$image" IT_NETWORK_GUARD_READY=1 GUARD_RUNNER_MANIFEST="$manifest" GUARD_RUNNER_ATTESTATION="$attestation" "${extra[@]}" bash -c "$script" _ "$source" "$manifest" "$attestation"
             return 0
             ;;
         probe) entry=(--live) ;;
@@ -350,6 +350,21 @@ guard_mapping_snapshot() {
     chmod a+r "$E/mapping-snapshot-$seq.rules" "$E/mapping-snapshot-$seq.witness"
     return 0
 }
+
+guard_mapping_state_write() {
+    local state=$1 generation=$2 network_id=$3 profile_sha256=$4 temporary
+    ! mapping_path_is_symlink "$state" || return 80
+    temporary=$(mktemp "${state%/*}/.mapping-network.XXXXXXXX") || return 80
+    if ! printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$network_id" "$profile_sha256" > "$temporary"; then
+        rm -f -- "$temporary"
+        return 80
+    fi
+    if mapping_path_is_symlink "$state" || ! mv -T -- "$temporary" "$state"; then
+        rm -f -- "$temporary"
+        return 80
+    fi
+    return 0
+}
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
 guard_mapping_main() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6 manifest=$7 attestation=$8 profile=$9
@@ -441,7 +456,7 @@ guard_mapping_main() {
                     IT_CONTROL_DIR=$E/control
                     state=$(mapping_network_state_file) || exit 80
                     mkdir -p "${state%/*}" || exit 80
-                    printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$generation" "$netid" "$sha" > "$state"
+                    guard_mapping_state_write "$state" "$generation" "$netid" "$sha" || exit $?
                     ready=1
                     printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp"
                     mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq"

@@ -361,6 +361,30 @@ mapping_generation_format_is_strict() {
     done
 }
 
+mapping_network_create_state_failure_has_zero_side_effects() {
+    local scratch=$WORK/state-failure calls rc=0
+    mkdir -p "$scratch/ledger"
+    profile_write "$scratch/profile.tsv"
+    calls=$scratch/calls
+    MAPPING_GENERATION=generation-1
+    mapping_network_state_file() { return 1; }
+    resource_create_register() { printf 'create\n' >> "$calls"; }
+    mapping_network_create "$scratch/profile.tsv" "$scratch/ledger" >/dev/null 2>&1 || rc=$?
+    [[ $rc != 0 && ! -e $calls && ! -e $scratch/ledger/ledger.tsv ]]
+}
+
+mapping_state_leaf_rejects_symlink() {
+    local root=$WORK/leaf-root outside=$WORK/leaf-outside rc=0
+    mkdir -p "$root/control/generations/generation-1"
+    printf 'outside\n' > "$outside"
+    ln -s "$outside" "$root/control/generations/generation-1/mapping-network.tsv"
+    IT_CONTROL_DIR=$root/control
+    MAPPING_ASSERT_GENERATION=generation-1
+    mapping_path_is_symlink() { [[ $1 == "$root/control/generations/generation-1/mapping-network.tsv" ]]; }
+    mapping_network_state_file >/dev/null 2>&1 || rc=$?
+    [[ $rc != 0 && $(cat "$outside") == outside ]]
+}
+
 # 写入映射 DROP 快照：五键、源 P、指定桥、链 MEmtest；可指定计数基数用于增量样本。
 write_mapping_snapshot_base() {
     local file=$1 base=${2:-0} bridge=${3:-mmtest}
@@ -1389,6 +1413,8 @@ scenario_keeps_control_and_ledger_root
 mapping_state_uses_control_root_and_archives_generation
 mapping_generation_rejects_invalid_or_unsafe_paths
 mapping_generation_format_is_strict
+mapping_network_create_state_failure_has_zero_side_effects
+mapping_state_leaf_rejects_symlink
 mapping_rule_keys_exact
 mapping_counter_missing_or_duplicate_fails
 mapping_witness_pause_detected

@@ -2,6 +2,19 @@
 # 共享 Docker 启动边界；所有夹具命令使用同一受控网络和安全默认值。
 source "$(dirname -- "${BASH_SOURCE[0]}")/docker-network-fixture.sh"
 
+if [[ -n ${GUARD_RUNNER_MANIFEST:-} || -n ${GUARD_RUNNER_ATTESTATION:-} ]]; then
+    if [[ -z ${GUARD_RUNNER_MANIFEST:-} || -z ${GUARD_RUNNER_ATTESTATION:-} ]]; then
+        return 77
+    fi
+    if ! source "$(dirname -- "${BASH_SOURCE[0]}")/docker-validation-environment.sh"; then
+        return 77
+    fi
+    validation_environment_verify "$GUARD_RUNNER_MANIFEST" "$GUARD_RUNNER_ATTESTATION" || return $?
+    if [[ -z ${VE_DOCKER_ENDPOINT:-} ]]; then
+        return 77
+    fi
+fi
+
 integration_docker() {
     if [[ -n ${GUARD_RUNNER_MANIFEST:-} || -n ${GUARD_RUNNER_ATTESTATION:-} ]] && [[ -z ${VE_DOCKER_ENDPOINT:-} ]]; then
         return 77

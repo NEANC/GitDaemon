@@ -37,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration bound_integration_empty_endpoint_rejected full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf full_dispatches_mapping_control mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -462,16 +462,65 @@ contract_case() {
             [[ $(cat "$calls") == $'verify manifest attestation\nintegration' ]] || return 1
             rm -rf "$scratch"
             ;;
+        integration_process_loads_own_binding)
+            local scratch cmd rc=0
+            scratch=$(mktemp -d)
+            mkdir -p "$scratch/source/tests"
+            cp "$HERE/docker-integration-startup.sh" "$scratch/source/tests/"
+            : > "$scratch/source/tests/docker-network-fixture.sh"
+            cat > "$scratch/source/tests/docker-validation-environment.sh" <<'STUB'
+printf 'source pid=%s\n' "$BASHPID" >> "$PROCESS_BINDING_LOG"
+validation_environment_verify() {
+    printf 'verify pid=%s manifest=%s attestation=%s endpoint=%s\n' "$BASHPID" "$1" "$2" "${VE_DOCKER_ENDPOINT:-}" >> "$PROCESS_BINDING_LOG"
+    VE_DOCKER_ENDPOINT=unix:///process/docker.sock
+}
+validation_docker() {
+    printf 'docker pid=%s endpoint=%s argv=%s\n' "$BASHPID" "${VE_DOCKER_ENDPOINT:-}" "$*" >> "$PROCESS_BINDING_LOG"
+}
+STUB
+            cat > "$scratch/source/tests/test-docker-network.sh" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname -- "${BASH_SOURCE[0]}")/docker-integration-startup.sh"
+integration_docker info
+STUB
+            chmod +x "$scratch/source/tests/test-docker-network.sh"
+            PROCESS_BINDING_LOG=$scratch/calls
+            export PROCESS_BINDING_LOG
+            cmd=$(guard_runner_command mapping-direct "$scratch/source" run1 /ev img tools manifest attestation profile) || return 1
+            VE_DOCKER_ENDPOINT=unix:///inherited/docker.sock
+            export VE_DOCKER_ENDPOINT
+            ( eval "$cmd" ) || rc=$?
+            [[ $rc == 0 ]] || return 1
+            [[ $(grep -c '^source pid=' "$scratch/calls") == 2 ]] || return 1
+            [[ $(grep -c '^verify pid=' "$scratch/calls") == 2 ]] || return 1
+            [[ $(grep -c '^verify .* endpoint=$' "$scratch/calls") == 2 ]] || return 1
+            grep -q '^docker .* endpoint=unix:///process/docker.sock argv=info$' "$scratch/calls" || return 1
+            rm -rf "$scratch"
+            ;;
         bound_integration_empty_endpoint_rejected)
             local scratch calls rc=0
             scratch=$(mktemp -d)
             calls=$scratch/calls
             GUARD_RUNNER_MANIFEST=manifest GUARD_RUNNER_ATTESTATION=attestation
             unset VE_DOCKER_ENDPOINT
-            source "$HERE/docker-integration-startup.sh"
+            source "$HERE/docker-integration-startup.sh" || rc=$?
             command() { printf '%s\n' "$*" >> "$calls"; }
-            integration_docker info >/dev/null 2>&1 || rc=$?
             [[ $rc == 77 && ! -s $calls ]] || return 1
+            rm -rf "$scratch"
+            ;;
+        mapping_state_write_rejects_replaceable_leaf)
+            local scratch state outside rc=0
+            scratch=$(mktemp -d)
+            state=$scratch/generations/generation-1/mapping-network.tsv
+            outside=$scratch/outside
+            mkdir -p "${state%/*}"
+            printf 'unchanged\n' > "$outside"
+            ln -s "$outside" "$state"
+            mapping_path_is_symlink() { [[ $1 == "$state" ]]; }
+            guard_mapping_state_write "$state" generation-1 net-1 profile >/dev/null 2>&1 || rc=$?
+            [[ $rc == 80 ]] || return 1
+            [[ $(cat "$outside") == unchanged ]] || return 1
             rm -rf "$scratch"
             ;;
         full_dispatches_mapping_control)
