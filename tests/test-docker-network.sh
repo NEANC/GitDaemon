@@ -37,7 +37,7 @@ contract_guard_driver() {
 # 契约通过替身记录外部边界，断言实际函数行为而不是搜索源码。
 contracts() {
     local failed=0 name rc
-    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf mapping_state_write_rejects_generation_parent_replacement mapping_state_is_runner_readonly_and_readable full_dispatches_mapping_control full_mapping_ready_uses_safe_state_handler mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
+    for name in guard_missing_blocks_start subnet_conflict_preserves_existing secondary_network_rejected cleanup_preserves_primary_status cleanup_writes_recovery_binding interrupt_removes_owned_rules cleanup_failure_keeps_isolation preflight_query_failure_blocks_start conditional_library_failure_stops counter_evidence_rejects_invalid reusable_generation_dns_contract independent_status_capture mapping_entry_mode_dispatch single_mapping_entry_runs_one_scenario full_binds_mapping_group runner_checks_manifest_and_socket secondary_integration_binds_private_endpoint secondary_runner_revalidates_before_integration integration_process_loads_own_binding bound_integration_empty_endpoint_rejected mapping_state_write_rejects_replaceable_leaf mapping_state_write_rejects_generation_parent_replacement mapping_state_is_runner_readonly_and_readable mapping_ack_rejects_preexisting_targets mapping_ack_uses_root_exclusive_atomic_publish mapping_ack_rechecks_control_identity mapping_actions_publish_ack_safely full_dispatches_mapping_control full_mapping_ready_uses_safe_state_handler mapping_sequence_order_is_closed stale_ready_rejected release_verifies_ledger_and_endpoint release_failure_retains_active_rules release_success_marks_released timeout_is_thirty_seconds; do
         rc=0
         ( contract_case "$name" ) || rc=$?
         printf '%s EXIT=%s\n' "$name" "$rc"
@@ -572,6 +572,99 @@ STUB
             [[ $(cat "$state") == $'generation\tgeneration-1\nnetwork_id\tnet-1\nprofile_sha256\tprofile' ]] || return 1
             rm -rf "$scratch"
             ;;
+        mapping_ack_rejects_preexisting_targets)
+            local scratch control target outside kind rc
+            scratch=$(mktemp -d)
+            control=$scratch/control
+            mkdir "$control"
+            for kind in leaf symlink; do
+                target=$control/ack-1
+                outside=$scratch/outside-$kind
+                printf 'unchanged-%s\n' "$kind" > "$outside"
+                if [[ $kind == leaf ]]; then
+                    cp "$outside" "$target"
+                else
+                    ln -s "$outside" "$target"
+                fi
+                rc=0
+                guard_mapping_ack_publish "$control" "$(guard_mapping_directory_identity "$control")" 1 nonce generation >/dev/null 2>&1 || rc=$?
+                [[ $rc == 80 && $(cat "$outside") == "unchanged-$kind" ]] || return 1
+                if [[ $kind == leaf ]]; then
+                    [[ $(cat "$target") == unchanged-leaf ]] || return 1
+                else
+                    [[ $(cat "$target") == unchanged-symlink ]] || return 1
+                fi
+                rm -f "$target"
+            done
+            rm -rf "$scratch"
+            ;;
+        mapping_ack_uses_root_exclusive_atomic_publish)
+            local scratch control owners modes links identity
+            scratch=$(mktemp -d)
+            control=$scratch/control
+            owners=$scratch/owners
+            modes=$scratch/modes
+            links=$scratch/links
+            mkdir "$control"
+            identity=$(guard_mapping_directory_identity "$control") || return 1
+            chown() { printf '%s\n' "$*" >> "$owners"; }
+            chmod() { printf '%s\n' "$*" >> "$modes"; command chmod "$@"; }
+            ln() { printf '%s\n' "$*" >> "$links"; command ln "$@"; }
+            guard_mapping_ack_publish "$control" "$identity" 1 nonce generation || return 1
+            grep -Eq '^-h 0:0 .*/\.ack-1\.[^/]+$' "$owners" || return 1
+            grep -Eq '^600 .*/\.ack-1\.[^/]+$' "$modes" || return 1
+            grep -Eq '^-- .*/\.ack-1\.[^/]+ .*/ack-1$' "$links" || return 1
+            [[ $(cat "$control/ack-1") == 'nonce generation' ]] || return 1
+            [[ -z $(find "$control" -maxdepth 1 -name '.ack-1.*' -print -quit) ]] || return 1
+            rm -rf "$scratch"
+            ;;
+        mapping_ack_rechecks_control_identity)
+            local scratch calls rc=0
+            scratch=$(mktemp -d)
+            E=$scratch/evidence
+            mkdir -p "$E/control"
+            calls=$scratch/identity-calls
+            printf '0\n' > "$calls"
+            seq=1 last_nonce=''
+            GUARD_MAPPING_CONTROL_IDENTITY=$'1\t1\t'"$E/control"
+            guard_mapping_ready_activate() { return 0; }
+            guard_mapping_directory_identity() {
+                local count
+                count=$(cat "$calls")
+                count=$((count + 1))
+                printf '%s\n' "$count" > "$calls"
+                if (( count == 1 )); then printf '1\t1\t%s\n' "$E/control"; else printf '1\t2\t%s\n' "$E/control"; fi
+            }
+            guard_mapping_request_handle mapping-ready generation-1 net-1 profile nonce-1 >/dev/null 2>&1 || rc=$?
+            [[ $rc == 80 && ! -e $E/control/ack-1 ]] || return 1
+            rm -rf "$scratch"
+            ;;
+        mapping_actions_publish_ack_safely)
+            local action scratch publishes
+            for action in mapping-ready mapping-snapshot mapping-release; do
+                (
+                    scratch=$(mktemp -d)
+                    E=$scratch/evidence
+                    mkdir -p "$E/control"
+                    publishes=$scratch/publishes
+                    seq=1 last_nonce='' rules_start=0
+                    GUARD_MAPPING_CONTROL_IDENTITY=$(guard_mapping_directory_identity "$E/control") || return 1
+                    guard_mapping_ready_activate() { return 0; }
+                    guard_mapping_generation() { return 0; }
+                    guard_mapping_snapshot() { return 0; }
+                    guard_mapping_release() { return 0; }
+                    guard_mapping_ack_publish() {
+                        printf '%s\n' "$*" >> "$publishes"
+                        printf '%s %s\n' "$4" "$5" > "$1/ack-$3"
+                    }
+                    guard_mapping_request_handle "$action" generation-1 net-1 profile nonce-1 || return 1
+                    [[ $(cat "$E/control/ack-1") == 'nonce-1 generation-1' ]] || return 1
+                    [[ $(wc -l < "$publishes") == 1 ]] || return 1
+                    [[ -z $(find "$E/control" -maxdepth 1 -name '*.tmp' -o -name '.ack-*' -print -quit) ]] || return 1
+                    rm -rf "$scratch"
+                ) || return 1
+            done
+            ;;
         full_dispatches_mapping_control)
             local cmd
             cmd=$(guard_runner_command full /src run1 /ev img tools man att prof) || return 1
@@ -587,9 +680,10 @@ STUB
             GUARD_MAPPING_STATE=PREPARING GUARD_MAPPING_LAST_GENERATION=''
             MP_PROFILE_SHA256=profile
             mkdir -p "$E/control"
+            GUARD_MAPPING_CONTROL_IDENTITY=$(guard_mapping_directory_identity "$E/control") || return 1
             guard_mapping_rules() { printf 'rules\n' >> "$FULL_READY_TRACE"; }
             guard_mapping_state_write() { printf 'state %s %s %s %s\n' "$@" >> "$FULL_READY_TRACE"; }
-            mv() { printf 'ack\n' >> "$FULL_READY_TRACE"; command mv "$@"; }
+            guard_mapping_ack_publish() { printf 'ack\n' >> "$FULL_READY_TRACE"; printf '%s %s\n' "$4" "$5" > "$1/ack-$3"; }
             export FULL_READY_TRACE
             seq=1 last_nonce=''
             guard_full_mapping_request mapping-ready generation-1 net-1 profile nonce-1 || rc=$?

@@ -395,6 +395,26 @@ guard_mapping_state_write() {
     return 0
 }
 
+# 以 root 独占临时文件和不可覆盖硬链接原子发布 ACK。
+guard_mapping_ack_publish() {
+    local control=$1 identity=$2 ack_seq=$3 nonce=$4 generation=$5 target temporary
+    target=$control/ack-$ack_seq
+    [[ $(guard_mapping_directory_identity "$control") == "$identity" ]] || return 80
+    [[ ! -e $target && ! -L $target ]] || return 80
+    temporary=$(mktemp "$control/.ack-$ack_seq.XXXXXXXX") || return 80
+    if ! chown -h 0:0 "$temporary" || ! chmod 600 "$temporary" || ! printf '%s %s\n' "$nonce" "$generation" > "$temporary"; then
+        rm -f -- "$temporary"
+        return 80
+    fi
+    if [[ $(guard_mapping_directory_identity "$control") != "$identity" ]] || [[ -e $target || -L $target ]] || ! ln -- "$temporary" "$target"; then
+        rm -f -- "$temporary"
+        return 80
+    fi
+    rm -f -- "$temporary" || return 80
+    [[ $(guard_mapping_directory_identity "$control") == "$identity" && -f $target && ! -L $target ]] || return 80
+    return 0
+}
+
 # 创建 root:runner 1770 控制根，供 runner 新建请求且不能替换其他主体的目录项。
 guard_mapping_control_prepare() {
     local runner_gid
@@ -402,6 +422,7 @@ guard_mapping_control_prepare() {
     mkdir "$E/control" || return 80
     chown "0:$runner_gid" "$E/control" || return 80
     chmod 1770 "$E/control" || return 80
+    GUARD_MAPPING_CONTROL_IDENTITY=$(guard_mapping_directory_identity "$E/control") || return 80
 }
 
 # 激活 READY：先迁移状态并安装规则，再通过安全写入器固化本代 network state。
@@ -430,8 +451,8 @@ guard_mapping_request_handle() {
         mapping-release) guard_mapping_release "$generation" "$network_id" "$profile_sha256" "$rules_start" || return $? ;;
         *) return 65 ;;
     esac
-    printf '%s %s\n' "$nonce" "$generation" > "$E/control/ack-$seq.tmp" || return 80
-    mv "$E/control/ack-$seq.tmp" "$E/control/ack-$seq" || return 80
+    [[ -n ${GUARD_MAPPING_CONTROL_IDENTITY:-} ]] || return 80
+    guard_mapping_ack_publish "$E/control" "$GUARD_MAPPING_CONTROL_IDENTITY" "$seq" "$nonce" "$generation" || return $?
     last_nonce=$nonce
     seq=$((seq + 1))
     return 0
@@ -544,7 +565,7 @@ guard_mapping_main() {
 guard_main() {
     local mode='' source='' image='' tools='' manifest='' attestation='' profile='' existing table chain parent bridge seq request token pid command rc=0 ids routes resources links rules
     local generation netid sha nonce rules_start last_nonce=''
-    RUN='' E='' RUNNER=''
+    RUN='' E='' RUNNER='' GUARD_MAPPING_CONTROL_IDENTITY=''
     while (( $# )); do
         [[ $# -ge 2 ]] || return 2
         case "$1" in
