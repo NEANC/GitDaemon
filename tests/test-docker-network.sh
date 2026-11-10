@@ -840,8 +840,18 @@ case "${1:-}" in
         ;;
     --mapping-probe)
         runner_handshake
+        [[ ${IT_NETWORK_GUARD_READY:-} == 1 && -n ${GUARD_RUNNER_MANIFEST:-} && -n ${GUARD_RUNNER_ATTESTATION:-} ]] || exit 77
+        validation_environment_verify "$GUARD_RUNNER_MANIFEST" "$GUARD_RUNNER_ATTESTATION" || exit $?
+        [[ -n ${VE_DOCKER_ENDPOINT:-} ]] || exit 77
         source "$HERE/docker-mapping-probe.sh"
-        source "$HERE/docker-mapping-fixture.sh"
+        source "$HERE/docker-network-fixture.sh"
+        MAPPING_GENERATION=mapping-probe-1
+        MPF_SCENARIO=mapping-probe
+        unset MAPPING_ACK_GENERATION MAPPING_ASSERT_GENERATION
+        mapping_prepare "$IT_MAPPING_PROFILE" mapping-probe "$IT_PRODUCT_IMAGE" "$IT_TOOLS_IMAGE" || exit $?
+        mapping_probe_network=$(mapping_network_id_load) || exit 80
+        mapping_ready "$IT_MAPPING_PROFILE" "$mapping_probe_network" "$MAPPING_GENERATION" || exit $?
+        mapping_activate "$MAPPING_GENERATION" || exit $?
         mapping_probe_run "$IT_MAPPING_PROFILE" "$IT_PRODUCT_IMAGE" "$IT_TOOLS_IMAGE" "$IT_EVIDENCE_DIR"
         ;;
     --live|--integration|--startup-integration)

@@ -50,15 +50,15 @@ mapping_probe_run() {
 }
 
 mapping_probe_check_ipam() { mapping_network_id_load >/dev/null; }
-mapping_probe_check_internal_peer() { mapping_fixture_precheck; }
-mapping_probe_check_uid_ports() { mapping_fixture_precheck; }
+mapping_probe_check_internal_peer() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_uid_ports() { return "$MAPPING_PROBE_FAILURE"; }
 mapping_probe_check_volume_owner() { mapping_evidence_volume_verify "$3"; }
-mapping_probe_check_dns() { mapping_fixture_precheck; }
-mapping_probe_check_proxy_tls() { mapping_fixture_precheck; }
-mapping_probe_check_upstream_tls() { mapping_fixture_precheck; }
-mapping_probe_check_connect_dial() { mapping_fixture_precheck; }
-mapping_probe_check_git_resolve() { mapping_fixture_precheck; }
-mapping_probe_check_bridge_drop() { mapping_fixture_precheck; }
-mapping_probe_check_input_drop() { mapping_fixture_precheck; }
-mapping_probe_check_witness_negative() { mapping_fixture_precheck; }
-mapping_probe_check_offline() { mapping_fixture_precheck; }
+mapping_probe_check_dns() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_proxy_tls() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_upstream_tls() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_connect_dial() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_git_resolve() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_bridge_drop() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_input_drop() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_witness_negative() { return "$MAPPING_PROBE_FAILURE"; }
+mapping_probe_check_offline() { return "$MAPPING_PROBE_FAILURE"; }
