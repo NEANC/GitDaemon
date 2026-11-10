@@ -532,8 +532,13 @@ MPF_UPSTREAM_IP=''
 
 # 夹具状态文件：只追加冻结状态，不反写输入档案。
 mapping_fixture_state_file() {
-    local dir
+    local dir generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
     dir=$(mapping_state_dir) || return 1
+    if [[ -n $generation ]]; then
+        mapping_network_state_file >/dev/null || return 1
+        printf '%s\n' "$dir/generations/$generation/mapping-fixture.tsv"
+        return 0
+    fi
     printf '%s\n' "$dir/mapping-fixture.tsv"
 }
 

@@ -5,6 +5,7 @@ WORK=$(mktemp -d)
 trap 'if [[ ${CONTRACT_KEEP:-0} != 1 ]]; then rm -rf "$WORK"; else printf "WORK=%s\n" "$WORK"; fi' EXIT
 source "$HERE/docker-network-fixture.sh"
 source "$HERE/docker-mapping-assertions.sh"
+source "$HERE/docker-network-guard.sh"
 VE_DOCKER_ENDPOINT=unix:///contract-only/docker.sock
 
 # 文件对象模拟 Docker 边界，保留真实编排、握手、校准及账本删除。
@@ -16,6 +17,7 @@ lifecycle_docker() {
     case "$action" in
         create)
             [[ $MODE != prepare-fail ]] || return 42
+            [[ $MODE != second-prepare-fail || $GEN != g2 ]] || return 42
             id=${*: -1}
             while (( $# )); do
                 arg=$1; shift
@@ -32,7 +34,8 @@ lifecycle_docker() {
                     --ip) ip=$1; shift ;;
                 esac
             done
-            if [[ $kind == container ]]; then id="id-$GEN-$role"; fi
+            if [[ $kind == container ]]; then id="id-$GEN-$role"; elif [[ $kind == network ]]; then id="net-$GEN"; fi
+            [[ $kind != network ]] || name=$MP_NETWORK_NAME
             [[ ! -f $CASE_DIR/objects/$id ]] || return 98
             printf '%s\t%s\t%s\t%s\t%s\n' "$run" "$scenario" "$role" "$network" "$ip" > "$CASE_DIR/objects/$id"
             if [[ -n $name ]]; then printf '%s\n' "$id" > "$CASE_DIR/names/$name"; fi
@@ -44,7 +47,8 @@ lifecycle_docker() {
             if [[ -f $CASE_DIR/names/$id ]]; then id=$(cat "$CASE_DIR/names/$id"); fi
             [[ -f $CASE_DIR/objects/$id ]] || return 1
             case "$format" in
-                '{{.Id}}'|'{{.Name}}') printf '%s\n' "$id" ;;
+                '{{.Id}}') printf '%s\n' "$id" ;;
+                '{{.Name}}') [[ $kind != network ]] || { printf '%s\n' "$MP_NETWORK_NAME"; return 0; }; printf '%s\n' "$id" ;;
                 *gitdaemon.run*) cut -f1-3 "$CASE_DIR/objects/$id" ;;
                 *'.CreatedAt'*'.Driver'*'.Mountpoint'*) printf 'created|local|/contract/%s|labels\n' "$id" ;;
                 '{{json .Mounts}}') printf '[{"Destination":"/ev","RW":true}]\n' ;;
@@ -62,6 +66,7 @@ lifecycle_docker() {
             if [[ $network != none ]]; then
                 [[ ${MAPPING_ACK_GENERATION:-} == "$GEN" ]] || return 98
                 [[ $MODE != start-fail ]] || return 42
+                [[ $MODE != second-start-fail || $GEN != g2 ]] || return 42
                 if [[ $ip == "$MP_P" ]]; then
                     [[ ! -f $CASE_DIR/p-owner ]] || return 98
                     printf '%s\n' "$id" > "$CASE_DIR/p-owner"
@@ -80,6 +85,7 @@ lifecycle_docker() {
             [[ -f $CASE_DIR/running/$id ]] || return 98
             if [[ $1 == curl ]]; then
                 [[ $MODE != calibrate-fail ]] || return 42
+                [[ $MODE != second-calibrate-fail || $GEN != g2 ]] || return 42
                 if [[ " $* " == *':8443 '* ]]; then
                     printf '1\n' > "$CASE_DIR/accept"
                     printf '%s\n' "$MAPPING_UPSTREAM_HEALTH"
@@ -104,8 +110,13 @@ lifecycle_docker() {
             if [[ -f $CASE_DIR/p-owner && $(cat "$CASE_DIR/p-owner") == "$id" ]]; then rm "$CASE_DIR/p-owner"; fi
             printf 'remove %s\n' "$id" >> "$CASE_DIR/events"
             rm -f "$CASE_DIR/objects/$id" "$CASE_DIR/running/$id" ;;
-        ps|ls) return 0 ;;
-        *) return 98 ;;
+        ps|ls)
+            for id in "$CASE_DIR/objects/"*; do
+                [[ -f $id ]] || continue
+                [[ $kind != container || $action != ps || ${id##*/} == id-* ]] || continue
+                [[ $kind == container || $kind == network && ${id##*/} == net-* || $kind == volume && ${id##*/} != id-* && ${id##*/} != net-* ]] || continue
+                printf '%s\n' "${id##*/}"
+            done ;;
     esac
     return 0
 }
@@ -113,18 +124,42 @@ validation_docker() { lifecycle_docker "$@"; }
 resource_docker() { lifecycle_docker "$@"; }
 resource_lock() { return 0; }
 resource_unlock() { return 0; }
+guard_mapping_rules() { printf 'rules %s\n' "$GUARD_MAPPING_GENERATION" >> "$CASE_DIR/events"; }
+guard_remove_rules_since() { printf 'unrules %s\n' "$GUARD_MAPPING_GENERATION" >> "$CASE_DIR/events"; }
+guard_mapping_state_write() { printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$2" "$3" "$4" > "$1"; }
+guard_mapping_ack_publish() {
+    local nonce=$4 generation=$5
+    case "$MODE" in
+        wrong-ack) nonce=wrong ;;
+        old-ack) generation=old ;;
+        second-old-ack) [[ $generation != g2 ]] || generation=g1 ;;
+    esac
+    printf '%s %s\n' "$nonce" "$generation" > "$1/ack-$3"
+}
+validation_environment_verify() { return 0; }
 
 # 控制端只响应实际请求中的 nonce 和 generation，不设置客户端 ACK。
 lifecycle_controller() {
-    local request action generation network digest nonce
+    local request action generation network digest nonce rc=0
+    local seq=1 last_nonce='' rules_start=0 state='' GUARD_MAPPING_CONTROL_IDENTITY=contract
+    local E=$CASE_DIR RUN=mtest GUARD_PROFILE=$MAPPING_PROFILE GUARD_MANIFEST=contract GUARD_ATTESTATION=contract
+    mapping_profile_load "$GUARD_PROFILE" || return 1
     while [[ ! -f $CASE_DIR/done ]]; do
         for request in "$IT_CONTROL_DIR"/request-*; do
             [[ -f $request && ! -f ${request/request-/ack-} ]] || continue
             read -r action generation network digest nonce < "$request"
-            printf 'ready %s\n' "$generation" >> "$CASE_DIR/events"
-            case "$MODE" in wrong-ack) nonce=wrong ;; old-ack) generation=old ;; second-old-ack) [[ $generation != g2 ]] || generation=g1 ;; esac
-            printf '%s %s\n' "$nonce" "$generation" > "${request/request-/ack-}.tmp"
-            mv "${request/request-/ack-}.tmp" "${request/request-/ack-}"
+            [[ $request == "$IT_CONTROL_DIR/request-$seq" ]] || continue
+            if [[ $action == mapping-ready ]]; then printf 'ready %s\n' "$generation" >> "$CASE_DIR/events"; fi
+            if [[ $action == mapping-release ]]; then printf 'release %s\n' "$generation" >> "$CASE_DIR/events"; fi
+            rc=0
+            if [[ $MODE == release-query-fail && $action == mapping-release ]]; then
+                resource_enumerate() { return 2; }
+            fi
+            guard_mapping_request_handle "$action" "$generation" "$network" "$digest" "$nonce" || rc=$?
+            if [[ $rc != 0 ]]; then
+                printf 'guard-fail %s %s\n' "$action" "$rc" >> "$CASE_DIR/events"
+                : > "$CASE_DIR/done"
+            fi
         done
         sleep 0.02
     done
@@ -132,15 +167,15 @@ lifecycle_controller() {
 
 # 两代共用控制根，按登记身份清理后必须重新握手及校准。
 lifecycle_case() {
-    local MODE=$1 expected=$2 CASE_DIR=$WORK/$1 GEN rc=0 pid generation id
+    local MODE=$1 expected=$2 CASE_DIR=$WORK/$1 GEN rc=0 pid generation id before
     local IT_CONTROL_DIR=$CASE_DIR/control IT_EVIDENCE_DIR=$CASE_DIR
     local RESOURCE_LEDGER_DIR=$CASE_DIR/control/resources RESOURCE_RUN=mtest
     local MAPPING_PROFILE=$CASE_DIR/profile MAPPING_PRODUCT_IMAGE=product MAPPING_TOOLS_IMAGE=tools
-    local MPF_SCENARIO=mapping-fallback
+    local MPF_SCENARIO=mapping-fallback E=$CASE_DIR RUN=mtest
     mkdir -p "$IT_CONTROL_DIR" "$CASE_DIR/objects" "$CASE_DIR/names" "$CASE_DIR/running"
     : > "$CASE_DIR/events"
     printf 'schema_version\t1\nrun_id\tmtest\ncidr\t140.82.112.0/24\ngateway\t140.82.112.1\nP\t140.82.112.10\nU\t140.82.112.11\nX\t140.82.112.12\nD\t140.82.112.13\nN\t140.82.112.14\nnetwork_name\tgm-mtest-m-net\nbridge\tmmtest\n' > "$MAPPING_PROFILE"
-    lifecycle_controller & pid=$!
+    lifecycle_controller > "$CASE_DIR/controller.log" 2>&1 & pid=$!
     for generation in 1 2; do
         GEN=g$generation
         MAPPING_ASSERT_GENERATION=$GEN MAPPING_PROXY_RUN_ID=$GEN
@@ -153,30 +188,47 @@ lifecycle_case() {
             printf 'foreign\tmapping-fallback\tprobe\tgm-mtest-m-net\t140.82.112.10\n' > "$CASE_DIR/objects/id-$GEN-probe"
         fi
         if (( rc == 0 )); then mapping_scenario_product_up fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.product" 2>&1 || rc=$?; fi
-        if [[ $MODE == second-old-ack && $GEN == g1 ]]; then
+        if [[ $MODE == second-* && $GEN == g1 || $MODE == release-query-fail && $GEN == g1 ]]; then
             [[ $rc == 0 ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
         else
             printf '%s %s expected=%s actual=%s\n' "$MODE" "$GEN" "$expected" "$rc"
             if [[ $rc != "$expected" ]]; then cat "$CASE_DIR/$GEN."*; : > "$CASE_DIR/done"; wait "$pid"; return 1; fi
         fi
-        if (( expected != 0 )) && [[ $MODE != second-old-ack || $GEN == g2 ]]; then
+        if (( expected != 0 )) && [[ $MODE != second-* && $MODE != release-query-fail || $GEN == g2 ]]; then
             ! grep -q "^start $GEN product$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+            before=$(wc -l < "$CASE_DIR/docker.log")
+            mapping_scenario_product_up fallback mapping-fallback "$CASE_DIR/$GEN" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+            ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
             if [[ $MODE == drift || $MODE == inspect-error ]]; then
                 ! grep -q "^remove id-$GEN-probe$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-                ! grep -q "^create .*gitdaemon.role=product" "$CASE_DIR/docker.log" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
             fi
-            if [[ $MODE == second-old-ack ]]; then [[ $GEN == g2 ]] || return 1; fi
+            if [[ $MODE == second-* || $MODE == release-query-fail ]]; then [[ $GEN == g2 ]] || return 1; fi
             break
         fi
         [[ $(grep -E "^(ready $GEN|start $GEN|calibrated $GEN|remove id-$GEN-probe$)" "$CASE_DIR/events") == "$(printf 'ready %s\nstart %s upstream\nstart %s proxy\nstart %s dns\nstart %s probe\ncalibrated %s\nremove id-%s-probe\nstart %s product' "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN")" ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-        for id in "$CASE_DIR/objects/"*; do resource_remove "$(case "${id##*/}" in id-*) printf container ;; gm-*-net) printf network ;; *) printf volume ;; esac)" "${id##*/}" || return 1; done
-        rm "$IT_CONTROL_DIR/mapping-fixture.tsv" "$CASE_DIR/calibrated"
+        if [[ $MODE == release-query-fail ]]; then
+            resource_enumerate() { return 2; }
+        fi
+        mapping_scenario_release fallback mapping-fallback "$GEN" "$CASE_DIR/$GEN" || {
+            if [[ $MODE == release-query-fail ]]; then
+                before=$(wc -l < "$CASE_DIR/docker.log")
+                ! grep -q '^unrules g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                ! grep -q '^remove id-g1-product$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                mapping_scenario_fixture_prepare fallback mapping-fallback "$CASE_DIR/g2" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                : > "$CASE_DIR/done"; wait "$pid"; return 0
+            fi
+            : > "$CASE_DIR/done"; wait "$pid"; return 1
+        }
+        [[ -f $IT_CONTROL_DIR/generations/$GEN/mapping-fixture.tsv && -f $IT_CONTROL_DIR/generations/$GEN/mapping-network.tsv ]] || return 1
+        [[ $(sed -n 's/^generation\t//p' "$IT_CONTROL_DIR/generations/$GEN/mapping-network.tsv") == "$GEN" ]] || return 1
+        rm "$CASE_DIR/calibrated"
     done
     : > "$CASE_DIR/done"
     wait "$pid"
 }
 failed=0
-for spec in ready:0 prepare-fail:80 wrong-ack:80 old-ack:80 second-old-ack:80 start-fail:80 calibrate-fail:80 drift:80 inspect-error:80; do
+for spec in ${LIFECYCLE_CASES:-ready:0 prepare-fail:80 wrong-ack:80 old-ack:80 second-old-ack:80 start-fail:80 calibrate-fail:80 second-prepare-fail:80 second-start-fail:80 second-calibrate-fail:80 drift:80 inspect-error:80 release-query-fail:80}; do
     ( lifecycle_case "${spec%:*}" "${spec#*:}" ) || failed=1
 done
 exit "$failed"

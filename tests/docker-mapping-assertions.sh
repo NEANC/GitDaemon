@@ -346,8 +346,18 @@ mapping_scenario_fixture_prepare() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} ledger netid
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n ${MAPPING_PROFILE:-} && -n ${MAPPING_PRODUCT_IMAGE:-} && -n ${MAPPING_TOOLS_IMAGE:-} ]] || return "$MAPPING_ASSERT_FIXTURE"
+    MAPPING_ASSERT_CALIBRATED_GENERATION=''
     ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources}
     RESOURCE_LEDGER_DIR=$ledger
+    if [[ -f $ledger/ledger.tsv ]]; then
+        local entry
+        mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
+        RESOURCE_RUN=$MP_RUN_ID
+        resource_crosscheck "$ledger" || return "$MAPPING_ASSERT_FIXTURE"
+        for entry in "${RESOURCE_LEDGER_ACTIVE[@]}"; do
+            [[ -z $entry ]] || return "$MAPPING_ASSERT_FIXTURE"
+        done
+    fi
     mapping_prepare "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$MAPPING_TOOLS_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_proxy_evidence_reset "$scenario" "$MAPPING_PRODUCT_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_negative_prepare "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
@@ -365,6 +375,7 @@ mapping_scenario_calibrate() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_proxy_calibrate "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    MAPPING_ASSERT_CALIBRATED_GENERATION=$MAPPING_ASSERT_GENERATION
     return 0
 }
 
@@ -393,9 +404,9 @@ mapping_scenario_product_ready() {
 mapping_scenario_release_probe() {
     local probe id
     probe=$(mapping_probe_container) || return 1
-    id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$probe" 2>/dev/null) || return 1
+    id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$probe" 2>/dev/null) || { MAPPING_ASSERT_CALIBRATED_GENERATION=''; return 1; }
     [[ -n $id ]] || return 1
-    resource_remove container "$id" || return 1
+    resource_remove container "$id" || { MAPPING_ASSERT_CALIBRATED_GENERATION=''; return 1; }
     return 0
 }
 
@@ -405,7 +416,9 @@ mapping_scenario_product_up() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
     local ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources} data gitconfig snapshot_content name
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    [[ -n ${MAPPING_ASSERT_GENERATION:-} && ${MAPPING_ASSERT_CALIBRATED_GENERATION:-} == "$MAPPING_ASSERT_GENERATION" && ${MAPPING_ACK_GENERATION:-} == "$MAPPING_ASSERT_GENERATION" ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_scenario_release_probe || return "$MAPPING_ASSERT_FIXTURE"
     data=$(mapping_scenario_data_volume "$MAPPING_ASSERT_GENERATION")
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
     resource_create_register volume "$scenario" "$MAPPING_ASSERT_DATA_ROLE" -- \
@@ -421,8 +434,6 @@ mapping_scenario_product_up() {
     gitconfig=$(mapping_scenario_gitconfig_content) || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_data_write "$data" "$MAPPING_ASSERT_GITCONFIG_REL" "$gitconfig" "$MAPPING_PRODUCT_IMAGE" \
         || return "$MAPPING_ASSERT_FIXTURE"
-    # 顺序占位必须先释放：产品启动前按登记身份删除 probe，产品才能取得冻结地址 P。
-    mapping_scenario_release_probe || return "$MAPPING_ASSERT_FIXTURE"
     name=$(mapping_scenario_product_container "$MAPPING_ASSERT_GENERATION")
     mapping_fixture_create "$scenario" "$MAPPING_ASSERT_PRODUCT_ROLE" -d --name "$name" \
         $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_P" --dns "$MP_D" \
