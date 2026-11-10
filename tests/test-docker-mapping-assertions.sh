@@ -837,51 +837,95 @@ rs_install() {
 # 同一 scenario 在同一进程内连续运行两次均成功：释放必须清掉映射网络与固定名容器，
 # 第二次才能重建同名资源；残留即视为释放不完整。
 scenario_repeated_run_succeeds() (
-    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root foreign id removed
+    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root foreign id removed ledger
     dir1=$(mktemp -d)
     dir2=$(mktemp -d)
     RS_STORE=$(mktemp)
     : > "$RS_STORE"
-    rs_install
+    rs_new_id() { printf '%s:%s' "$1" "$2" | sha256sum | cut -d' ' -f1; }
+    rs_add() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$RS_STORE"; }
+    # 在文件对象上模拟实时标签漂移，不修改真实账本记录。
+    rs_drift() {
+        awk -F '\t' -v id="$1" -v scenario="$2" 'BEGIN {OFS="\t"} $3==id {$5=scenario} {print}' "$RS_STORE" > "$RS_STORE.tmp"
+        mv -- "$RS_STORE.tmp" "$RS_STORE"
+    }
+    # 仅模拟 Docker 创建、inspect、枚举与删除，其余资源账本函数均执行真实实现。
+    rs_docker() {
+        local kind=$1 action=${2:-} last=${!#} name='' id='' run='' scenario='' role='' format='' row field i
+        local -a args=("$@")
+        case "$kind:$action" in
+            create:*|network:create|volume:create)
+                if [[ $kind == create ]]; then kind=container; else args=("${args[@]:2}"); fi
+                for ((i=0; i<${#args[@]}; i++)); do
+                    case "${args[i]}" in
+                        --name) name=${args[i+1]} ;;
+                        --label)
+                            field=${args[i+1]}
+                            case "$field" in
+                                gitdaemon.run=*) run=${field#*=} ;;
+                                gitdaemon.scenario=*) scenario=${field#*=} ;;
+                                gitdaemon.role=*) role=${field#*=} ;;
+                            esac
+                            ;;
+                    esac
+                done
+                [[ -n $name ]] || name=$last
+                [[ -z $(rs_row "$kind" "$name") ]] || return 1
+                if [[ $kind == volume ]]; then id=$name; else id=$(rs_new_id "$kind" "$name:${MAPPING_ASSERT_GENERATION:-foreign}"); fi
+                rs_add "$kind" "$name" "$id" "$run" "$scenario" "$role"
+                printf '%s\n' "$id"
+                ;;
+            inspect:*|network:inspect|volume:inspect)
+                if [[ $kind == inspect ]]; then
+                    format=${2:-}
+                    [[ $format != -f ]] || format=${3:-}
+                else
+                    format=${3:-}
+                    [[ $format != -f ]] || format=${4:-}
+                fi
+                row=$(awk -F '\t' -v id="$last" '$2==id || $3==id {print; exit}' "$RS_STORE")
+                [[ -n $row ]] || return 1
+                IFS=$'\t' read -r kind name id run scenario role <<< "$row"
+                case "$format" in
+                    '{{.Id}}'|'{{.Name}}') printf '%s\n' "$id" ;;
+                    *gitdaemon.run*) printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" ;;
+                    '') printf '{"id":"%s","scenario":"%s"}\n' "$id" "$scenario" ;;
+                    *) printf '%s\n' "$row" ;;
+                esac
+                ;;
+            ps:*|network:ls|volume:ls)
+                if [[ $kind == ps ]]; then kind=container; fi
+                awk -F '\t' -v k="$kind" '$1==k {print $3}' "$RS_STORE"
+                ;;
+            rm:*|network:rm|volume:rm)
+                if [[ $kind == rm ]]; then kind=container; fi
+                rs_has_id "$kind" "$last" || return 1
+                printf '%s\t%s\n' "$kind" "$last" >> "$removed"
+                rs_delete "$kind" "$last"
+                ;;
+        esac
+    }
+    mapping_fixture_docker() { rs_docker "$@"; }
+    resource_docker() { rs_docker "$@"; }
     sa_doubles 1
     sa_lifecycle_defaults fallback
-    rs_new_id() { printf 'id-%s\n' "$(printf '%s:%s' "$1" "$2" | sha256sum | cut -d' ' -f1)"; }
-    rs_add() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$RS_SCENARIO" >> "$RS_STORE"; }
-    resource_create_register() {
-        local kind=$1 scenario=$2 role=$3 id
-        shift 3
-        [[ ${1:-} != -- ]] || shift
-        id=$(RS_SCENARIO=$scenario "$@") || return $?
-        [[ -n $id ]] || return 2
-        RESOURCE_CREATED_ID=$id
-    }
-    resource_crosscheck() {
-        local dir=$1 kind name identity scenario seq=0
-        RESOURCE_LEDGER_ORDER=()
-        RESOURCE_LEDGER_ACTIVE=()
-        while IFS=$'\t' read -r kind name identity scenario; do
-            seq=$((seq + 1))
-            RESOURCE_LEDGER_ORDER+=("$seq|$kind|$identity")
-            RESOURCE_LEDGER_ACTIVE["$kind|$identity"]="$seq|$scenario|role|hash|digest|$MP_RUN_ID"
-        done < "$RS_STORE"
-    }
-    resource_remove() {
-        local kind=$1 identity=$2
-        rs_has_id "$kind" "$identity" || return 2
-        printf '%s\t%s\n' "$kind" "$identity" >> "$removed"
-        rs_delete "$kind" "$identity"
-    }
     removed=$(mktemp)
-    RS_SCENARIO=mapping-direct
-    foreign=$(rs_docker create --name foreign "$MAPPING_PRODUCT_IMAGE")
+    ledger=$IT_CONTROL_DIR/resources
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=mtest
+    foreign=$(resource_docker create --label gitdaemon.run=mtest --label gitdaemon.scenario=mapping-direct \
+        --label gitdaemon.role=foreign --name foreign "$MAPPING_PRODUCT_IMAGE")
+    resource_register container "$foreign" mapping-direct foreign || return 1
+    resource_crosscheck "$ledger" || return 1
+    [[ $(awk -F '\t' '$2=="register" && $6=="mapping-direct" && $7=="foreign" {print $5}' "$ledger/ledger.tsv") == mtest ]] || failed=1
     mapping_control_request() { return 0; }
     mapping_scenario_fixture_prepare() {
-        local kind=$1 scenario=$2 dir=$3 ledger=$dir/control/resources
+        local kind=$1 scenario=$2 dir=$3
         mkdir -p "$dir/control" || return 80
         mapping_network_create "$MAPPING_PROFILE" "$ledger" "$scenario" >/dev/null || return 80
         RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
         resource_create_register container "$scenario" upstream -- \
             resource_docker create --label "gitdaemon.run=$MP_RUN_ID" \
+            --label "gitdaemon.scenario=$scenario" --label gitdaemon.role=upstream \
             --name "$(mapping_upstream_container)" "$MAPPING_PRODUCT_IMAGE" >/dev/null || return 80
         mapping_negative_prepare "$kind" "$scenario" "$dir" || return 80
         return 0
@@ -891,6 +935,8 @@ scenario_repeated_run_succeeds() (
     [[ $rc1 == 0 ]] || failed=1
     [[ $(rs_count) == 1 && $(rs_lookup container foreign) == "$foreign" ]] || { printf 'run1 cleanup crossed scenario or left resources behind\n'; failed=1; }
     [[ $(wc -l < "$removed") == 2 ]] || { printf 'run1 did not remove both resources\n'; failed=1; }
+    [[ $(awk -F '\t' '$2=="register" && $6=="mapping-fallback" && ($7=="upstream" || $7=="network") {print $5}' "$ledger/ledger.tsv" | sort -u) == mtest ]] || { printf 'target three-label registration missing\n'; failed=1; }
+    resource_crosscheck "$ledger" || { printf 'run1 ledger crosscheck failed\n'; failed=1; }
     generation1=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir1/identity.tsv")
     [[ $generation1 == mapping-fallback-g1-$$ ]] || { printf 'run1 generation not automatic: %s\n' "$generation1"; failed=1; }
     state_root=$IT_CONTROL_DIR/generations
@@ -907,16 +953,27 @@ scenario_repeated_run_succeeds() (
         printf 'run2 identity missing\n'
         failed=1
     fi
-    [[ $(wc -l < "$removed") == 4 ]] || { printf 'expected four exact resource deletions\n'; failed=1; }
+    [[ $(wc -l < "$removed") == 4 && $(cut -f2 "$removed" | sort -u | wc -l) == 4 ]] || { printf 'expected four unique exact resource deletions\n'; failed=1; }
+    resource_crosscheck "$ledger" || { printf 'run2 ledger crosscheck failed\n'; failed=1; }
     while IFS=$'\t' read -r kind id; do
-        [[ $id == id-???????????????????????????????????????????????????????????????? ]] || { printf 'incomplete deletion identity: %s\n' "$id"; failed=1; }
+        [[ $id =~ ^[0-9a-f]{64}$ ]] || { printf 'incomplete deletion identity: %s\n' "$id"; failed=1; }
         [[ $id != "$foreign" ]] || { printf 'deleted other scenario\n'; failed=1; }
         case "$kind:$id" in
-            "container:$(rs_new_id container "$(mapping_upstream_container)")"|"network:$(rs_new_id network gm-mtest-m-net)") ;;
+            container:*|network:*) ;;
             *) printf 'unexpected removal %s:%s\n' "$kind" "$id"; failed=1 ;;
         esac
         printf 'REPEAT removed=%s:%s\n' "$kind" "$id"
     done < "$removed"
+    id=$(resource_docker network create --label gitdaemon.run=mtest --label gitdaemon.scenario=mapping-fallback \
+        --label gitdaemon.role=network drift-net)
+    resource_register network "$id" mapping-fallback network || failed=1
+    resource_crosscheck "$ledger" || failed=1
+    rs_drift "$id" mapping-direct
+    rc1=0
+    resource_cleanup_scenario "$ledger" mapping-fallback || rc1=$?
+    [[ $rc1 == 2 && $(wc -l < "$removed") == 4 && $(rs_lookup network drift-net) == "$id" ]] \
+        || { printf 'identity drift deleted an object or escaped detection rc=%s\n' "$rc1"; failed=1; }
+    printf 'REPEAT drift_cleanup=%s deletions=%s foreign_preserved=%s\n' "$rc1" "$(wc -l < "$removed")" "$(rs_lookup container foreign)"
     rm -rf "$dir1" "$dir2"
     rm -f "$RS_STORE" "$removed"
     return "$failed"
