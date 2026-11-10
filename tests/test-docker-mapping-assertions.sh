@@ -838,6 +838,7 @@ rs_install() {
 # 第二次才能重建同名资源；残留即视为释放不完整。
 scenario_repeated_run_succeeds() (
     local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root foreign id removed ledger
+    local ledger_start ledger_first ledger_second removed_first
     dir1=$(mktemp -d)
     dir2=$(mktemp -d)
     RS_STORE=$(mktemp)
@@ -917,6 +918,7 @@ scenario_repeated_run_succeeds() (
     resource_register container "$foreign" mapping-direct foreign || return 1
     resource_crosscheck "$ledger" || return 1
     [[ $(awk -F '\t' '$2=="register" && $6=="mapping-direct" && $7=="foreign" {print $5}' "$ledger/ledger.tsv") == mtest ]] || failed=1
+    ledger_start=$(wc -l < "$ledger/ledger.tsv")
     mapping_control_request() { return 0; }
     mapping_scenario_fixture_prepare() {
         local kind=$1 scenario=$2 dir=$3
@@ -931,6 +933,8 @@ scenario_repeated_run_succeeds() (
         return 0
     }
     mapping_scenario_run fallback "$dir1" || rc1=$?
+    ledger_first=$(wc -l < "$ledger/ledger.tsv")
+    removed_first=$(wc -l < "$removed")
     printf 'REPEAT run1 rc=%s target_leftover=%s foreign=%s\n' "$rc1" "$(($(rs_count) - 1))" "$foreign"
     [[ $rc1 == 0 ]] || failed=1
     [[ $(rs_count) == 1 && $(rs_lookup container foreign) == "$foreign" ]] || { printf 'run1 cleanup crossed scenario or left resources behind\n'; failed=1; }
@@ -942,6 +946,7 @@ scenario_repeated_run_succeeds() (
     state_root=$IT_CONTROL_DIR/generations
     [[ -s $state_root/$generation1/mapping-network.tsv ]] || { printf 'run1 network state missing\n'; failed=1; }
     mapping_scenario_run fallback "$dir2" || rc2=$?
+    ledger_second=$(wc -l < "$ledger/ledger.tsv")
     printf 'REPEAT run2 rc=%s target_leftover=%s foreign=%s\n' "$rc2" "$(($(rs_count) - 1))" "$foreign"
     [[ $rc2 == 0 ]] || failed=1
     [[ $(rs_count) == 1 && $(rs_lookup container foreign) == "$foreign" ]] || { printf 'run2 cleanup crossed scenario or left resources behind\n'; failed=1; }
@@ -955,6 +960,26 @@ scenario_repeated_run_succeeds() (
     fi
     [[ $(wc -l < "$removed") == 4 && $(cut -f2 "$removed" | sort -u | wc -l) == 4 ]] || { printf 'expected four unique exact resource deletions\n'; failed=1; }
     resource_crosscheck "$ledger" || { printf 'run2 ledger crosscheck failed\n'; failed=1; }
+    for id in 1 2; do
+        local start end generation deletion_start deletion_end registered receipts actual
+        if [[ $id == 1 ]]; then
+            start=$ledger_start end=$ledger_first generation=$generation1 deletion_start=0 deletion_end=$removed_first
+        else
+            start=$ledger_first end=$ledger_second generation=${generation2:-} deletion_start=$removed_first deletion_end=4
+        fi
+        registered=$(awk -F '\t' -v start="$start" -v end="$end" -v gen="$generation" \
+            'NR>start && NR<=end && $2=="register" {print $3 "\t" gen "\t" $5 "\t" $6 "\t" $7 "\t" $4}' "$ledger/ledger.tsv" | sort)
+        receipts=$(awk -F '\t' -v start="$start" -v end="$end" -v gen="$generation" \
+            'NR>start && NR<=end && $2=="removed" {print $3 "\t" gen "\t" $5 "\t" $6 "\t" $7 "\t" $4}' "$ledger/ledger.tsv" | sort)
+        actual=$(awk -F '\t' -v start="$deletion_start" -v end="$deletion_end" \
+            'NR>start && NR<=end {print $1 "\t" $2}' "$removed" | sort)
+        [[ $(printf '%s\n' "$registered" | wc -l) == 2 && $registered == "$receipts" ]] \
+            || { printf 'generation %s registration/receipt mismatch\n' "$generation"; failed=1; }
+        [[ $(printf '%s\n' "$registered" | cut -f1,6 | sort) == "$actual" ]] \
+            || { printf 'generation %s registration/deletion mismatch\n' "$generation"; failed=1; }
+        [[ $(printf '%s\n' "$registered" | cut -f1,3-5 | sort) == $'container\tmtest\tmapping-fallback\tupstream\nnetwork\tmtest\tmapping-fallback\tnetwork' ]] \
+            || { printf 'generation %s unexpected ownership or roles\n' "$generation"; failed=1; }
+    done
     while IFS=$'\t' read -r kind id; do
         [[ $id =~ ^[0-9a-f]{64}$ ]] || { printf 'incomplete deletion identity: %s\n' "$id"; failed=1; }
         [[ $id != "$foreign" ]] || { printf 'deleted other scenario\n'; failed=1; }
