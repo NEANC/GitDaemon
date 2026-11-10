@@ -508,7 +508,9 @@ guard_mapping_main() {
     chmod 755 "$E"
     guard_mapping_control_prepare || return $?
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
-    sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
+    sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256" || return 80
+    sha256sum "$E/inputs.sha256" | cut -d' ' -f1 > "$E/inputs.sha256.digest" || return 80
+    chmod 644 "$E/inputs.sha256" "$E/inputs.sha256.digest" || return 80
     if [[ -d $source/.git ]]; then
         git -C "$source" status --short > "$E/git-state.txt"
     else
@@ -646,7 +648,9 @@ guard_main() {
         mkdir "$E/control"; chown "$RUNNER" "$E/control"
     fi
     printf '%s\n' "$existing" > "$E/subnets-before.txt"
-    sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256"
+    sha256sum "$source"/tests/*.sh "$source"/tests/docker-dns-tools.Dockerfile "$source"/Dockerfile "$source"/compose.yml > "$E/inputs.sha256" || return 80
+    sha256sum "$E/inputs.sha256" | cut -d' ' -f1 > "$E/inputs.sha256.digest" || return 80
+    chmod 644 "$E/inputs.sha256" "$E/inputs.sha256.digest" || return 80
     if [[ -d $source/.git ]]; then
         git -C "$source" status --short > "$E/git-state.txt"
     else

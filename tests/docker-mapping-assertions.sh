@@ -657,7 +657,7 @@ mapping_scenario_proxy_url() {
 # identity.tsv：绑定 run/scenario/generation/network/image/三项哈希与独有提交。
 mapping_scenario_identity_write() {
     local kind=${1:-} scenario=${2:-} generation=${3:-} dir=${4:-}
-    local network image profile_sha input_sha manifest_sha unique file
+    local network image profile_sha input_sha manifest_sha unique file root
     [[ -n $kind && -n $scenario && -n $generation && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
     network=$(mapping_network_id_load) || return "$MAPPING_ASSERT_FIXTURE"
@@ -666,7 +666,9 @@ mapping_scenario_identity_write() {
     [[ -n $image && -n $profile_sha ]] || return "$MAPPING_ASSERT_FIXTURE"
     unique=$(sed -n '1p' "$dir/control/unique-commit" 2>/dev/null) || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n $unique ]] || return "$MAPPING_ASSERT_FIXTURE"
-    input_sha=$(mapping_scenario_hash_of "$dir/inputs.sha256") || return "$MAPPING_ASSERT_FIXTURE"
+    root=${MAPPING_INPUT_ROOT:-}
+    [[ -n $root && $root == /* && ${IT_CONTROL_DIR:-} == "$root/control" ]] || return "$MAPPING_ASSERT_FIXTURE"
+    input_sha=$(mapping_scenario_frozen_input_hash "$root") || return "$MAPPING_ASSERT_FIXTURE"
     manifest_sha=$(mapping_scenario_hash_of "${MAPPING_MANIFEST:-}") || return "$MAPPING_ASSERT_FIXTURE"
     file=$dir/identity.tsv
     {
@@ -684,7 +686,25 @@ mapping_scenario_identity_write() {
     return 0
 }
 
-# 输入摘要：给定文件的 SHA-256；文件不存在或不可读时非零（调用方回退到档案摘要）。
+mapping_scenario_input_facts() { stat -c '%u %a' -- "$1" 2>/dev/null; }
+
+mapping_scenario_frozen_input_hash() {
+    local root=${1:-} list=$root/inputs.sha256 anchor=$root/inputs.sha256.digest facts owner mode digest expected file
+    [[ -f $list && ! -L $list && -f $anchor && ! -L $anchor ]] || return 1
+    for file in "$list" "$anchor"; do
+        facts=$(mapping_scenario_input_facts "$file") || return 1
+        read -r owner mode <<< "$facts"
+        [[ $owner == 0 && $mode =~ ^[0-7]{3,4}$ ]] || return 1
+        (( (8#$mode & 8#022) == 0 )) || return 1
+    done
+    expected=$(cat -- "$anchor") || return 1
+    [[ $expected =~ ^[0-9a-f]{64}$ ]] || return 1
+    digest=$(mapping_scenario_hash_of "$list") || return 1
+    [[ $digest == "$expected" ]] || return 1
+    sha256sum -c -- "$list" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$digest"
+}
+
 mapping_scenario_hash_of() {
     local file=${1:-} digest
     [[ -n $file && -f $file && ! -L $file && -r $file ]] || return 1
@@ -742,6 +762,7 @@ mapping_scenario_run() {
     MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
     generation=$(mapping_assert_generation "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     mapping_assert_prepare_dir "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    local MAPPING_INPUT_ROOT=${IT_CONTROL_DIR%/control}
     # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
     # 分组会把证据写进映射场景的嵌套目录，主成功/清理失败校验被静默跳过。
     local IT_EVIDENCE_DIR=$dir
@@ -813,6 +834,7 @@ mapping_negative_run() {
     MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
     generation=$(mapping_assert_generation "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     mapping_assert_prepare_dir "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    local MAPPING_INPUT_ROOT=${IT_CONTROL_DIR%/control}
     # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
     # 分组会把证据写进映射场景的嵌套目录，主成功/清理失败校验被静默跳过。
     local IT_EVIDENCE_DIR=$dir

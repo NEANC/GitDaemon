@@ -39,6 +39,12 @@ MAPPING_TOOLS_IMAGE=tools
 MAPPING_ASSET_ROOT=$WORK/assets
 printf 'manifest\n' > "$MAPPING_MANIFEST"
 export MAPPING_PROFILE MAPPING_MANIFEST MAPPING_PRODUCT_IMAGE MAPPING_TOOLS_IMAGE MAPPING_ASSET_ROOT LOG_FILE
+mkdir -p "$WORK/run/control"
+sha256sum "$MAPPING_MANIFEST" > "$WORK/run/inputs.sha256"
+sha256sum "$WORK/run/inputs.sha256" | cut -d' ' -f1 > "$WORK/run/inputs.sha256.digest"
+IT_CONTROL_DIR=$WORK/run/control
+IT_EVIDENCE_DIR=$WORK/run
+mapping_scenario_input_facts() { printf '0 644\n'; }
 
 # 证据文件 samples 使用的可变字段。
 EV_UNIQUE=''
@@ -151,7 +157,6 @@ sa_doubles() {
         local dir=$3
         [[ ${D_FIXTURE_FAIL:-0} == 0 ]] || return 80
         mkdir -p "$dir/control" || return 80
-        printf 'inputs\n' > "$dir/inputs.sha256" || return 80
         printf 'network_id\t%s\n' "${D_NETWORK_ID:-netid-double}" > "$dir/control/mapping-network.tsv"
         # 负例缺陷选择走真实逻辑，只有证书替换/额外网络边界被替换。
         mapping_negative_prepare "$1" "$2" "$dir" || return 80
@@ -845,7 +850,6 @@ scenario_repeated_run_succeeds() {
     mapping_scenario_fixture_prepare() {
         local kind=$1 scenario=$2 dir=$3 ledger=$dir/control/resources
         mkdir -p "$dir/control" || return 80
-        printf 'inputs\n' > "$dir/inputs.sha256" || return 80
         mapping_network_create "$MAPPING_PROFILE" "$ledger" >/dev/null || return 80
         RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
         resource_create_register container "$kind" upstream -- \
