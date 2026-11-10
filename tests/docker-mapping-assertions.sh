@@ -429,6 +429,8 @@ mapping_scenario_product_up() {
         --label "gitdaemon.scenario=$scenario" \
         --label "gitdaemon.role=$MAPPING_ASSERT_DATA_ROLE" "$data" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
     snapshot_content=$(mapping_scenario_snapshot_content "$kind") || return "$MAPPING_ASSERT_FIXTURE"
+    mkdir -p "$dir/control" || return "$MAPPING_ASSERT_FIXTURE"
+    printf '%s' "$snapshot_content" > "$dir/control/snapshot.content" || return "$MAPPING_ASSERT_FIXTURE"
     if [[ -n $snapshot_content ]]; then
         mapping_scenario_data_write "$data" "$MAPPING_ASSERT_SNAPSHOT_REL" "$snapshot_content" "$MAPPING_PRODUCT_IMAGE" \
             || return "$MAPPING_ASSERT_FIXTURE"
@@ -545,7 +547,7 @@ mapping_dns_query() {
     status=$(sed -n 's/.*status: \([A-Z][A-Z]*\),.*/\1/p' "$raw" | head -n 1)
     server=$(sed -n 's/^;; SERVER: \([^#[:space:]]*\).*/\1/p' "$raw" | head -n 1)
     answer=$(sed -n 's/.*ANSWER: \([0-9][0-9]*\).*/\1/p' "$raw" | head -n 1)
-    [[ -n $status && -n $server ]] || return "$MAPPING_ASSERT_FIXTURE"
+    [[ -n $status && $server == "$resolver" ]] || return "$MAPPING_ASSERT_FIXTURE"
     case "$status" in
         NXDOMAIN) printf '%s\t%s\tNXDOMAIN\n' "$name" "$rrtype" ;;
         NOERROR)
@@ -563,7 +565,7 @@ mapping_scenario_dns_state() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} spec name type raw rc
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
-    for spec in 'github.com A' 'github.com AAAA' "$MAPPING_PROXY_HOST A"; do
+    for spec in "$MAPPING_UPSTREAM_HOST A" "$MAPPING_UPSTREAM_HOST AAAA" "$MAPPING_PROXY_HOST A"; do
         read -r name type <<< "$spec"
         raw=$dir/dig-$name-$type.txt
         rc=0
@@ -575,18 +577,31 @@ mapping_scenario_dns_state() {
     return 0
 }
 
+mapping_scenario_dns_client_probe() {
+    local client=${1:-} dir=${2:-} state=${3:-} spec name type raw rc=0
+    [[ -n $client && -d $dir && -n $state ]] || return "$MAPPING_ASSERT_FIXTURE"
+    for spec in "$MAPPING_UPSTREAM_HOST A" "$MAPPING_UPSTREAM_HOST AAAA" "$MAPPING_PROXY_HOST A"; do
+        read -r name type <<< "$spec"
+        raw=$dir/dig-$client-$name-$type.txt
+        rc=0
+        mapping_fixture_docker exec "$client" dig +time=1 +tries=1 "@$MP_D" "$name" "$type" > "$raw" 2>&1 || rc=$?
+        mapping_dns_query "$client" "$MP_D" "$name" "$type" "$raw" "$rc" >> "$state" \
+            || return "$MAPPING_ASSERT_FIXTURE"
+    done
+    return 0
+}
+
 # 受控 DNS 恢复：清除假绿开关并核验 github.com 恢复为 NXDOMAIN、gm-proxy 仍指向 X。
 # 恢复后判定器读到的 DNS 证据不再是被造假绿样本。
 mapping_scenario_dns_restore() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} file rc=0
-    MAPPING_DNS_FAKE_HOST=''
-    MAPPING_DNS_FAKE_IP=''
     [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
+    local MAPPING_ASSERT_KIND=$kind
     mapping_dns_set nxdomain "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     file=$dir/dns.restore
     mapping_scenario_dns_state "$kind" "$scenario" "$dir" > "$file" || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_assert_dns_file "$file" || rc="$MAPPING_ASSERT_FAIL"
-    rm -f "$file"
+    mapping_assert_dns_file "$file" || rc="$MAPPING_ASSERT_FIXTURE"
     return "$rc"
 }
 
@@ -721,10 +736,15 @@ mapping_scenario_evidence() {
     [[ -n $scenario && -n $generation && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     base_scenario=$(mapping_assert_scenario "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_GENERATION=$generation
+    MAPPING_ASSERT_PRODUCT=''
     # 本轮代理计数与 CONNECT 日志按 generation 独立，重跑不复用上一轮证据。
     MAPPING_PROXY_RUN_ID=$generation
     mapping_scenario_fixture_prepare "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_calibrate "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_DNS_MODE:-none} == upstream ]]; then
+        local MAPPING_ASSERT_KIND=$kind
+        mapping_dns_set upstream "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    fi
     product=$(mapping_scenario_product_up "$kind" "$scenario" "$dir") || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n $product ]] || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_PRODUCT=$product
@@ -737,6 +757,9 @@ mapping_scenario_evidence() {
     mapping_scenario_upstream_head "$kind" "$scenario" "$dir" > "$dir/head.expected" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_apply_negative "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_sync_exec "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == unreachable-map-system ]]; then
+        mapping_scenario_unreachable_probe "$product" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    fi
     mapping_scenario_proxy_after "$kind" "$scenario" "$dir" > "$dir/proxy.after" || return "$MAPPING_ASSERT_FIXTURE"
     case "${MAPPING_ASSERT_CASE:-}" in
         wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san)
@@ -749,6 +772,17 @@ mapping_scenario_evidence() {
     mapping_scenario_local_head "$kind" "$scenario" "$dir" > "$dir/head.actual" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_local_fsck "$kind" "$scenario" "$dir" > "$dir/fsck.exit" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_dns_state "$kind" "$scenario" "$dir" > "$dir/dns.txt" || return "$MAPPING_ASSERT_FIXTURE"
+    return 0
+}
+
+mapping_scenario_unreachable_probe() {
+    local product=${1:-} dir=${2:-} rc=0
+    [[ -n $product && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_fixture_docker exec "$product" curl --silent --show-error --connect-timeout 2 \
+        --max-time 3 --noproxy '*' --resolve "$MAPPING_UPSTREAM_HOST:443:$MP_N" \
+        "https://$MAPPING_UPSTREAM_HOST/health.txt" > "$dir/unreachable.log" 2>&1 || rc=$?
+    [[ $rc == 7 || $rc == 28 ]] || return "$MAPPING_ASSERT_FIXTURE"
+    printf '%s\n' "$MP_N" > "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
 }
 
@@ -788,7 +822,7 @@ mapping_scenario_run() {
 # 同时把被拒层次写入 MAPPING_ASSERT_REJECT_LAYER：sync 为底层同步层，mapping 为映射判定层，
 # policy 为配置审计层。
 mapping_negative_rejected() {
-    local case_name=${1:-} kind=${2:-} dir=${3:-} sync_exit system_line
+    local case_name=${1:-} kind=${2:-} dir=${3:-} sync_exit system_line snapshot
     [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     case "$case_name" in
         isolation)
@@ -798,13 +832,51 @@ mapping_negative_rejected() {
             MAPPING_ASSERT_REJECT_LAYER=policy
             return 0
             ;;
-        dns-false-green)
+        dns-false-green|unreachable-map-system)
             mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+            mapping_assert_identity_load "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return "$MAPPING_ASSERT_FIXTURE"
             [[ $sync_exit == 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
             system_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_SYSTEM")
             [[ -n $system_line ]] || return "$MAPPING_ASSERT_FIXTURE"
-            if mapping_assert_result "$kind" "$dir"; then return 1; fi
+            mapping_assert_refs_match "$dir" && mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" \
+                && mapping_assert_head_match "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+            [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
+            [[ -f $dir/dns.txt && ! -L $dir/dns.txt ]] || return "$MAPPING_ASSERT_FIXTURE"
+            mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
+            grep -Fqx "$(printf '%s\tA\t%s' "$MAPPING_UPSTREAM_HOST" "$MP_U")" "$dir/dns.txt" \
+                || return "$MAPPING_ASSERT_FIXTURE"
+            [[ -n $(mapping_assert_log_line "$dir/sync.log" '传输失败：直连加动态地址映射') ]] || return 1
+            if [[ $case_name == unreachable-map-system ]]; then
+                snapshot=$(sed -n '1p' "$dir/control/snapshot.content" 2>/dev/null) || return "$MAPPING_ASSERT_FIXTURE"
+                [[ $snapshot == "$MP_N $MAPPING_UPSTREAM_HOST" ]] || return "$MAPPING_ASSERT_FIXTURE"
+                [[ -f $dir/unreachable.txt && ! -L $dir/unreachable.txt ]] || return "$MAPPING_ASSERT_FIXTURE"
+                grep -Fqx "$MP_N" "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
+                [[ -f $dir/unreachable.log && ! -L $dir/unreachable.log ]] || return "$MAPPING_ASSERT_FIXTURE"
+            else
+                [[ -f $dir/control/snapshot.content && ! -s $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
+            fi
+            MAPPING_ASSERT_REJECT_LAYER=dns
+            return 0
+            ;;
+        missing-map|invalid-map)
+            mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+            sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return "$MAPPING_ASSERT_FIXTURE"
+            (( sync_exit != 0 )) || return 1
+            [[ -f $dir/control/snapshot.content && ! -L $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
+            snapshot=$(sed -n '1p' "$dir/control/snapshot.content") || return "$MAPPING_ASSERT_FIXTURE"
+            if [[ $case_name == missing-map ]]; then
+                [[ -z $snapshot ]] || return 1
+            else
+                [[ $snapshot == "$MAPPING_ASSERT_RESERVED_ADDR $MAPPING_UPSTREAM_HOST" ]] || return 1
+            fi
+            [[ -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
+            if [[ $case_name == invalid-map ]]; then
+                grep -Fq '地址快照无效，忽略动态映射' "$dir/sync.log" || return 1
+            else
+                grep -Fq '无地址快照，使用系统 DNS' "$dir/sync.log" || return 1
+            fi
+            MAPPING_ASSERT_REJECT_LAYER=sync
             return 0
             ;;
         wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san)
@@ -850,12 +922,14 @@ mapping_negative_run() {
     if mapping_negative_rejected "$case_name" "$kind" "$dir"; then
         rc=0
     else
-        rc="$MAPPING_ASSERT_FAIL"
+        rc=$?
+        [[ $rc == "$MAPPING_ASSERT_FIXTURE" ]] || rc="$MAPPING_ASSERT_FAIL"
     fi
     printf '%s\n' "${MAPPING_ASSERT_REJECT_LAYER:-none}" > "$dir/reject.layer" || rc="$MAPPING_ASSERT_FIXTURE"
-    # 结束后恢复受控 DNS：清除假绿开关（配合本场景释放被造假的 DNS 容器，使后续运行回到 NXDOMAIN）。
-    MAPPING_DNS_FAKE_HOST=''
-    MAPPING_DNS_FAKE_IP=''
+    if [[ ${MAPPING_ASSERT_DNS_MODE:-none} == upstream ]]; then
+        mapping_scenario_dns_restore "$kind" "$scenario" "$dir" || rc="$MAPPING_ASSERT_FIXTURE"
+    fi
+    MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
     mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || rc="$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_CASE='' MAPPING_PROXY_RUN_ID=''
     return "$rc"

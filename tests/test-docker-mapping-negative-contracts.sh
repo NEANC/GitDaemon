@@ -60,8 +60,8 @@ tls_injection_follows_healthy_baseline() {
     local dir order rc=0
     dir=$(mktemp -d); order=$dir/order
     MAPPING_ASSERT_CASE=wrong_proxy_ca
-    MAPPING_PROFILE=profile MAPPING_PRODUCT_IMAGE=product MAPPING_TOOLS_IMAGE=tools
-    mapping_prepare() { printf 'prepare\n' >> "$order"; }
+    MAPPING_PROFILE=$dir/profile MAPPING_PRODUCT_IMAGE=product MAPPING_TOOLS_IMAGE=tools
+    mapping_scenario_fixture_prepare() { printf 'prepare\n' >> "$order"; mapping_negative_prepare "$@"; }
     mapping_proxy_evidence_reset() { return 0; }
     mapping_proxy_calibrate() { printf 'calibrate\n' >> "$order"; }
     mapping_negative_wrong_ca() { printf 'inject\n' >> "$order"; }

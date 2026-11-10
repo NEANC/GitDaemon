@@ -1128,6 +1128,47 @@ mapping_dns_daemon_args() {
         --log-queries --log-facility=- --pid-file= --user=git-daemon
 }
 
+mapping_dns_set() {
+    local mode=${1:-} scenario=${2:-} dir=${3:-} name id args client state observed
+    [[ $mode == nxdomain || $mode == upstream ]] || return "$MAPPING_FAILURE"
+    [[ -n $scenario && -d $dir && -n ${MAPPING_PROFILE:-} && -n ${MAPPING_TOOLS_IMAGE:-} ]] || return "$MAPPING_FAILURE"
+    mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_FAILURE"
+    name=$(mapping_dns_container) || return "$MAPPING_FAILURE"
+    id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$name") || return "$MAPPING_FAILURE"
+    [[ -n $id ]] || return "$MAPPING_FAILURE"
+    resource_remove container "$id" || return "$MAPPING_FAILURE"
+    if [[ $mode == upstream ]]; then
+        MAPPING_DNS_FAKE_HOST=$MAPPING_UPSTREAM_HOST MAPPING_DNS_FAKE_IP=$MP_U
+    else
+        MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
+    fi
+    args=$(mapping_dns_daemon_args "$MAPPING_PROFILE") || return "$MAPPING_FAILURE"
+    mapping_fixture_run "$scenario" dns -d --name "$name" \
+        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_D" \
+        --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_DNS_PORT" \
+        "$MAPPING_TOOLS_IMAGE" $args >/dev/null || return "$MAPPING_FAILURE"
+    mapping_fixture_wait "$name" || return "$MAPPING_FAILURE"
+    for client in ${MAPPING_ASSERT_PRODUCT:+"$MAPPING_ASSERT_PRODUCT"}; do
+        mapping_fixture_docker restart "$client" >/dev/null || return "$MAPPING_FAILURE"
+        mapping_fixture_wait "$client" || return "$MAPPING_FAILURE"
+    done
+    state=$dir/dns-rebuild-$mode.tsv
+    mapping_scenario_dns_state "${MAPPING_ASSERT_KIND:-fallback}" "$scenario" "$dir" > "$state" || return "$MAPPING_FAILURE"
+    if [[ -n ${MAPPING_ASSERT_PRODUCT:-} ]]; then
+        observed=$dir/dns-client-$mode.tsv
+        : > "$observed" || return "$MAPPING_FAILURE"
+        mapping_scenario_dns_client_probe "$MAPPING_ASSERT_PRODUCT" "$dir" "$observed" || return "$MAPPING_FAILURE"
+        cmp -s "$state" "$observed" || return "$MAPPING_FAILURE"
+    fi
+    if [[ $mode == nxdomain ]]; then
+        mapping_assert_dns_file "$state" || return "$MAPPING_FAILURE"
+    else
+        grep -Fqx "$(printf '%s\tA\t%s' "$MAPPING_UPSTREAM_HOST" "$MP_U")" "$state" || return "$MAPPING_FAILURE"
+        grep -Fqx "$(printf '%s\tAAAA\tNXDOMAIN' "$MAPPING_UPSTREAM_HOST")" "$state" || return "$MAPPING_FAILURE"
+    fi
+    return 0
+}
+
 # 上游服务脚本：逐连接接受一次并记录 requests.log，供 U:443 实际连接计数取证。
 # 请求日志与 serve.log 落在独立可写证据卷（MAPPING_EVIDENCE_ROOT），证书私钥仍留在只读资产卷；
 # 只读文件系统上的写重定向会失败并使循环空转，因此两者必须分开挂载。

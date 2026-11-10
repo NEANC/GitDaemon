@@ -219,6 +219,13 @@ sa_doubles() {
         printf '%s\tA\t%s\n' "$MAPPING_PROXY_HOST" "$proxy"
     }
     mapping_dns_set() { return 0; }
+    mapping_fixture_docker() {
+        if [[ ${MAPPING_ASSERT_CASE:-} == unreachable-map-system && $1 == exec && $3 == curl ]]; then
+            printf 'curl: (7) Failed to connect to %s:443\n' "$MP_N" >&2
+            return 7
+        fi
+        return 80
+    }
     if [[ $keep_release != 1 ]]; then
         mapping_scenario_release() { return 0; }
     fi
@@ -454,7 +461,7 @@ sa_negative_layer() {
     local case_name=$1 dir=$2 layer expect
     case "$case_name" in
         missing-map|invalid-map|wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) expect=sync ;;
-        dns-false-green|unreachable-map-system) expect=mapping ;;
+        dns-false-green|unreachable-map-system) expect=dns ;;
         isolation) expect=policy ;;
         *) printf 'unknown negative case %s\n' "$case_name"; return 1 ;;
     esac
@@ -540,9 +547,13 @@ sa_negative_case() {
 # 各负例的替身缺陷参数。
 sa_negative_overrides() {
     case "$1" in
-        missing-map|invalid-map)
+        missing-map)
             D_SYNC_EXIT=1
-            D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n传输失败：直连加动态地址映射；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
+            D_LOG=$'无地址快照，使用系统 DNS\n传输失败：直连系统 DNS；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
+            ;;
+        invalid-map)
+            D_SYNC_EXIT=1
+            D_LOG=$'地址快照无效，忽略动态映射\n传输失败：直连系统 DNS；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
             ;;
         dns-false-green)
             D_SYNC_EXIT=0
@@ -646,8 +657,7 @@ scenario_evidence_dir_local() {
     [[ $IT_EVIDENCE_DIR == /outer/evidence ]] \
         || { printf 'scenario run changed IT_EVIDENCE_DIR: %s\n' "$IT_EVIDENCE_DIR"; failed=1; }
     sa_lifecycle_case fallback
-    D_SYNC_EXIT=1
-    D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n'
+    sa_negative_overrides missing-map
     IT_EVIDENCE_DIR=/outer/evidence
     rc=0
     mapping_negative_run missing-map fallback "$dir_b" || rc=$?
