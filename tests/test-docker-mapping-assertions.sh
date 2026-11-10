@@ -837,12 +837,13 @@ rs_install() {
 # 同一 scenario 在同一进程内连续运行两次均成功：释放必须清掉映射网络与固定名容器，
 # 第二次才能重建同名资源；残留即视为释放不完整。
 scenario_repeated_run_succeeds() (
-    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root foreign id removed ledger
-    local ledger_start ledger_first ledger_second removed_first
+    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root foreign id removed ledger created
+    local ledger_start ledger_first ledger_second removed_first created_first state1 network_loader
     dir1=$(mktemp -d)
     dir2=$(mktemp -d)
     RS_STORE=$(mktemp)
     : > "$RS_STORE"
+    created=$(mktemp)
     rs_new_id() { printf '%s:%s' "$1" "$2" | sha256sum | cut -d' ' -f1; }
     rs_add() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$RS_STORE"; }
     # 在文件对象上模拟实时标签漂移，不修改真实账本记录。
@@ -874,6 +875,7 @@ scenario_repeated_run_succeeds() (
                 [[ -z $(rs_row "$kind" "$name") ]] || return 1
                 if [[ $kind == volume ]]; then id=$name; else id=$(rs_new_id "$kind" "$name:${MAPPING_ASSERT_GENERATION:-foreign}"); fi
                 rs_add "$kind" "$name" "$id" "$run" "$scenario" "$role"
+                printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$id" "$run" "$scenario" "$role" >> "$created"
                 printf '%s\n' "$id"
                 ;;
             inspect:*|network:inspect|volume:inspect)
@@ -906,9 +908,11 @@ scenario_repeated_run_succeeds() (
                 ;;
         esac
     }
+    network_loader=$(declare -f mapping_network_id_load)
     mapping_fixture_docker() { rs_docker "$@"; }
     resource_docker() { rs_docker "$@"; }
     sa_doubles 1
+    eval "$network_loader"
     sa_lifecycle_defaults fallback
     removed=$(mktemp)
     ledger=$IT_CONTROL_DIR/resources
@@ -935,6 +939,7 @@ scenario_repeated_run_succeeds() (
     mapping_scenario_run fallback "$dir1" || rc1=$?
     ledger_first=$(wc -l < "$ledger/ledger.tsv")
     removed_first=$(wc -l < "$removed")
+    created_first=$(wc -l < "$created")
     printf 'REPEAT run1 rc=%s target_leftover=%s foreign=%s\n' "$rc1" "$(($(rs_count) - 1))" "$foreign"
     [[ $rc1 == 0 ]] || failed=1
     [[ $(rs_count) == 1 && $(rs_lookup container foreign) == "$foreign" ]] || { printf 'run1 cleanup crossed scenario or left resources behind\n'; failed=1; }
@@ -945,6 +950,7 @@ scenario_repeated_run_succeeds() (
     [[ $generation1 == mapping-fallback-g1-$$ ]] || { printf 'run1 generation not automatic: %s\n' "$generation1"; failed=1; }
     state_root=$IT_CONTROL_DIR/generations
     [[ -s $state_root/$generation1/mapping-network.tsv ]] || { printf 'run1 network state missing\n'; failed=1; }
+    state1=$(cat "$state_root/$generation1/mapping-network.tsv" 2>/dev/null) || failed=1
     mapping_scenario_run fallback "$dir2" || rc2=$?
     ledger_second=$(wc -l < "$ledger/ledger.tsv")
     printf 'REPEAT run2 rc=%s target_leftover=%s foreign=%s\n' "$rc2" "$(($(rs_count) - 1))" "$foreign"
@@ -954,6 +960,8 @@ scenario_repeated_run_succeeds() (
         generation2=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir2/identity.tsv")
         [[ $generation2 == mapping-fallback-g2-$$ && $generation2 != "$generation1" ]] || { printf 'run2 reused generation: %s\n' "$generation2"; failed=1; }
         [[ -s $state_root/$generation2/mapping-network.tsv ]] || { printf 'run2 network state missing\n'; failed=1; }
+        [[ $(cat "$state_root/$generation1/mapping-network.tsv" 2>/dev/null) == "$state1" ]] \
+            || { printf 'run2 changed run1 network state\n'; failed=1; }
     else
         printf 'run2 identity missing\n'
         failed=1
@@ -961,23 +969,35 @@ scenario_repeated_run_succeeds() (
     [[ $(wc -l < "$removed") == 4 && $(cut -f2 "$removed" | sort -u | wc -l) == 4 ]] || { printf 'expected four unique exact resource deletions\n'; failed=1; }
     resource_crosscheck "$ledger" || { printf 'run2 ledger crosscheck failed\n'; failed=1; }
     for id in 1 2; do
-        local start end generation deletion_start deletion_end registered receipts actual
+        local start end generation deletion_start deletion_end creation_start creation_end registered receipts actual made state identity network container evidence_dir
         if [[ $id == 1 ]]; then
-            start=$ledger_start end=$ledger_first generation=$generation1 deletion_start=0 deletion_end=$removed_first
+            start=$ledger_start end=$ledger_first generation=$generation1 deletion_start=0 deletion_end=$removed_first creation_start=1 creation_end=$created_first evidence_dir=$dir1
         else
-            start=$ledger_first end=$ledger_second generation=${generation2:-} deletion_start=$removed_first deletion_end=4
+            start=$ledger_first end=$ledger_second generation=${generation2:-} deletion_start=$removed_first deletion_end=4 creation_start=$created_first creation_end=$(wc -l < "$created") evidence_dir=$dir2
         fi
-        registered=$(awk -F '\t' -v start="$start" -v end="$end" -v gen="$generation" \
-            'NR>start && NR<=end && $2=="register" {print $3 "\t" gen "\t" $5 "\t" $6 "\t" $7 "\t" $4}' "$ledger/ledger.tsv" | sort)
-        receipts=$(awk -F '\t' -v start="$start" -v end="$end" -v gen="$generation" \
-            'NR>start && NR<=end && $2=="removed" {print $3 "\t" gen "\t" $5 "\t" $6 "\t" $7 "\t" $4}' "$ledger/ledger.tsv" | sort)
+        registered=$(awk -F '\t' -v start="$start" -v end="$end" \
+            'NR>start && NR<=end && $2=="register" {print $3 "\t" $5 "\t" $6 "\t" $7 "\t" $4}' "$ledger/ledger.tsv" | sort)
+        receipts=$(awk -F '\t' -v start="$start" -v end="$end" \
+            'NR>start && NR<=end && $2=="removed" {print $3 "\t" $5 "\t" $6 "\t" $7 "\t" $4}' "$ledger/ledger.tsv" | sort)
         actual=$(awk -F '\t' -v start="$deletion_start" -v end="$deletion_end" \
             'NR>start && NR<=end {print $1 "\t" $2}' "$removed" | sort)
+        made=$(awk -F '\t' -v start="$creation_start" -v end="$creation_end" \
+            'NR>start && NR<=end {print $1 "\t" $3 "\t" $4 "\t" $5 "\t" $2}' "$created" | sort)
+        state=$(cat "$state_root/$generation/mapping-network.tsv" 2>/dev/null) || failed=1
+        identity=$(awk -F '\t' '$1=="network_id" {print $2}' "$evidence_dir/identity.tsv" 2>/dev/null) || failed=1
+        network=$(printf '%s\n' "$made" | awk -F '\t' '$1=="network" {print $5}')
+        container=$(printf '%s\n' "$made" | awk -F '\t' '$1=="container" {print $5}')
+        [[ $network =~ ^[0-9a-f]{64}$ && $container =~ ^[0-9a-f]{64}$ && $network != "$container" ]] \
+            || { printf 'generation %s incomplete creation identities\n' "$generation"; failed=1; }
+        [[ $state == "network_id"$'\t'"$network" && $identity == "$network" ]] \
+            || { printf 'generation %s network state/identity differs from creation\n' "$generation"; failed=1; }
+        [[ $registered == "$made" ]] \
+            || { printf 'generation %s registration differs from creation\n' "$generation"; failed=1; }
         [[ $(printf '%s\n' "$registered" | wc -l) == 2 && $registered == "$receipts" ]] \
             || { printf 'generation %s registration/receipt mismatch\n' "$generation"; failed=1; }
-        [[ $(printf '%s\n' "$registered" | cut -f1,6 | sort) == "$actual" ]] \
+        [[ $(printf '%s\n' "$registered" | cut -f1,5 | sort) == "$actual" ]] \
             || { printf 'generation %s registration/deletion mismatch\n' "$generation"; failed=1; }
-        [[ $(printf '%s\n' "$registered" | cut -f1,3-5 | sort) == $'container\tmtest\tmapping-fallback\tupstream\nnetwork\tmtest\tmapping-fallback\tnetwork' ]] \
+        [[ $(printf '%s\n' "$registered" | cut -f1-4 | sort) == $'container\tmtest\tmapping-fallback\tupstream\nnetwork\tmtest\tmapping-fallback\tnetwork' ]] \
             || { printf 'generation %s unexpected ownership or roles\n' "$generation"; failed=1; }
     done
     while IFS=$'\t' read -r kind id; do
@@ -1000,7 +1020,7 @@ scenario_repeated_run_succeeds() (
         || { printf 'identity drift deleted an object or escaped detection rc=%s\n' "$rc1"; failed=1; }
     printf 'REPEAT drift_cleanup=%s deletions=%s foreign_preserved=%s\n' "$rc1" "$(wc -l < "$removed")" "$(rs_lookup container foreign)"
     rm -rf "$dir1" "$dir2"
-    rm -f "$RS_STORE" "$removed"
+    rm -f "$RS_STORE" "$removed" "$created"
     return "$failed"
 )
 
