@@ -76,7 +76,7 @@ mapping_assert_generation() {
     local kind=${1:-} scenario
     scenario=$(mapping_assert_scenario "$kind") || return 1
     MAPPING_ASSERT_GENERATION_SEQ=$((MAPPING_ASSERT_GENERATION_SEQ + 1))
-    printf '%s-g%s-%s\n' "$scenario" "$MAPPING_ASSERT_GENERATION_SEQ" "$$"
+    MAPPING_ASSERT_GENERATION="$scenario-g$MAPPING_ASSERT_GENERATION_SEQ-$$"
 }
 
 # 证据目录：必须为绝对路径、真实目录、非符号链接且为空，保证每次运行独立且不覆盖既有证据。
@@ -760,7 +760,8 @@ mapping_scenario_run() {
     scenario=$(mapping_assert_scenario "$kind") || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_CASE='' MAPPING_ASSERT_SNAPSHOT_MODE=valid MAPPING_ASSERT_DNS_MODE=none
     MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
-    generation=$(mapping_assert_generation "$kind") || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_assert_generation "$kind" || return "$MAPPING_ASSERT_FIXTURE"
+    generation=$MAPPING_ASSERT_GENERATION
     mapping_assert_prepare_dir "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     local MAPPING_INPUT_ROOT=${IT_CONTROL_DIR%/control}
     # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它
@@ -832,7 +833,8 @@ mapping_negative_run() {
     mapping_scenario_valid "$scenario" || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_CASE=$case_name MAPPING_ASSERT_SNAPSHOT_MODE=valid MAPPING_ASSERT_DNS_MODE=none
     MAPPING_DNS_FAKE_HOST='' MAPPING_DNS_FAKE_IP=''
-    generation=$(mapping_assert_generation "$kind") || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_assert_generation "$kind" || return "$MAPPING_ASSERT_FIXTURE"
+    generation=$MAPPING_ASSERT_GENERATION
     mapping_assert_prepare_dir "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     local MAPPING_INPUT_ROOT=${IT_CONTROL_DIR%/control}
     # 证据目录局部化：只在本次调用可见；返回后外层值必须保持不变，否则映射组之后的其它

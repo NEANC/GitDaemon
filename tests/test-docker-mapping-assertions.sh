@@ -836,8 +836,8 @@ rs_install() {
 
 # 同一 scenario 在同一进程内连续运行两次均成功：释放必须清掉映射网络与固定名容器，
 # 第二次才能重建同名资源；残留即视为释放不完整。
-scenario_repeated_run_succeeds() {
-    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root
+scenario_repeated_run_succeeds() (
+    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root foreign id removed
     dir1=$(mktemp -d)
     dir2=$(mktemp -d)
     RS_STORE=$(mktemp)
@@ -845,43 +845,82 @@ scenario_repeated_run_succeeds() {
     rs_install
     sa_doubles 1
     sa_lifecycle_defaults fallback
-    resource_cleanup_scenario() { : > "$RS_STORE"; }
+    rs_new_id() { printf 'id-%s\n' "$(printf '%s:%s' "$1" "$2" | sha256sum | cut -d' ' -f1)"; }
+    rs_add() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$RS_SCENARIO" >> "$RS_STORE"; }
+    resource_create_register() {
+        local kind=$1 scenario=$2 role=$3 id
+        shift 3
+        [[ ${1:-} != -- ]] || shift
+        id=$(RS_SCENARIO=$scenario "$@") || return $?
+        [[ -n $id ]] || return 2
+        RESOURCE_CREATED_ID=$id
+    }
+    resource_crosscheck() {
+        local dir=$1 kind name identity scenario seq=0
+        RESOURCE_LEDGER_ORDER=()
+        RESOURCE_LEDGER_ACTIVE=()
+        while IFS=$'\t' read -r kind name identity scenario; do
+            seq=$((seq + 1))
+            RESOURCE_LEDGER_ORDER+=("$seq|$kind|$identity")
+            RESOURCE_LEDGER_ACTIVE["$kind|$identity"]="$seq|$scenario|role|hash|digest|$MP_RUN_ID"
+        done < "$RS_STORE"
+    }
+    resource_remove() {
+        local kind=$1 identity=$2
+        rs_has_id "$kind" "$identity" || return 2
+        printf '%s\t%s\n' "$kind" "$identity" >> "$removed"
+        rs_delete "$kind" "$identity"
+    }
+    removed=$(mktemp)
+    RS_SCENARIO=mapping-direct
+    foreign=$(rs_docker create --name foreign "$MAPPING_PRODUCT_IMAGE")
     mapping_control_request() { return 0; }
     mapping_scenario_fixture_prepare() {
         local kind=$1 scenario=$2 dir=$3 ledger=$dir/control/resources
         mkdir -p "$dir/control" || return 80
-        mapping_network_create "$MAPPING_PROFILE" "$ledger" >/dev/null || return 80
+        mapping_network_create "$MAPPING_PROFILE" "$ledger" "$scenario" >/dev/null || return 80
         RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
-        resource_create_register container "$kind" upstream -- \
+        resource_create_register container "$scenario" upstream -- \
             resource_docker create --label "gitdaemon.run=$MP_RUN_ID" \
             --name "$(mapping_upstream_container)" "$MAPPING_PRODUCT_IMAGE" >/dev/null || return 80
         mapping_negative_prepare "$kind" "$scenario" "$dir" || return 80
         return 0
     }
     mapping_scenario_run fallback "$dir1" || rc1=$?
-    printf 'REPEAT run1 rc=%s leftover=%s\n' "$rc1" "$(rs_count)"
+    printf 'REPEAT run1 rc=%s target_leftover=%s foreign=%s\n' "$rc1" "$(($(rs_count) - 1))" "$foreign"
     [[ $rc1 == 0 ]] || failed=1
-    [[ $(rs_count) == 0 ]] || { printf 'run1 left resources behind\n'; failed=1; }
+    [[ $(rs_count) == 1 && $(rs_lookup container foreign) == "$foreign" ]] || { printf 'run1 cleanup crossed scenario or left resources behind\n'; failed=1; }
+    [[ $(wc -l < "$removed") == 2 ]] || { printf 'run1 did not remove both resources\n'; failed=1; }
     generation1=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir1/identity.tsv")
+    [[ $generation1 == mapping-fallback-g1-$$ ]] || { printf 'run1 generation not automatic: %s\n' "$generation1"; failed=1; }
     state_root=$IT_CONTROL_DIR/generations
     [[ -s $state_root/$generation1/mapping-network.tsv ]] || { printf 'run1 network state missing\n'; failed=1; }
-    MAPPING_ASSERT_GENERATION_SEQ=$((MAPPING_ASSERT_GENERATION_SEQ + 1))
     mapping_scenario_run fallback "$dir2" || rc2=$?
-    printf 'REPEAT run2 rc=%s leftover=%s\n' "$rc2" "$(rs_count)"
+    printf 'REPEAT run2 rc=%s target_leftover=%s foreign=%s\n' "$rc2" "$(($(rs_count) - 1))" "$foreign"
     [[ $rc2 == 0 ]] || failed=1
-    [[ $(rs_count) == 0 ]] || { printf 'run2 left resources behind\n'; failed=1; }
+    [[ $(rs_count) == 1 && $(rs_lookup container foreign) == "$foreign" ]] || { printf 'run2 cleanup crossed scenario or left resources behind\n'; failed=1; }
     if [[ -f $dir2/identity.tsv ]]; then
         generation2=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir2/identity.tsv")
-        [[ -n $generation2 && $generation2 != "$generation1" ]] || { printf 'run2 reused generation\n'; failed=1; }
+        [[ $generation2 == mapping-fallback-g2-$$ && $generation2 != "$generation1" ]] || { printf 'run2 reused generation: %s\n' "$generation2"; failed=1; }
         [[ -s $state_root/$generation2/mapping-network.tsv ]] || { printf 'run2 network state missing\n'; failed=1; }
     else
         printf 'run2 identity missing\n'
         failed=1
     fi
+    [[ $(wc -l < "$removed") == 4 ]] || { printf 'expected four exact resource deletions\n'; failed=1; }
+    while IFS=$'\t' read -r kind id; do
+        [[ $id == id-???????????????????????????????????????????????????????????????? ]] || { printf 'incomplete deletion identity: %s\n' "$id"; failed=1; }
+        [[ $id != "$foreign" ]] || { printf 'deleted other scenario\n'; failed=1; }
+        case "$kind:$id" in
+            "container:$(rs_new_id container "$(mapping_upstream_container)")"|"network:$(rs_new_id network gm-mtest-m-net)") ;;
+            *) printf 'unexpected removal %s:%s\n' "$kind" "$id"; failed=1 ;;
+        esac
+        printf 'REPEAT removed=%s:%s\n' "$kind" "$id"
+    done < "$removed"
     rm -rf "$dir1" "$dir2"
-    rm -f "$RS_STORE"
+    rm -f "$RS_STORE" "$removed"
     return "$failed"
-}
+)
 
 # 顺序占位释放必须按登记身份（容器 ID）而非容器名：替身的身份与名称不同，
 # 按名称删除必须被拒（等价真实拓扑返回 2），按登记身份删除必须成功且无残留。
