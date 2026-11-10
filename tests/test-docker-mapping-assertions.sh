@@ -950,7 +950,8 @@ scenario_repeated_run_succeeds() (
     [[ $generation1 == mapping-fallback-g1-$$ ]] || { printf 'run1 generation not automatic: %s\n' "$generation1"; failed=1; }
     state_root=$IT_CONTROL_DIR/generations
     [[ -s $state_root/$generation1/mapping-network.tsv ]] || { printf 'run1 network state missing\n'; failed=1; }
-    state1=$(cat "$state_root/$generation1/mapping-network.tsv" 2>/dev/null) || failed=1
+    state1=$(mktemp)
+    cp -- "$state_root/$generation1/mapping-network.tsv" "$state1" || failed=1
     mapping_scenario_run fallback "$dir2" || rc2=$?
     ledger_second=$(wc -l < "$ledger/ledger.tsv")
     printf 'REPEAT run2 rc=%s target_leftover=%s foreign=%s\n' "$rc2" "$(($(rs_count) - 1))" "$foreign"
@@ -960,7 +961,7 @@ scenario_repeated_run_succeeds() (
         generation2=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir2/identity.tsv")
         [[ $generation2 == mapping-fallback-g2-$$ && $generation2 != "$generation1" ]] || { printf 'run2 reused generation: %s\n' "$generation2"; failed=1; }
         [[ -s $state_root/$generation2/mapping-network.tsv ]] || { printf 'run2 network state missing\n'; failed=1; }
-        [[ $(cat "$state_root/$generation1/mapping-network.tsv" 2>/dev/null) == "$state1" ]] \
+        cmp -s -- "$state1" "$state_root/$generation1/mapping-network.tsv" \
             || { printf 'run2 changed run1 network state\n'; failed=1; }
     else
         printf 'run2 identity missing\n'
@@ -1020,7 +1021,7 @@ scenario_repeated_run_succeeds() (
         || { printf 'identity drift deleted an object or escaped detection rc=%s\n' "$rc1"; failed=1; }
     printf 'REPEAT drift_cleanup=%s deletions=%s foreign_preserved=%s\n' "$rc1" "$(wc -l < "$removed")" "$(rs_lookup container foreign)"
     rm -rf "$dir1" "$dir2"
-    rm -f "$RS_STORE" "$removed" "$created"
+    rm -f "$RS_STORE" "$removed" "$created" "$state1"
     return "$failed"
 )
 
