@@ -837,7 +837,7 @@ rs_install() {
 # 同一 scenario 在同一进程内连续运行两次均成功：释放必须清掉映射网络与固定名容器，
 # 第二次才能重建同名资源；残留即视为释放不完整。
 scenario_repeated_run_succeeds() {
-    local failed=0 dir1 dir2 rc1=0 rc2=0
+    local failed=0 dir1 dir2 rc1=0 rc2=0 generation1 generation2 state_root
     dir1=$(mktemp -d)
     dir2=$(mktemp -d)
     RS_STORE=$(mktemp)
@@ -862,10 +862,22 @@ scenario_repeated_run_succeeds() {
     printf 'REPEAT run1 rc=%s leftover=%s\n' "$rc1" "$(rs_count)"
     [[ $rc1 == 0 ]] || failed=1
     [[ $(rs_count) == 0 ]] || { printf 'run1 left resources behind\n'; failed=1; }
+    generation1=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir1/identity.tsv")
+    state_root=$IT_CONTROL_DIR/generations
+    [[ -s $state_root/$generation1/mapping-network.tsv ]] || { printf 'run1 network state missing\n'; failed=1; }
+    MAPPING_ASSERT_GENERATION_SEQ=$((MAPPING_ASSERT_GENERATION_SEQ + 1))
     mapping_scenario_run fallback "$dir2" || rc2=$?
     printf 'REPEAT run2 rc=%s leftover=%s\n' "$rc2" "$(rs_count)"
     [[ $rc2 == 0 ]] || failed=1
     [[ $(rs_count) == 0 ]] || { printf 'run2 left resources behind\n'; failed=1; }
+    if [[ -f $dir2/identity.tsv ]]; then
+        generation2=$(awk -F '\t' '$1 == "generation" { print $2 }' "$dir2/identity.tsv")
+        [[ -n $generation2 && $generation2 != "$generation1" ]] || { printf 'run2 reused generation\n'; failed=1; }
+        [[ -s $state_root/$generation2/mapping-network.tsv ]] || { printf 'run2 network state missing\n'; failed=1; }
+    else
+        printf 'run2 identity missing\n'
+        failed=1
+    fi
     rm -rf "$dir1" "$dir2"
     rm -f "$RS_STORE"
     return "$failed"
