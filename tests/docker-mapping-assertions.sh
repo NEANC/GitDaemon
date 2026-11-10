@@ -344,6 +344,7 @@ mapping_scenario_upstream_head() {
 # 产品启动前先重建本轮 CONNECT 日志，杜绝上一轮残留的合法行被复用。
 mapping_scenario_fixture_prepare() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} ledger netid
+    [[ ${MAPPING_ASSERT_RELEASE_FAILED:-0} != 1 ]] || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n ${MAPPING_PROFILE:-} && -n ${MAPPING_PRODUCT_IMAGE:-} && -n ${MAPPING_TOOLS_IMAGE:-} ]] || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_CALIBRATED_GENERATION=''
@@ -373,6 +374,7 @@ mapping_scenario_fixture_prepare() {
 # 代理校准：先证接受端口可达、拒绝端口 403、计数增长，再写 proxy.before 基线。
 mapping_scenario_calibrate() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
+    MAPPING_ASSERT_CALIBRATED_GENERATION=''
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_proxy_calibrate "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     MAPPING_ASSERT_CALIBRATED_GENERATION=$MAPPING_ASSERT_GENERATION
@@ -597,7 +599,7 @@ mapping_scenario_release() {
     ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources}
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
     resource_cleanup_scenario "$ledger" "$scenario" || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_control_request mapping-release "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_control_request mapping-release "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || { MAPPING_ASSERT_RELEASE_FAILED=1; return "$MAPPING_ASSERT_FIXTURE"; }
     return 0
 }
 

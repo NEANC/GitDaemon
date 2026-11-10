@@ -184,6 +184,10 @@ lifecycle_case() {
         rc=0
         mapping_scenario_fixture_prepare fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.prepare" 2>&1 || rc=$?
         if (( rc == 0 )); then mapping_scenario_calibrate fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.calibrate" 2>&1 || rc=$?; fi
+        if (( rc == 0 )) && [[ $MODE == success-then-calibrate-fail ]]; then
+            MODE=calibrate-fail
+            mapping_scenario_calibrate fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.recalibrate" 2>&1 || rc=$?
+        fi
         if (( rc == 0 )) && [[ $MODE == drift ]]; then
             printf 'foreign\tmapping-fallback\tprobe\tgm-mtest-m-net\t140.82.112.10\n' > "$CASE_DIR/objects/id-$GEN-probe"
         fi
@@ -206,14 +210,13 @@ lifecycle_case() {
             break
         fi
         [[ $(grep -E "^(ready $GEN|start $GEN|calibrated $GEN|remove id-$GEN-probe$)" "$CASE_DIR/events") == "$(printf 'ready %s\nstart %s upstream\nstart %s proxy\nstart %s dns\nstart %s probe\ncalibrated %s\nremove id-%s-probe\nstart %s product' "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN")" ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-        if [[ $MODE == release-query-fail ]]; then
-            resource_enumerate() { return 2; }
-        fi
         mapping_scenario_release fallback mapping-fallback "$GEN" "$CASE_DIR/$GEN" || {
             if [[ $MODE == release-query-fail ]]; then
                 before=$(wc -l < "$CASE_DIR/docker.log")
+                grep -q '^release g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                grep -q '^guard-fail mapping-release 2$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 ! grep -q '^unrules g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-                ! grep -q '^remove id-g1-product$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                grep -q '^remove id-g1-product$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 mapping_scenario_fixture_prepare fallback mapping-fallback "$CASE_DIR/g2" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 : > "$CASE_DIR/done"; wait "$pid"; return 0
@@ -228,7 +231,7 @@ lifecycle_case() {
     wait "$pid"
 }
 failed=0
-for spec in ${LIFECYCLE_CASES:-ready:0 prepare-fail:80 wrong-ack:80 old-ack:80 second-old-ack:80 start-fail:80 calibrate-fail:80 second-prepare-fail:80 second-start-fail:80 second-calibrate-fail:80 drift:80 inspect-error:80 release-query-fail:80}; do
+for spec in ${LIFECYCLE_CASES:-ready:0 prepare-fail:80 wrong-ack:80 old-ack:80 second-old-ack:80 start-fail:80 calibrate-fail:80 success-then-calibrate-fail:80 second-prepare-fail:80 second-start-fail:80 second-calibrate-fail:80 drift:80 inspect-error:80 release-query-fail:80}; do
     ( lifecycle_case "${spec%:*}" "${spec#*:}" ) || failed=1
 done
 exit "$failed"
