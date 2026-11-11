@@ -109,6 +109,10 @@ mapping_proxy_san_hostname_probe() {
         --noproxy '' --proxy "https://$MAPPING_PROXY_HOST:$MAPPING_PROXY_ACCEPT_PORT" \
         --proxy-cacert "$MAPPING_CLIENT_PROXY_CA" --cacert "$MAPPING_CLIENT_UPSTREAM_CA" \
         "https://$MAPPING_UPSTREAM_HOST/health.txt" > "$dir/hostname.log" 2>&1 || rc=$?
+    if [[ $rc == 1 ]]; then
+        grep -Eqi 'docker|daemon|exec failed|context deadline' "$dir/hostname.log" && return 80
+    fi
+    [[ $rc != 28 && $rc != 124 && $rc != 125 && $rc != 126 && $rc != 127 ]] || return 80
     [[ $rc == 60 ]] || return 1
     grep -Eqi 'hostname|subject alternative|certificate.*(match|name)' "$dir/hostname.log" || return 1
 }
@@ -141,7 +145,9 @@ mapping_proxy_san_case() {
     if ! mapping_proxy_san_replace "$dir"; then rc=80; fi
     if (( rc == 0 )); then mapping_proxy_san_restart "$dir" || rc=80; fi
     if (( rc == 0 )); then mapping_proxy_san_leaf "$dir" wrong || rc=80; fi
-    if (( rc == 0 )); then mapping_proxy_san_hostname_probe "$dir" || rc=1; fi
+    if (( rc == 0 )); then
+        mapping_proxy_san_hostname_probe "$dir" || { rc=$?; [[ $rc == 80 ]] || rc=1; }
+    fi
     if (( rc == 0 )); then
         request=$(mapping_tls_product_request "$dir" "$scenario") || rc=80
         if (( rc == 0 )); then
@@ -165,6 +171,7 @@ mapping_proxy_san_case() {
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || rc=1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || rc=1
             grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || rc=1
+            grep -Eqi 'SSL.*(hostname|subject alternative|certificate.*(match|name))' "$dir/request.failed.log" || rc=1
         fi
     fi
     if (( mutated )); then
