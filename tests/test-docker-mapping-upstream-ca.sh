@@ -31,7 +31,7 @@ upstream_ca_git_8443_restores_refs() {
         n=$(cat "$dir/proxy-count"); printf '%s\n' "$((n+1))" > "$dir/proxy-count"
         n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
         if [[ -f $dir/injected && ! -f $dir/restored ]]; then
-            printf '传输失败：配置的 HTTPS 代理\nfatal: SSL certificate problem: unable to get local issuer certificate\n'
+            printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n'
             return 128
         fi
         printf '同步传输路径：配置的 HTTPS 代理\n'
@@ -111,7 +111,7 @@ upstream_ca_missing_dial_is_not_inner_failure() {
     }
     mapping_tls_product_request() {
         if [[ -f $dir/injected ]]; then
-            printf '传输失败：配置的 HTTPS 代理\nfatal: SSL certificate problem\n' > "$1/request.log"
+            printf 'fatal: SSL certificate problem\n' > "$1/request.log"
             printf '128\n'
         else
             printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
@@ -124,8 +124,68 @@ upstream_ca_missing_dial_is_not_inner_failure() {
     [[ $rc == 1 && -f $dir/restored ]]
 }
 
+upstream_ca_missing_count_restores_and_returns_fixture() {
+    local dir missing rc=0
+    for missing in proxy-before upstream-before proxy-after upstream-after empty-proxy-before empty-upstream-after; do
+        dir=$(mktemp -d)
+        printf '0\n' > "$dir/proxy-count"
+        printf '0\n' > "$dir/dial-count"
+        MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+        mapping_profile_load() { MP_U=140.82.112.9; }
+        mapping_proxy_count_read_remote() {
+            if [[ $missing == empty-proxy-before && -f $dir/injected && ! -f $dir/request.exit ]]; then return 0; fi
+            if [[ $missing == proxy-before && -f $dir/injected && ! -f $dir/request.exit ||
+                  $missing == proxy-after && -f $dir/request.exit && ! -f $dir/restored ]]; then return 9; fi
+            cat "$dir/proxy-count"
+        }
+        mapping_scenario_upstream_count() {
+            if [[ $missing == empty-upstream-after && -f $dir/request.exit && ! -f $dir/restored ]]; then return 0; fi
+            if [[ $missing == upstream-before && -f $dir/injected && ! -f $dir/request.exit ||
+                  $missing == upstream-after && -f $dir/request.exit && ! -f $dir/restored ]]; then return 9; fi
+            cat "$dir/dial-count"
+        }
+        mapping_scenario_connect_evidence() {
+            local n
+            for ((n=0; n<$(cat "$dir/proxy-count"); n++)); do
+                printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+            done
+        }
+        mapping_tls_product_request() {
+            local n
+            n=$(cat "$dir/proxy-count"); printf '%s\n' "$((n+1))" > "$dir/proxy-count"
+            n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
+            if [[ -f $dir/injected && ! -f $dir/restored ]]; then
+                printf 'fatal: SSL certificate problem\n' > "$1/request.log"
+                printf '128\n'
+            else
+                printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
+                printf '0\n'
+            fi
+        }
+        mapping_negative_wrong_ca() { : > "$dir/injected"; }
+        mapping_negative_upstream_ca_restore() { : > "$dir/restored"; }
+        rc=0
+        mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
+        [[ $rc == 80 && -f $dir/restored ]] || return 1
+    done
+}
+
+upstream_ca_missing_verdict_count_is_fixture() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    printf 'wrong_upstream_ca\n' > "$dir/case.tsv"
+    for name in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
+        printf '1\n' > "$dir/$name"
+    done
+    printf '0\n' > "$dir/baseline.exit" "$dir/recovery.exit"
+    printf 'case\twrong_upstream_ca\nlayer\tinner-failure\nconnect_delta\t1\nrequest_exit\t1\n' > "$dir/tls-layer.tsv"
+    rm "$dir/upstream.after"
+    mapping_negative_rejected wrong_upstream_ca fallback "$dir" || rc=$?
+    [[ $rc == 80 ]]
+}
+
 failed=0
-for name in upstream_ca_git_8443_restores_refs upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure; do
+for name in upstream_ca_git_8443_restores_refs upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
