@@ -494,27 +494,39 @@ mapping_probe_egress() {
                 resource_verify_object container "$product_id" "$MPF_SCENARIO" product '' || return 80
                 facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.State.Running}}' "$product_id") || return 80
                 [[ $facts == "$MP_NETWORK_NAME|true" ]] || return 80
-                tool=$(mapping_fixture_run "$MPF_SCENARIO" tcp-dns -d --name "gm-$MP_RUN_ID-$generation-tcp-dns" \
+                tool=$(mapping_fixture_create "$MPF_SCENARIO" tcp-dns -d --name "gm-$MP_RUN_ID-$generation-tcp-dns" \
                     --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges \
                     --network "container:$product_id" \
-                    --entrypoint sleep "$MPF_TOOLS_IMAGE" 120) || return 80
-                [[ $tool =~ ^[0-9a-f]{64}$ ]] || return 80
-                resource_crosscheck "$ledger" || return 80
-                resource_verify_object container "$tool" "$MPF_SCENARIO" tcp-dns '' || return 80
-                facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.Config.User}}|{{.State.Running}}|{{.Image}}' "$tool") || return 80
-                [[ $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE" ]] || return 80
-                printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product_id"
-                status=0
-                output=$(mapping_fixture_docker exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A 2>&1) || status=$?
-                printf '%s\n' "$output"
-                probe_rc=0
-                if [[ $status == 0 ]]; then
-                    probe_rc=1
-                elif [[ $status != 9 || $output != *"communications error to $dest#53: timed out"* || $output != *'no servers could be reached'* ]]; then
-                    probe_rc=80
+                    --entrypoint sleep "$MPF_TOOLS_IMAGE" 120) || {
+                    printf 'TCP_DNS_TOOL_IDENTITY_UNCERTAIN stage=create name=%s\n' "gm-$MP_RUN_ID-$generation-tcp-dns" >&2
+                    return 80
+                }
+                probe_rc=80
+                if [[ $tool =~ ^[0-9a-f]{64}$ ]] && resource_crosscheck "$ledger" &&
+                    resource_verify_object container "$tool" "$MPF_SCENARIO" tcp-dns ''; then
+                    if mapping_fixture_docker start "$tool" >/dev/null; then
+                        facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.Config.User}}|{{.State.Running}}|{{.Image}}|{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|{{json .HostConfig.SecurityOpt}}' "$tool") || facts=''
+                        if [[ $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE|true|[\"ALL\"]|[\"no-new-privileges\"]" ]]; then
+                            printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product_id"
+                            status=0
+                            output=$(mapping_fixture_docker exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A 2>&1) || status=$?
+                            printf '%s\n' "$output"
+                            if [[ $status == 0 && $output == *"SERVER: $dest#53("* && $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), ]]; then
+                                probe_rc=1
+                            elif [[ $status == 9 && $output == *"communications error to $dest#53: timed out"* && $output == *'no servers could be reached'* ]]; then
+                                probe_rc=0
+                            fi
+                        fi
+                    fi
                 fi
                 remove_rc=0
-                resource_remove container "$tool" || remove_rc=$?
+                if [[ $tool =~ ^[0-9a-f]{64}$ ]] && resource_crosscheck "$ledger" &&
+                    resource_verify_object container "$tool" "$MPF_SCENARIO" tcp-dns ''; then
+                    resource_remove container "$tool" || remove_rc=$?
+                else
+                    printf 'TCP_DNS_TOOL_IDENTITY_UNCERTAIN id=%s\n' "$tool" >&2
+                    remove_rc=80
+                fi
                 [[ $remove_rc == 0 ]] || return 80
                 [[ $probe_rc == 0 ]] || return "$probe_rc"
                 ;;
