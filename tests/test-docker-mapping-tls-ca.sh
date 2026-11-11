@@ -258,8 +258,86 @@ wrong_proxy_ca_assertion_and_restore_failure_returns_80() {
     [[ $rc == 80 && -f $dir/restored && $(cat "$dir/request.exit") == 0 ]]
 }
 
+# 注入已写坏 CA 后返回失败，必须恢复并保留三份原始证据。
+wrong_proxy_ca_partial_injection_failure_restores_and_preserves_evidence() {
+    local dir rc=0 name restore_rc
+    dir=$(mktemp -d)
+    MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/baseline.exit ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+        fi
+        printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+    }
+    mapping_tls_product_request() {
+        printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
+        printf '0\n'
+    }
+    mapping_negative_wrong_ca() { printf 'partial CA\n' > "$dir/ca"; return 9; }
+    mapping_negative_proxy_ca_restore() { printf 'original CA\n' > "$dir/ca"; : > "$dir/restored"; return "${restore_rc:-0}"; }
+    for name in request.exit request.failed.log tls-layer.tsv; do
+        printf '旧证据:%s\n\n' "$name" > "$dir/$name"
+        cp "$dir/$name" "$dir/$name.before"
+    done
+    for restore_rc in 0 9; do
+        rc=0
+        mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+        [[ $rc == 80 && -f $dir/restored && $(cat "$dir/ca") == 'original CA' ]] || return 1
+        for name in request.exit request.failed.log tls-layer.tsv; do
+            cmp -s "$dir/$name.before" "$dir/$name" || return 1
+        done
+    done
+}
+
+# 原本缺失的注入阶段证据不能因失败路径出现。
+wrong_proxy_ca_partial_injection_failure_keeps_missing_evidence() {
+    local dir rc=0 name
+    dir=$(mktemp -d)
+    MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/baseline.exit ]]; then printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'; fi
+        printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+    }
+    mapping_tls_product_request() { printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"; printf '0\n'; }
+    mapping_negative_wrong_ca() { printf 'partial CA\n' > "$dir/ca"; return 9; }
+    mapping_negative_proxy_ca_restore() { printf 'original CA\n' > "$dir/ca"; : > "$dir/restored"; }
+    mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 80 && -f $dir/restored && $(cat "$dir/ca") == 'original CA' ]] || return 1
+    for name in request.exit request.failed.log tls-layer.tsv; do [[ ! -e $dir/$name ]] || return 1; done
+}
+
+# 按真实绝对挂载路径执行恢复命令，并拒绝写入后字节不一致。
+wrong_proxy_ca_restore_executes_mounted_paths_and_rejects_mismatch() {
+    local dir rc=0 script source target mismatch=0
+    dir=$(mktemp -d)
+    MAPPING_PRODUCT_IMAGE=product MP_RUN_ID=contract
+    MAPPING_FIXTURE_MOUNT="$dir/assets" MAPPING_ASSET_ROOT="$dir/assets"
+    MAPPING_CA_MOUNT="$dir/ca" MAPPING_CLIENT_PROXY_CA="$dir/ca/proxy-ca.crt"
+    mkdir -p "$dir/assets/proxy/tls" "$dir/ca"
+    source="$MAPPING_ASSET_ROOT/proxy/tls/ca.crt" target=$MAPPING_CLIENT_PROXY_CA
+    printf 'real CA\nsecond line\n' > "$source"
+    printf 'partial CA\n' > "$target"
+    mapping_fixture_docker() {
+        [[ $* == *"-v $(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT:ro"* && $* == *"-v $(mapping_ca_volume):$MAPPING_CA_MOUNT"* ]] || return 9
+        while [[ $# -gt 0 && $1 != -c ]]; do shift; done
+        script=$2
+        [[ $3 == sh && $4 == "$source" && $5 == "$target" ]] || return 9
+        if (( mismatch )); then script=${script/cmp -s/printf corrupted >> \"\$2\"; cmp -s}; fi
+        bash -c "$script" sh "$source" "$target"
+    }
+    mapping_negative_proxy_ca_restore || return 1
+    cmp -s "$source" "$target" || return 1
+    mismatch=1
+    mapping_negative_proxy_ca_restore || rc=$?
+    [[ $rc != 0 ]] && ! cmp -s "$source" "$target"
+}
+
 failed=0
-for name in wrong_proxy_ca_uses_product_8443_and_recovers wrong_proxy_ca_rejects_unrelated_failure wrong_proxy_ca_dispatches_dedicated_path wrong_proxy_ca_rejects_unrelated_connect wrong_proxy_ca_accepts_dedicated_evidence wrong_proxy_ca_restore_uses_both_real_mounts_and_exact_bytes wrong_proxy_ca_restores_after_injected_evidence_failure wrong_proxy_ca_restore_failure_keeps_original_failure wrong_proxy_ca_assertion_failure_still_restores wrong_proxy_ca_assertion_and_restore_failure_returns_80; do
+for name in wrong_proxy_ca_uses_product_8443_and_recovers wrong_proxy_ca_rejects_unrelated_failure wrong_proxy_ca_dispatches_dedicated_path wrong_proxy_ca_rejects_unrelated_connect wrong_proxy_ca_accepts_dedicated_evidence wrong_proxy_ca_restore_uses_both_real_mounts_and_exact_bytes wrong_proxy_ca_restores_after_injected_evidence_failure wrong_proxy_ca_restore_failure_keeps_original_failure wrong_proxy_ca_assertion_failure_still_restores wrong_proxy_ca_assertion_and_restore_failure_returns_80 wrong_proxy_ca_partial_injection_failure_restores_and_preserves_evidence wrong_proxy_ca_partial_injection_failure_keeps_missing_evidence wrong_proxy_ca_restore_executes_mounted_paths_and_rejects_mismatch; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

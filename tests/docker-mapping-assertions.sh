@@ -750,7 +750,10 @@ mapping_tls_negative_run() {
     tail -n "+$(( $(wc -l < "$dir/connect.before") + 1 ))" "$dir/connect.baseline" > "$dir/connect.baseline.new" || return 80
     mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 80
     printf '%s\n' "$case_name" > "$dir/case.tsv"
-    mapping_negative_wrong_ca proxy-ca.crt || return 80
+    if ! mapping_negative_wrong_ca proxy-ca.crt; then
+        mapping_negative_proxy_ca_restore || return 80
+        return 80
+    fi
     mapping_tls_injected_evidence "$dir" "$kind" "$scenario" || evidence_rc=$?
     mapping_negative_proxy_ca_restore || return 80
     (( evidence_rc == 0 )) || return "$evidence_rc"
