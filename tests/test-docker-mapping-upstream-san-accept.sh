@@ -23,8 +23,27 @@ printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n' 
 cp "$WORK/connect.baseline.new" "$WORK/connect.failed.new"
 cp "$WORK/connect.baseline.new" "$WORK/connect.recovered.new"
 printf '传输失败：配置的 HTTPS 代理；fatal: SSL: no alternative certificate subject name matches target host name\n' > "$WORK/request.failed.log"
+printf 'run_id\trun\nscenario\tscenario\ngeneration\tg1\nnetwork_id\tnet\nimage_id\timage\nprofile_sha256\tprofile\ninput_sha256\tinput\nmanifest_sha256\tmanifest\nunique_commit\tabc\n' > "$WORK/identity.tsv"
+mkdir -p "$WORK/control"
+printf 'abc\n' > "$WORK/control/unique-commit"
 mapping_negative_rejected wrong_upstream_san fallback "$WORK"
 [[ $MAPPING_ASSERT_REJECT_LAYER == tls-upstream ]]
+printf 'old\trefs/heads/main\n' > "$WORK/refs.expected"
+cp "$WORK/refs.expected" "$WORK/refs.actual"
+printf 'old\n' > "$WORK/head.expected"
+cp "$WORK/head.expected" "$WORK/head.actual"
+rc=0
+mapping_negative_rejected wrong_upstream_san fallback "$WORK" || rc=$?
+[[ $rc == 80 ]]
+printf 'abc\trefs/heads/main\n' > "$WORK/refs.expected"
+cp "$WORK/refs.expected" "$WORK/refs.actual"
+printf 'abc\n' > "$WORK/head.expected"
+cp "$WORK/head.expected" "$WORK/head.actual"
+printf 'other\n' > "$WORK/control/unique-commit"
+rc=0
+mapping_negative_rejected wrong_upstream_san fallback "$WORK" || rc=$?
+[[ $rc == 80 ]]
+printf 'abc\n' > "$WORK/control/unique-commit"
 cp "$WORK/request.failed.log" "$WORK/request.valid.log"
 printf 'fatal: certificate verify failed\n' > "$WORK/request.failed.log"
 rc=0

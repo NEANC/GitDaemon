@@ -96,14 +96,24 @@ run_case() {
         printf 'abc\n' > "$dir/control/unique-commit"
         mapping_profile_load() { return 0; }
         mapping_scenario_valid() { return 0; }
-        mapping_assert_identity_load() { MPA_UNIQUE_COMMIT=abc; }
+        mapping_assert_identity_load() { MPA_UNIQUE_COMMIT=abc; [[ $MODE != identity-invalid ]]; }
         printf '2\n' > "$dir/proxy.count"
         printf '2\n' > "$dir/upstream.count"
         : > "$dir/connect.source"
         mapping_proxy_count_read_remote() { cat "$dir/proxy.count"; }
-        mapping_scenario_upstream_count() { cat "$dir/upstream.count"; }
+        mapping_scenario_upstream_count() {
+            if [[ $MODE == delayed-count || $MODE == stuck-count ]]; then
+                if [[ -f $dir/replaced && -f $dir/request.failed.log ]]; then
+                    local reads=0
+                    [[ ! -f $dir/count.reads ]] || reads=$(cat "$dir/count.reads")
+                    printf '%s\n' "$((reads + 1))" > "$dir/count.reads"
+                    if [[ $MODE == stuck-count || $reads == 0 ]]; then printf '3\n'; return; fi
+                fi
+            fi
+            cat "$dir/upstream.count"
+        }
         mapping_scenario_connect_evidence() { cat "$dir/connect.source"; }
-        mapping_scenario_local_refs() { printf 'abc\trefs/heads/main\n'; }
+        mapping_scenario_local_refs() { if [[ $MODE == absent-unique ]]; then printf 'old\trefs/heads/main\n'; else printf 'abc\trefs/heads/main\n'; fi; }
         mapping_scenario_local_head() { printf 'abc\n'; }
         mapping_scenario_local_fsck() { printf '0\n'; }
         mapping_upstream_san_leaf() {
@@ -125,6 +135,9 @@ run_case() {
             elif [[ -f $dir/replaced ]]; then
                 printf '传输失败：配置的 HTTPS 代理；fatal: SSL: no alternative certificate subject name matches target host name\n' > "$dir/request.log"
                 [[ $MODE == git-other-error ]] && printf 'fatal: Could not resolve host\n' > "$dir/request.log"
+                if [[ $MODE == stale-hostname ]]; then
+                    printf 'fatal: SSL: no alternative certificate subject name matches target host name\nfatal: Could not resolve host\n' > "$dir/request.log"
+                fi
                 printf '4\n' > "$dir/proxy.count"
                 printf '4\n' > "$dir/upstream.count"
                 if [[ $MODE != no-connect ]]; then
@@ -145,7 +158,7 @@ run_case() {
     if [[ $mode != baseline-fail ]]; then
         [[ $(cat "$dir/events") == *restore* ]] || return 1
     fi
-    if [[ $mode == ok ]]; then
+    if [[ $mode == ok || $mode == delayed-count ]]; then
         [[ $(cat "$dir/events") == *'replace'*'restart'*'leaf:wrong'*'request'*'restore'*'restart'*'leaf:restored'* ]] || return 1
         [[ $(cat "$dir/request.exit") == 60 && $(cat "$dir/refs.actual") == "$(cat "$dir/refs.expected")" ]] || return 1
         [[ $(cat "$dir/fsck.exit") == 0 ]] || return 1
@@ -158,7 +171,7 @@ volume_sign_failure_restores_pair
 upstream_evidence_survives_restart
 upstream_san_blocks_fallback
 upstream_leaf_uses_frozen_address
-for spec in ok:0 baseline-fail:80 replace-fail:80 restart-fail:80 leaf-fail:80 no-connect:1 unexpected-success:1 git-other-error:1 restore-fail:80; do
+for spec in ok:0 baseline-fail:80 replace-fail:80 restart-fail:80 leaf-fail:80 no-connect:1 unexpected-success:1 git-other-error:1 stale-hostname:1 absent-unique:80 identity-invalid:80 delayed-count:0 stuck-count:80 restore-fail:80; do
     run_case "${spec%:*}" "${spec#*:}"
 done
 printf 'upstream SAN standalone PASS\n'

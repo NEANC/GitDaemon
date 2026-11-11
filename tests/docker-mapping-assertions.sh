@@ -1192,6 +1192,8 @@ mapping_negative_rejected() {
         wrong_upstream_san)
             local baseline_exit recovery_exit request_exit proxy_before proxy_after upstream_before upstream_after
             [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == wrong_upstream_san ]] || return 80
+            mapping_assert_identity_load "$dir" || return 80
+            [[ -f $dir/control/unique-commit && ! -L $dir/control/unique-commit && $MPA_UNIQUE_COMMIT == "$(cat "$dir/control/unique-commit")" ]] || return 80
             for snapshot in tls-layer.tsv baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log leaf.original leaf.wrong leaf.restored refs.expected refs.actual head.expected head.actual fsck.exit; do
                 [[ -f $dir/$snapshot && ! -L $dir/$snapshot ]] || return 80
             done
@@ -1217,6 +1219,8 @@ mapping_negative_rejected() {
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
             mapping_assert_refs_match "$dir" || return 80
+            mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 80
+            mapping_assert_refs_contain "$dir/refs.actual" "$MPA_UNIQUE_COMMIT" || return 80
             mapping_assert_head_match "$dir" || return 80
             [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 80
             MAPPING_ASSERT_REJECT_LAYER=tls-upstream
