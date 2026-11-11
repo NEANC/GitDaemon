@@ -1538,7 +1538,7 @@ check_mapping_negative() {
         *" $case_id "*) ;;
         *) return 2 ;;
     esac
-    if [[ $case_id == wrong_proxy_ca || $case_id == wrong_upstream_ca ]]; then
+    if [[ $case_id == wrong_proxy_ca || $case_id == wrong_proxy_san || $case_id == wrong_upstream_ca ]]; then
         mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
     else
         rc=80
@@ -3286,6 +3286,7 @@ fi
 # 单项 mode 只选对应场景，其汇总缺少另一正例与全部负例，不能作为 full 结论。
 if integration_group_selected mapping; then
     source "$ROOT/tests/docker-mapping-assertions.sh"
+    source "$ROOT/tests/docker-wrong-proxy-san.sh"
     export MAPPING_PROFILE MAPPING_PRODUCT_IMAGE MAPPING_TOOLS_IMAGE
     integration_register_mapping_group
 fi

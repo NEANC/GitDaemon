@@ -461,7 +461,7 @@ mapping_scenario_apply_negative() {
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     case "${MAPPING_ASSERT_CASE:-}" in
         wrong_proxy_ca) mapping_negative_wrong_ca proxy-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
-        wrong_proxy_san) MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san proxy || return "$MAPPING_ASSERT_FIXTURE" ;;
+        wrong_proxy_san) : ;;
         wrong_upstream_ca) mapping_negative_wrong_ca upstream-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
         wrong_upstream_san) MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san upstream || return "$MAPPING_ASSERT_FIXTURE" ;;
     esac
@@ -965,6 +965,10 @@ mapping_scenario_evidence() {
         return 0
     fi
     mapping_scenario_apply_negative "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == wrong_proxy_san ]]; then
+        mapping_proxy_san_case "$dir" "$kind" "$scenario" || return $?
+        return 0
+    fi
     mapping_scenario_sync_exec "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     if [[ ${MAPPING_ASSERT_CASE:-} == unreachable-map-system ]]; then
         mapping_scenario_unreachable_probe "$product" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
@@ -1166,7 +1170,20 @@ mapping_negative_rejected() {
             MAPPING_ASSERT_REJECT_LAYER=tls-upstream
             return 0
             ;;
-        wrong_proxy_san|wrong_upstream_san)
+        wrong_proxy_san)
+            [[ $(cat "$dir/case.tsv" 2>/dev/null) == wrong_proxy_san ]] || return 80
+            mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return 1
+            [[ $(mapping_assert_uint_file "$dir/request.exit") -gt 0 ]] || return 1
+            [[ $(mapping_assert_uint_file "$dir/proxy.before") == $(mapping_assert_uint_file "$dir/proxy.after") ]] || return 1
+            cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
+            cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 80
+            cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 80
+            mapping_assert_head_match "$dir" || return 80
+            [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 80
+            MAPPING_ASSERT_REJECT_LAYER=tls-proxy
+            return 0
+            ;;
+        wrong_upstream_san)
             mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return "$MAPPING_ASSERT_FIXTURE"
             if mapping_assert_result "$kind" "$dir"; then return 1; fi
@@ -1237,7 +1254,8 @@ mapping_negative_prepare() {
         dns-false-green) MAPPING_ASSERT_SNAPSHOT_MODE=none MAPPING_ASSERT_DNS_MODE=upstream ;;
         unreachable-map-system) MAPPING_ASSERT_SNAPSHOT_MODE=unallocated MAPPING_ASSERT_DNS_MODE=upstream ;;
         wrong_proxy_ca) MAPPING_ASSERT_SNAPSHOT_MODE=none ;;
-        wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
+        wrong_proxy_san) MAPPING_ASSERT_SNAPSHOT_MODE=none ;;
+        wrong_upstream_ca|wrong_upstream_san) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
         isolation) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
         *) return "$MAPPING_ASSERT_FIXTURE" ;;
     esac
