@@ -544,7 +544,7 @@ mapping_probe_egress() {
                             printf '%s\n' "$output"
                             if [[ $status == 0 && $output == *"SERVER: $dest#53("* && $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), ]]; then
                                 probe_rc=1
-                            elif [[ $status == 9 && $output == *"communications error to $dest#53: timed out"* && $output == *'no servers could be reached'* ]]; then
+                            elif [[ $status == 9 && $output != *'Error response from daemon:'* && ! $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), && $output == *"communications error to $dest#53: timed out"* && $output == *'no servers could be reached'* ]]; then
                                 probe_rc=0
                             fi
                         fi
