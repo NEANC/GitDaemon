@@ -184,8 +184,75 @@ upstream_ca_missing_verdict_count_is_fixture() {
     [[ $rc == 80 ]]
 }
 
+# 验证负例入口沿证据调用链保留判定与夹具退出码，并释放场景。
+upstream_ca_entry_preserves_evidence_verdict() {
+    local dir expected rc
+    for expected in 1 80; do
+        dir=$(mktemp -d)
+        IT_CONTROL_DIR=$dir/control
+        mkdir -p "$IT_CONTROL_DIR"
+        mapping_assert_generation() { MAPPING_ASSERT_GENERATION=g1; }
+        mapping_scenario_evidence() { return "$expected"; }
+        mapping_scenario_release() { printf 'released\n' > "$4/released"; }
+        rc=0
+        mapping_negative_run wrong_upstream_ca fallback "$dir/evidence" || rc=$?
+        [[ $rc == "$expected" && -f $dir/evidence/released && ${MAPPING_ASSERT_CASE:-} == '' ]] || return 1
+    done
+}
+
+# 完整入口使用真实 TLS 取证与恢复，拒绝没有上游拨号增长或证书诊断的失败。
+upstream_ca_entry_rejects_invalid_git_evidence() {
+    local test_root mode rc n
+    for mode in flat-dial bad-log; do
+        test_root=$(mktemp -d)
+        IT_CONTROL_DIR=$test_root/control
+        mkdir -p "$IT_CONTROL_DIR"
+        MAPPING_PRODUCT_IMAGE=product MAPPING_PROXY_HOST=gm-proxy MAPPING_PROXY_ACCEPT_PORT=8443
+        MAPPING_CLIENT_UPSTREAM_CA=/ca/upstream-ca.crt MAPPING_CLIENT_PROXY_CA=/ca/proxy-ca.crt
+        MAPPING_UPSTREAM_HOST=github.com MAPPING_UPSTREAM_OWNER=acme MAPPING_UPSTREAM_REPO=demo
+        MAPPING_PROXY_AUTHORITY=github.com:443 MAPPING_UPSTREAM_PORT=443 MP_U=140.82.112.9
+        printf '0\n' > "$test_root/proxy-count"
+        printf '0\n' > "$test_root/dial-count"
+        mapping_assert_generation() { MAPPING_ASSERT_GENERATION=g1; }
+        mapping_profile_load() { MP_U=140.82.112.9; }
+        mapping_scenario_fixture_prepare() { return 0; }
+        mapping_scenario_calibrate() { return 0; }
+        mapping_scenario_product_up() { printf 'product-1\n'; }
+        mapping_scenario_upstream_count() { cat "$test_root/dial-count"; }
+        mapping_scenario_upstream_commit() { return 0; }
+        mapping_scenario_identity_write() { return 0; }
+        mapping_scenario_upstream_refs() { printf 'abc\trefs/heads/main\n'; }
+        mapping_scenario_upstream_head() { printf 'abc\n'; }
+        mapping_proxy_count_read_remote() { cat "$test_root/proxy-count"; }
+        mapping_scenario_connect_evidence() {
+            for ((n=0; n<$(cat "$test_root/proxy-count"); n++)); do
+                printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+            done
+        }
+        mapping_negative_wrong_ca() { : > "$test_root/injected"; }
+        mapping_negative_upstream_ca_restore() { : > "$test_root/restored"; }
+        mapping_fixture_docker() {
+            n=$(cat "$test_root/proxy-count"); printf '%s\n' "$((n+1))" > "$test_root/proxy-count"
+            if [[ $mode != flat-dial || ! -f $test_root/injected || -f $test_root/restored ]]; then
+                n=$(cat "$test_root/dial-count"); printf '%s\n' "$((n+1))" > "$test_root/dial-count"
+            fi
+            if [[ -f $test_root/injected && ! -f $test_root/restored ]]; then
+                if [[ $mode == bad-log ]]; then printf 'fatal: repository not found\n'; else printf 'fatal: SSL certificate problem\n'; fi
+                return 128
+            fi
+            printf '同步传输路径：配置的 HTTPS 代理\n'
+        }
+        mapping_scenario_release() { printf 'released\n' > "$4/released"; }
+        rc=0
+        mapping_negative_run wrong_upstream_ca fallback "$test_root/evidence" || rc=$?
+        [[ $rc == 1 && -f $test_root/restored && -f $test_root/evidence/released ]] || return 1
+        [[ $(cat "$test_root/evidence/baseline.exit") == 0 && $(cat "$test_root/evidence/request.exit") == 128 ]] || return 1
+        [[ ! -f $test_root/evidence/recovery.exit && ! -f $test_root/evidence/refs.actual ]] || return 1
+    done
+}
+
 failed=0
-for name in upstream_ca_git_8443_restores_refs upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture; do
+for name in upstream_ca_git_8443_restores_refs upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture upstream_ca_entry_preserves_evidence_verdict upstream_ca_entry_rejects_invalid_git_evidence; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

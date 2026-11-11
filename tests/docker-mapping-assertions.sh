@@ -1192,10 +1192,14 @@ mapping_negative_run() {
     local IT_EVIDENCE_DIR=$dir
     local IT_CONTROL_DIR=${IT_CONTROL_DIR:-$dir/control}
     local RESOURCE_LEDGER_DIR=${RESOURCE_LEDGER_DIR:-$IT_CONTROL_DIR/resources}
-    if ! mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
+    if mapping_scenario_evidence "$kind" "$scenario" "$generation" "$dir"; then
+        :
+    else
+        rc=$?
         mapping_scenario_release "$kind" "$scenario" "$generation" "$dir" || true
         MAPPING_ASSERT_CASE='' MAPPING_PROXY_RUN_ID=''
-        return "$MAPPING_ASSERT_FIXTURE"
+        [[ $rc == "$MAPPING_ASSERT_FAIL" ]] || rc="$MAPPING_ASSERT_FIXTURE"
+        return "$rc"
     fi
     if mapping_negative_rejected "$case_name" "$kind" "$dir"; then
         rc=0
