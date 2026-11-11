@@ -151,8 +151,31 @@ isolation_requires_per_target_snapshots() (
     [[ $rc == 1 && $count == 4 ]]
 )
 
+isolation_snapshots_each_of_five_targets() (
+    local dir=$TEST_ROOT/five-snapshots count=0 probe=0 key
+    local -a keys=(cross-network host-published host-input dns-udp dns-tcp)
+    mkdir -p "$dir/control"
+    IT_CONTROL_DIR=$dir/control MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
+    MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=netid-abc MP_PROFILE_SHA256=hash
+    mapping_profile_load() { return 0; }
+    mapping_control_request() {
+        count=$((count + 1))
+        CONTROL_SEQ=$count
+        printf '0\n0\n0\n0\n' > "$dir/mapping-snapshot-$count.witness"
+        printf '%s\n' "$(( count / 2 ))" > "$dir/mapping-snapshot-$count.rules"
+    }
+    mapping_witness() { cat "$1"; }
+    mapping_count() { cat "$1"; }
+    mapping_probe_egress() {
+        [[ $3 == "${keys[$probe]}" ]] || return 80
+        probe=$((probe + 1))
+    }
+    mapping_isolation_check product gen1 profile || return 1
+    [[ $count == 10 && $probe == 5 ]]
+)
+
 failed=0
-for name in isolation_evidence_calibrates_before_product isolation_cases_reach_negative_runner isolation_target_keeps_case_and_scenario_separate isolation_calibration_requires_each_shared_port_probe isolation_requires_per_target_snapshots; do
+for name in isolation_evidence_calibrates_before_product isolation_cases_reach_negative_runner isolation_target_keeps_case_and_scenario_separate isolation_calibration_requires_each_shared_port_probe isolation_requires_per_target_snapshots isolation_snapshots_each_of_five_targets; do
     rc=0; ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
     [[ $rc == 0 ]] || failed=1

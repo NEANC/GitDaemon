@@ -503,8 +503,8 @@ mapping_calibrate_witness() {
 mapping_probe_egress() {
     local product=$1 generation=$2 target=${3:-} key spec proto port dest tool facts ledger output status probe_rc remove_rc product_id
     [[ -n $product && -n $generation ]] || return 80
-        [[ -z $target || $target == "$key" ]] || continue
     for key in $MAPPING_WITNESS_KEYS; do
+        [[ -z $target || $target == "$key" ]] || continue
         spec=$(mapping_witness_spec "$key") || return 80
         IFS=$'\t' read -r proto port dest <<< "$spec"
         case "$key" in
@@ -566,7 +566,7 @@ mapping_probe_egress() {
                 output=$(mapping_fixture_docker exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/" 2>&1) || status=$?
                 printf '%s\n' "$output"
                 if [[ $status == 0 ]]; then return 1; fi
-                [[ $output != *'Error response from daemon:'* && $status == 28 && ( $output == *'Connection timed out'* || $output == *'Operation timed out'* ) ]] || return 80
+                [[ $output != *'Error response from daemon:'* && $status == 28 && ( $output == *'Connection timed out'* || $output == *'Operation timed out'* || $output == *'Timeout was reached'* ) ]] || return 80
                 ;;
         esac
     done
@@ -585,6 +585,7 @@ mapping_isolation_check() {
     [[ -n ${IT_CONTROL_DIR:-} ]] || return 80
     base=${IT_CONTROL_DIR%/control}
     [[ -n $base && $base != "$IT_CONTROL_DIR" ]] || return 80
+    for key in $MAPPING_WITNESS_KEYS; do
         [[ -z ${MAPPING_ASSERT_TARGET:-} || $MAPPING_ASSERT_TARGET == "$key" ]] || continue
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
         seq_before=${CONTROL_SEQ:-0}
@@ -596,7 +597,6 @@ mapping_isolation_check() {
         wb=$(mapping_witness "$base/mapping-snapshot-$seq_before.witness") || return 1
         wa=$(mapping_witness "$base/mapping-snapshot-$seq_after.witness") || return 1
         [[ $wb == "$wa" ]] || return 1
-    for key in $MAPPING_WITNESS_KEYS; do
         cb=$(mapping_count "$before" "$profile" "$key") || return 1
         ca=$(mapping_count "$after" "$profile" "$key") || return 1
         [[ $ca -gt $cb ]] || return 1

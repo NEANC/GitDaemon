@@ -19,6 +19,10 @@ probe_case() (
                 printf 'curl: (28) Connection timed out\n' >&2
                 return 28
                 ;;
+            curl-timeout)
+                printf 'curl: (28) Timeout was reached\n' >&2
+                return 28
+                ;;
             reached)
                 if [[ $key == dns-udp ]]; then
                     printf 'Name: reachable.invalid\nAddress: 172.30.244.53\n'
@@ -59,6 +63,9 @@ for key in dns-udp cross-network host-published host-input; do
         read -r mode expected <<< "$row"
         probe_case "$key" "$mode" "$expected" || { printf 'FAIL %s %s\n' "$key" "$mode"; failed=1; }
     done
+done
+for key in cross-network host-published host-input; do
+    probe_case "$key" curl-timeout 0 || { printf 'FAIL %s curl-timeout\n' "$key"; failed=1; }
 done
 probe_case dns-udp udp-timeout 0 || { printf 'FAIL dns-udp udp-timeout\n'; failed=1; }
 exit "$failed"
