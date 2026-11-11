@@ -165,9 +165,19 @@ lifecycle_controller() {
                 resource_enumerate() { return 2; }
             fi
             if [[ $action == mapping-release ]]; then
-                printf '%s %s\n' "$(wc -l < "$CASE_DIR/iptables.log")" "$(wc -l < "$CASE_DIR/nsenter.log")" > "$CASE_DIR/rules-before-release"
+                [[ $GUARD_MAPPING_STATE == ACTIVE && ${#OWN_RULES[@]} -gt 0 && ${#OWN_NS_RULES[@]} -gt 0 ]] || return 98
+                declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS > "$CASE_DIR/ownership-before-release"
+                cp "$CASE_DIR/iptables.log" "$CASE_DIR/iptables-before-release.log"
+                cp "$CASE_DIR/nsenter.log" "$CASE_DIR/nsenter-before-release.log"
             fi
             guard_mapping_request_handle "$action" "$generation" "$network" "$digest" "$nonce" || rc=$?
+            if [[ $MODE == release-query-fail && $action == mapping-release ]]; then
+                [[ $GUARD_MAPPING_STATE == ACTIVE ]] || rc=98
+                declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS > "$CASE_DIR/ownership-after-release"
+                cmp -s "$CASE_DIR/ownership-before-release" "$CASE_DIR/ownership-after-release" || rc=98
+                cmp -s "$CASE_DIR/iptables-before-release.log" "$CASE_DIR/iptables.log" || rc=98
+                cmp -s "$CASE_DIR/nsenter-before-release.log" "$CASE_DIR/nsenter.log" || rc=98
+            fi
             if [[ $rc == 0 && $action == mapping-ready && ( ${#OWN_RULES[@]} == 0 || ${#OWN_NS_RULES[@]} == 0 ) ]]; then rc=98; fi
             if [[ $rc != 0 ]]; then
                 printf 'guard-fail %s %s\n' "$action" "$rc" >> "$CASE_DIR/events"
@@ -233,8 +243,9 @@ lifecycle_case() {
                 before=$(wc -l < "$CASE_DIR/docker.log")
                 grep -q '^release g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 grep -q '^guard-fail mapping-release 2$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-                read -r host_before witness_before < "$CASE_DIR/rules-before-release"
-                [[ $(wc -l < "$CASE_DIR/iptables.log") == "$host_before" && $(wc -l < "$CASE_DIR/nsenter.log") == "$witness_before" ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                cmp -s "$CASE_DIR/ownership-before-release" "$CASE_DIR/ownership-after-release" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                cmp -s "$CASE_DIR/iptables-before-release.log" "$CASE_DIR/iptables.log" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                cmp -s "$CASE_DIR/nsenter-before-release.log" "$CASE_DIR/nsenter.log" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 grep -q "^remove $(cat "$CASE_DIR/names/gm-mtest-g1-product")$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 mapping_scenario_fixture_prepare fallback mapping-fallback "$CASE_DIR/g2" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
