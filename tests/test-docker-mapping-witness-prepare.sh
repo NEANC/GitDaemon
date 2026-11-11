@@ -89,7 +89,7 @@ setup_case() {
     MAPPING_ASSERT_GENERATION=g1 IT_CONTROL_DIR=$dir/control IT_EVIDENCE_DIR=$dir
     RESOURCE_LEDGER_DIR=$dir/control/resources RESOURCE_RUN=mtest RUN=mtest E=$dir
     GUARD_PROFILE=$MAPPING_PROFILE GUARD_MAPPING_CONTROL_IDENTITY=identity
-    GUARD_MAPPING_STATE=PREPARING seq=1 last_nonce='' rules_start=0
+    GUARD_MAPPING_STATE=PREPARING seq=1 last_nonce='' rules_start=0 MP_NETWORK_ID=net-one
     OWN_RULES=() OWN_CHAINS=() OWN_NS_RULES=() OWN_NS_CHAINS=()
     : > "$WORK/docker.calls"
     : > "$WORK/removed"
@@ -117,7 +117,7 @@ setup_case() {
     }
     mapping_proxy_evidence_reset() { return 0; }
     mapping_negative_prepare() { return 0; }
-    mapping_control_request() { guard_mapping_request_handle "$1" "$2" "$3" "$4" nonce1; MAPPING_ACK_GENERATION=$2; }
+    mapping_control_request() { guard_mapping_request_handle "$1" "$2" "$3" "$4" "nonce$seq" || return $?; MAPPING_ACK_GENERATION=$2; }
     mapping_fixture_start() { return 0; }
 }
 
@@ -169,9 +169,11 @@ prepare_refuses_orphaned_shared_receipt() (
 
 fixture_second_generation_accepts_only_shared_entries() (
     setup_case fixture-second
-    mapping_prepare "$MAPPING_PROFILE" mapping-direct product tools || return 1
-    guard_mapping_generation mapping-ready g1 net-one "$MP_PROFILE_SHA256" || return 1
-    GUARD_MAPPING_STATE=RELEASED GUARD_MAPPING_LAST_GENERATION=g1
+    GUARD_MANIFEST=manifest GUARD_ATTESTATION=attestation
+    mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
+    [[ $GUARD_MAPPING_STATE == ACTIVE && $GUARD_MAPPING_GENERATION == g1 ]] || return 1
+    mapping_scenario_release direct mapping-direct g1 "$E" || return 1
+    [[ $GUARD_MAPPING_STATE == RELEASED && $GUARD_MAPPING_LAST_GENERATION == g1 ]] || return 1
     MAPPING_ASSERT_GENERATION=g2
     : > "$WORK/acks"
     mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
@@ -181,12 +183,37 @@ fixture_second_generation_accepts_only_shared_entries() (
 
 fixture_second_generation_rejects_extra_shared_identity() (
     setup_case fixture-extra
-    mapping_prepare "$MAPPING_PROFILE" mapping-direct product tools || return 1
+    GUARD_MANIFEST=manifest GUARD_ATTESTATION=attestation
+    mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
+    mapping_scenario_release direct mapping-direct g1 "$E" || return 1
     printf '3\tregister\tcontainer\t%s\tmtest\tmapping\twitness\thash\t%s\tpath\n' dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd >> "$RESOURCE_LEDGER_DIR/ledger.tsv"
-    resource_crosscheck() { resource_ledger_load "$1"; }
     MAPPING_ASSERT_GENERATION=g2
     mapping_scenario_fixture_prepare direct mapping-direct "$E" >/dev/null 2>&1 && return 1
     [[ $(awk '$1=="create" && $0 ~ /gm-mtest-witness/ {n++} END {print n+0}' "$WORK/docker.calls") == 1 ]]
+)
+
+release_rejects_drift_without_teardown() (
+    setup_case release-drift
+    GUARD_MANIFEST=manifest GUARD_ATTESTATION=attestation
+    mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
+    GUARD_MAPPING_WITNESS_ID=$WITNESS_ID
+    OWN_RULES=('filter|-A GEN -j DROP') OWN_NS_RULES=('raw|-A MS -j RETURN') OWN_NS_CHAINS=('raw|MS')
+    WITNESS_ATTACHMENT=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    mapping_scenario_release direct mapping-direct g1 "$E" >/dev/null 2>&1 && return 1
+    [[ $GUARD_MAPPING_STATE == ACTIVE && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_NS_CHAINS[@]} == 1 && ${#OWN_RULES[@]} == 1 ]] || return 1
+    [[ ! -s $WORK/removed ]]
+)
+
+release_rejects_missing_wnet_without_teardown() (
+    setup_case release-no-wnet
+    GUARD_MANIFEST=manifest GUARD_ATTESTATION=attestation
+    mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
+    GUARD_MAPPING_WITNESS_ID=$WITNESS_ID
+    OWN_RULES=('filter|-A GEN -j DROP') OWN_NS_RULES=('raw|-A MS -j RETURN') OWN_NS_CHAINS=('raw|MS')
+    WITNESS_NET_MISSING=1
+    mapping_scenario_release direct mapping-direct g1 "$E" >/dev/null 2>&1 && return 1
+    [[ $GUARD_MAPPING_STATE == ACTIVE && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_NS_CHAINS[@]} == 1 && ${#OWN_RULES[@]} == 1 ]] || return 1
+    [[ ! -s $WORK/removed ]]
 )
 
 prepare_rejects_witness_attachment_drift() (
@@ -232,7 +259,7 @@ start_failure_cannot_ready() (
 )
 
 failed=0
-for test in prepare_ready_registers_witness wrong_network_cannot_ack start_failure_cannot_ready prepare_second_generation_reuses_shared_identity prepare_second_generation_rejects_missing_wnet prepare_release_two_generations_keep_shared prepare_refuses_orphaned_shared_receipt prepare_rejects_witness_attachment_drift fixture_second_generation_accepts_only_shared_entries fixture_second_generation_rejects_extra_shared_identity; do
+for test in prepare_ready_registers_witness wrong_network_cannot_ack start_failure_cannot_ready prepare_second_generation_reuses_shared_identity prepare_second_generation_rejects_missing_wnet prepare_release_two_generations_keep_shared prepare_refuses_orphaned_shared_receipt prepare_rejects_witness_attachment_drift fixture_second_generation_accepts_only_shared_entries fixture_second_generation_rejects_extra_shared_identity release_rejects_drift_without_teardown release_rejects_missing_wnet_without_teardown; do
     rc=0; "$test" || rc=$?
     printf '%s EXIT=%s\n' "$test" "$rc"
     [[ $rc == 0 ]] || failed=1

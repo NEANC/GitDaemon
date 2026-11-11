@@ -19,6 +19,7 @@ lifecycle_docker() {
             [[ $MODE != prepare-fail ]] || return 42
             [[ $MODE != second-prepare-fail || $GEN != g2 ]] || return 42
             id=${*: -1}
+            if [[ $kind == network || $kind == volume ]]; then name=$id; fi
             while (( $# )); do
                 arg=$1; shift
                 case "$arg" in
@@ -34,8 +35,8 @@ lifecycle_docker() {
                     --ip) ip=$1; shift ;;
                 esac
             done
-            if [[ $kind == container ]]; then id="id-$GEN-$role"; elif [[ $kind == network ]]; then id="net-$GEN"; fi
-            [[ $kind != network ]] || name=$MP_NETWORK_NAME
+            if [[ $kind == container ]]; then id=$(printf '%s' "$GEN-$scenario-$role" | sha256sum); id=${id%% *}; fi
+            if [[ $kind == network ]]; then id=$(printf '%s' "$name" | sha256sum); id=${id%% *}; fi
             [[ ! -f $CASE_DIR/objects/$id ]] || return 98
             printf '%s\t%s\t%s\t%s\t%s\n' "$run" "$scenario" "$role" "$network" "$ip" > "$CASE_DIR/objects/$id"
             if [[ -n $name ]]; then printf '%s\n' "$id" > "$CASE_DIR/names/$name"; fi
@@ -43,12 +44,15 @@ lifecycle_docker() {
         inspect)
             if [[ ${1:-} == -f ]]; then format=$2; shift 2; fi
             id=$1
-            if [[ $MODE == inspect-error && -f $CASE_DIR/calibrated && $id == *probe ]]; then return 2; fi
+            if [[ $MODE == inspect-error && -f $CASE_DIR/calibrated && -f $CASE_DIR/names/gm-mtest-probe && $id == "$(cat "$CASE_DIR/names/gm-mtest-probe")" ]]; then return 2; fi
             if [[ -f $CASE_DIR/names/$id ]]; then id=$(cat "$CASE_DIR/names/$id"); fi
             [[ -f $CASE_DIR/objects/$id ]] || return 1
             case "$format" in
                 '{{.Id}}') printf '%s\n' "$id" ;;
-                '{{.Name}}') [[ $kind != network ]] || { printf '%s\n' "$MP_NETWORK_NAME"; return 0; }; printf '%s\n' "$id" ;;
+                '{{.Name}}') for name in "$CASE_DIR/names/"*; do [[ ! -f $name || $(cat "$name") != "$id" ]] || { printf '%s\n' "${name##*/}"; return 0; }; done; return 1 ;;
+                *'HostConfig.NetworkMode'*'gitdaemon.run'*|*'gitdaemon.run'*'HostConfig.NetworkMode'*) IFS=$'\t' read -r run scenario role network ip < "$CASE_DIR/objects/$id"; printf '%s|%s|%s|%s|%s|123|true\n' "$id" "$run" "$scenario" "$role" "$network" ;;
+                *'HostConfig.NetworkMode'*) cut -f4 "$CASE_DIR/objects/$id" | while read -r network; do printf '%s|true\n' "$network"; done ;;
+                *'NetworkSettings.Networks'*) network=$(cut -f4 "$CASE_DIR/objects/$id"); cat "$CASE_DIR/names/$network" ;;
                 *gitdaemon.run*) cut -f1-3 "$CASE_DIR/objects/$id" ;;
                 *'.CreatedAt'*'.Driver'*'.Mountpoint'*) printf 'created|local|/contract/%s|labels\n' "$id" ;;
                 '{{json .Mounts}}') printf '[{"Destination":"/ev","RW":true}]\n' ;;
@@ -63,7 +67,7 @@ lifecycle_docker() {
             id=${*: -1}
             if [[ -f $CASE_DIR/names/$id ]]; then id=$(cat "$CASE_DIR/names/$id"); fi
             IFS=$'\t' read -r run scenario role network ip < "$CASE_DIR/objects/$id"
-            if [[ $network != none ]]; then
+            if [[ $network != none && $role != witness ]]; then
                 [[ ${MAPPING_ACK_GENERATION:-} == "$GEN" ]] || return 98
                 [[ $MODE != start-fail ]] || return 42
                 [[ $MODE != second-start-fail || $GEN != g2 ]] || return 42
@@ -74,6 +78,7 @@ lifecycle_docker() {
                 printf 'start %s %s\n' "$GEN" "$role" >> "$CASE_DIR/events"
                 : > "$CASE_DIR/running/$id"
             fi
+            if [[ $role == witness ]]; then : > "$CASE_DIR/running/$id"; fi
             case "$role" in
                 evidence-image-check) printf '10001:10001\n' ;;
                 evidence-init) printf 'owner=10001:10001\n' ;;
@@ -113,8 +118,10 @@ lifecycle_docker() {
         ps|ls)
             for id in "$CASE_DIR/objects/"*; do
                 [[ -f $id ]] || continue
-                [[ $kind != container || $action != ps || ${id##*/} == id-* ]] || continue
-                [[ $kind == container || $kind == network && ${id##*/} == net-* || $kind == volume && ${id##*/} != id-* && ${id##*/} != net-* ]] || continue
+                role=$(cut -f3 "$id")
+                if [[ $kind == network ]]; then [[ $role == network || $role == witness-network ]] || continue
+                elif [[ $kind == volume ]]; then [[ $role != network && $role != witness-network && $role != witness && ! -f $CASE_DIR/running/${id##*/} ]] || continue
+                else [[ $role != network && $role != witness-network && ( $action != ps || -f $CASE_DIR/running/${id##*/} ) ]] || continue; fi
                 printf '%s\n' "${id##*/}"
             done ;;
     esac
@@ -122,6 +129,8 @@ lifecycle_docker() {
 }
 validation_docker() { lifecycle_docker "$@"; }
 resource_docker() { lifecycle_docker "$@"; }
+docker() { lifecycle_docker "$@"; }
+nsenter() { return 0; }
 resource_lock() { return 0; }
 resource_unlock() { return 0; }
 guard_mapping_rules() { printf 'rules %s\n' "$GUARD_MAPPING_GENERATION" >> "$CASE_DIR/events"; }
@@ -189,7 +198,8 @@ lifecycle_case() {
             mapping_scenario_calibrate fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.recalibrate" 2>&1 || rc=$?
         fi
         if (( rc == 0 )) && [[ $MODE == drift ]]; then
-            printf 'foreign\tmapping-fallback\tprobe\tgm-mtest-m-net\t140.82.112.10\n' > "$CASE_DIR/objects/id-$GEN-probe"
+            id=$(cat "$CASE_DIR/names/gm-mtest-probe")
+            printf 'foreign\tmapping-fallback\tprobe\tgm-mtest-m-net\t140.82.112.10\n' > "$CASE_DIR/objects/$id"
         fi
         if (( rc == 0 )); then mapping_scenario_product_up fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.product" 2>&1 || rc=$?; fi
         if [[ $MODE == second-* && $GEN == g1 || $MODE == release-query-fail && $GEN == g1 ]]; then
@@ -204,19 +214,20 @@ lifecycle_case() {
             mapping_scenario_product_up fallback mapping-fallback "$CASE_DIR/$GEN" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
             ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
             if [[ $MODE == drift || $MODE == inspect-error ]]; then
-                ! grep -q "^remove id-$GEN-probe$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                ! grep -q "^remove $(cat "$CASE_DIR/names/gm-mtest-probe")$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
             fi
             if [[ $MODE == second-* || $MODE == release-query-fail ]]; then [[ $GEN == g2 ]] || return 1; fi
             break
         fi
-        [[ $(grep -E "^(ready $GEN|start $GEN|calibrated $GEN|remove id-$GEN-probe$)" "$CASE_DIR/events") == "$(printf 'ready %s\nstart %s upstream\nstart %s proxy\nstart %s dns\nstart %s probe\ncalibrated %s\nremove id-%s-probe\nstart %s product' "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN")" ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+        id=$(cat "$CASE_DIR/names/gm-mtest-probe")
+        [[ $(grep -E "^(ready $GEN|start $GEN|calibrated $GEN|remove $id$)" "$CASE_DIR/events") == "$(printf 'ready %s\nstart %s upstream\nstart %s proxy\nstart %s dns\nstart %s probe\ncalibrated %s\nremove %s\nstart %s product' "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$GEN" "$id" "$GEN")" ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
         mapping_scenario_release fallback mapping-fallback "$GEN" "$CASE_DIR/$GEN" || {
             if [[ $MODE == release-query-fail ]]; then
                 before=$(wc -l < "$CASE_DIR/docker.log")
                 grep -q '^release g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 grep -q '^guard-fail mapping-release 2$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 ! grep -q '^unrules g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-                grep -q '^remove id-g1-product$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                grep -q "^remove $(cat "$CASE_DIR/names/gm-mtest-g1-product")$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 mapping_scenario_fixture_prepare fallback mapping-fallback "$CASE_DIR/g2" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 : > "$CASE_DIR/done"; wait "$pid"; return 0
