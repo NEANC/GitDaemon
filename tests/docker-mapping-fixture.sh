@@ -475,19 +475,53 @@ mapping_calibrate_witness() {
     return 0
 }
 
-# 从产品 netns 发起五类目标探测；预期全部被拒绝。
+# 从产品 netns 发起五类目标探测；TCP DNS 由登记工具共享 netns 发起。
 mapping_probe_egress() {
-    local product=$1 generation=$2 spec proto port dest rc=0
+    local product=$1 generation=$2 spec proto port dest tool facts ledger output status probe_rc remove_rc product_id
+    [[ -n $product && -n $generation ]] || return 80
     for key in $MAPPING_WITNESS_KEYS; do
-        spec=$(mapping_witness_spec "$key") || return 1
+        spec=$(mapping_witness_spec "$key") || return 80
         IFS=$'\t' read -r proto port dest <<< "$spec"
         case "$key" in
             dns-udp) docker exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest" || true ;;
-            dns-tcp) docker exec "$product" timeout 4 busybox nslookup -tcp "$MP_RUN_ID-$generation.invalid" "$dest" || true ;;
+            dns-tcp)
+                mapping_fixture_state_load || return 80
+                ledger=$(resource_ledger_dir) || return 80
+                RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+                resource_crosscheck "$ledger" || return 80
+                product_id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$product") || return 80
+                [[ $product_id =~ ^[0-9a-f]{64}$ ]] || return 80
+                resource_verify_object container "$product_id" "$MPF_SCENARIO" product '' || return 80
+                facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.State.Running}}' "$product_id") || return 80
+                [[ $facts == "$MP_NETWORK_NAME|true" ]] || return 80
+                tool=$(mapping_fixture_run "$MPF_SCENARIO" tcp-dns -d --name "gm-$MP_RUN_ID-$generation-tcp-dns" \
+                    --user 10001:10001 --read-only --cap-drop ALL --security-opt no-new-privileges \
+                    --network "container:$product_id" \
+                    --entrypoint sleep "$MPF_TOOLS_IMAGE" 120) || return 80
+                [[ $tool =~ ^[0-9a-f]{64}$ ]] || return 80
+                resource_crosscheck "$ledger" || return 80
+                resource_verify_object container "$tool" "$MPF_SCENARIO" tcp-dns '' || return 80
+                facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.Config.User}}|{{.State.Running}}|{{.Image}}' "$tool") || return 80
+                [[ $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE" ]] || return 80
+                printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product_id"
+                status=0
+                output=$(mapping_fixture_docker exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A 2>&1) || status=$?
+                printf '%s\n' "$output"
+                probe_rc=0
+                if [[ $status == 0 ]]; then
+                    probe_rc=1
+                elif [[ $status != 9 || $output != *"communications error to $dest#53: timed out"* || $output != *'no servers could be reached'* ]]; then
+                    probe_rc=80
+                fi
+                remove_rc=0
+                resource_remove container "$tool" || remove_rc=$?
+                [[ $remove_rc == 0 ]] || return 80
+                [[ $probe_rc == 0 ]] || return "$probe_rc"
+                ;;
             *) docker exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/" || true ;;
         esac
     done
-    return "$rc"
+    return 0
 }
 
 # 隔离判定：五类 DROP 计数均增长、接收端计数零变化；未完成正校准不得通过。
