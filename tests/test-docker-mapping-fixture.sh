@@ -694,12 +694,25 @@ tls_docker() {
     done
     case "$*" in
         'volume create '*)
-            printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" > "$TLS_DIR/labels"
+            printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" > "$TLS_DIR/labels-$last"
             printf '%s\n' "$last"
             ;;
         'create '*)
-            printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" > "$TLS_DIR/labels"
-            printf '%s\n' "${name:-$last}"
+            name=${name:-gm-mtest-$role}
+            printf '%s\t%s\t%s\n' "$run" "$scenario" "$role" > "$TLS_DIR/labels-$name"
+            printf '%s\n' "$name"
+            ;;
+        'rm -f '*|'volume rm '*)
+            rm -f -- "$TLS_DIR/labels-$last"
+            printf '%s\n' "$last"
+            ;;
+        'start -a '*)
+            labels=$(command cat -- "$TLS_DIR/labels-$last") || return 1
+            case "$labels" in
+                *$'\tevidence-image-check') printf '10001:10001\n' ;;
+                *$'\tevidence-init') : ;;
+                *) return 1 ;;
+            esac
             ;;
         'exec '*)
             case "$*" in
@@ -711,15 +724,16 @@ tls_docker() {
             esac
             ;;
         *'.Config.Labels'*|*'.Labels'*)
-            labels=$(command cat -- "$TLS_DIR/labels") || return 1
+            labels=$(command cat -- "$TLS_DIR/labels-$last") || return 1
             printf '%s\n' "$labels"
             ;;
         *'CreatedAt'*)
             printf '%s|local|/var/lib/docker/volumes/%s/_data|gitdaemon.run=%s,\n' "$last" "$last" "$run"
             ;;
         *'.State.Running'*) printf 'true\n' ;;
-        *'.Name'*) printf '%s\n' "$last" ;;
-        *'.Id'*) printf '%s\n' "$last" ;;
+        'network inspect '*'.Name'*) printf '%s\n' "$last" ;;
+        *'.Name'*) [[ -f $TLS_DIR/labels-$last ]] || return 1; printf '%s\n' "$last" ;;
+        *'.Id'*) [[ -f $TLS_DIR/labels-$last ]] || return 1; printf '%s\n' "$last" ;;
         'inspect '*) printf '{"Name":"%s"}\n' "$last" ;;
         *) printf '{}\n' ;;
     esac
@@ -804,10 +818,12 @@ tls_env() {
 # 完整 tls 契约环境：资产准备 + 夹具启动，并预置两端口独立计数文件与 CONNECT 日志。
 tls_setup() {
     tls_env || return 1
+    MPF_SCENARIO=$TLS_SCENARIO_ID
     mapping_assets_prepare "$TLS_DIR/profile.tsv" "$TLS_SCENARIO_ID" product "$TLS_DIR/ledger" || {
         printf 'mapping_assets_prepare failed\n'
         return 1
     }
+    mapping_evidence_volume_prepare tools "$TLS_SCENARIO_ID" || return 1
     mkdir -p "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID"
     printf '0\n' > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/accept.count"
     printf '0\n' > "$TLS_ASSETS/proxy/scenarios/$TLS_SCENARIO_ID/reject.count"
@@ -968,7 +984,7 @@ upstream_evidence_volume_writable() {
     esac
     [[ $MAPPING_UPSTREAM_REQUESTS == "$MAPPING_EVIDENCE_MOUNT/requests.log" ]] \
         || { printf 'evidence count path is not on the rw volume: %s\n' "$MAPPING_UPSTREAM_REQUESTS"; failed=1; }
-    grep -q $'register\tvolume\tgm-mtest-mapping-evidence\tmtest\tmapping\tevidence\t' "$TLS_DIR/ledger/ledger.tsv" \
+    grep -q $'register\tvolume\tgm-mtest-mapping-evidence\tmtest\tmapping-fallback\tevidence\t' "$TLS_DIR/ledger/ledger.tsv" \
         || { printf 'evidence volume not registered\n'; failed=1; }
     # 生成的服务脚本必须只向证据卷写入；只读资产卷上的写重定向会失败并让循环空转。
     script=$(mapping_upstream_serve_script) || { printf 'serve script generation failed\n'; return 1; }
@@ -981,6 +997,18 @@ upstream_evidence_volume_writable() {
     [[ $rc != 0 ]] || { printf 'missing evidence file was accepted as a count\n'; failed=1; }
     grep -q "wc -l < '$MAPPING_EVIDENCE_MOUNT/requests.log'" "$TLS_DIR/docker.calls" \
         || { printf 'evidence count does not read the rw path\n'; failed=1; }
+    rm -rf "$TLS_DIR"
+    return "$failed"
+}
+
+# 证据卷须由真实登记链在启动上游前创建，且归属 mapping-fallback。
+tls_setup_registers_evidence_before_upstream() {
+    local failed=0 volume_line upstream_line
+    tls_setup || return 1
+    volume_line=$(grep -n $'volume create --label gitdaemon.run=mtest --label gitdaemon.scenario=mapping-fallback --label gitdaemon.role=evidence ' "$TLS_DIR/docker.calls" | cut -d: -f1) || failed=1
+    upstream_line=$(grep -n -- '--name gm-mtest-upstream' "$TLS_DIR/docker.calls" | cut -d: -f1) || failed=1
+    [[ -n $volume_line && -n $upstream_line && $volume_line -lt $upstream_line ]] || failed=1
+    grep -q $'register\tvolume\tgm-mtest-mapping-evidence\tmtest\tmapping-fallback\tevidence\t' "$TLS_DIR/ledger/ledger.tsv" || failed=1
     rm -rf "$TLS_DIR"
     return "$failed"
 }
@@ -1406,7 +1434,7 @@ wrong_upstream_san() {
 relay_round_trip() {
     local client_file=$1 server_file=$2 dir port server_pid rc=0
     dir=$(mktemp -d)
-    python - "$dir/port" "$dir/upstream" "$client_file" "$server_file" <<'PY' &
+    python3 - "$dir/port" "$dir/upstream" "$client_file" "$server_file" <<'PY' &
 import pathlib
 import socket
 import sys
@@ -1532,7 +1560,7 @@ proxy_restart_preserves_other_port() {
 relay_timeout_and_term_reap_children() {
     local dir port server_pid rc=0
     dir=$(mktemp -d)
-    python - "$dir/port" <<'PY' &
+    python3 - "$dir/port" <<'PY' &
 import pathlib
 import socket
 import sys
@@ -1569,7 +1597,7 @@ PY
 proxy_repeated_connections_work() {
     local dir failed=0 upstream_port upstream_pid connection=0
     dir=$(mktemp -d)
-    python - "$dir/upstream-port" "$dir/upstream-requests" <<'PY' &
+    python3 - "$dir/upstream-port" "$dir/upstream-requests" <<'PY' &
 import pathlib
 import socket
 import sys
@@ -1771,7 +1799,8 @@ mapping_isolation_check_behavior
 mapping_run_id_binding
 mapping_snapshot_requires_ready'
 
-MAPPING_TLS_TESTS='upstream_evidence_volume_writable
+MAPPING_TLS_TESTS='tls_setup_registers_evidence_before_upstream
+upstream_evidence_volume_writable
 negative_injection_replaces_files
 evidence_volume_initialized_before_ev_mount
 evidence_volume_owner_is_10001
