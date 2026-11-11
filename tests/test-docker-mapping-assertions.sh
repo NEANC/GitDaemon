@@ -626,15 +626,6 @@ negative_unreachable_map_system() {
     sa_negative_case unreachable-map-system direct judge
 }
 
-negative_tls_names() {
-    local name failed=0
-    for name in wrong_upstream_san; do
-        sa_negative_case "$name" fallback judge || failed=1
-        sa_negative_case "$name" direct judge || failed=1
-    done
-    return "$failed"
-}
-
 negative_isolation() {
     sa_negative_case isolation fallback policy || return 1
     sa_negative_case isolation direct policy
@@ -1158,7 +1149,6 @@ negative_missing_map
 negative_invalid_map
 negative_dns_false_green
 negative_unreachable_map_system
-negative_tls_names
 negative_isolation
 fixture_failure_is_80
 full_summary_slots_supported'

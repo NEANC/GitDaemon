@@ -1180,7 +1180,7 @@ R=${MAPPING_ASSET_ROOT:?}
 E=${MAPPING_EVIDENCE_ROOT:?}
 mkdir -p "$E" || exit 1
 cd "$R/upstream/web" || exit 1
-: > "$E/requests.log" || exit 1
+if test ! -f "$E/requests.log"; then : > "$E/requests.log" || exit 1; fi
 while :; do
     openssl s_server -quiet -naccept 1 -accept 443 \
         -cert "$R/upstream/tls/srv.crt" -key "$R/upstream/tls/srv.key" -WWW \

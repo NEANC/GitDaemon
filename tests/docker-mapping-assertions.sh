@@ -5,6 +5,7 @@
 # 契约测试以替身替换这些边界。判定器不设替身，直接消费证据文件，因此假绿注入无法绕过。
 
 source "$(dirname -- "${BASH_SOURCE[0]}")/docker-wrong-proxy-san.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/docker-wrong-upstream-san.sh"
 
 # 场景与证据契约。
 MAPPING_ASSERT_KINDS='fallback direct'
@@ -465,7 +466,6 @@ mapping_scenario_apply_negative() {
         wrong_proxy_ca) mapping_negative_wrong_ca proxy-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
         wrong_proxy_san) : ;;
         wrong_upstream_ca) mapping_negative_wrong_ca upstream-ca.crt || return "$MAPPING_ASSERT_FIXTURE" ;;
-        wrong_upstream_san) MAPPING_NEG_HOST='other-host.invalid' mapping_negative_wrong_san upstream || return "$MAPPING_ASSERT_FIXTURE" ;;
     esac
     mapping_negative_apply "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
@@ -962,6 +962,10 @@ mapping_scenario_evidence() {
     mapping_scenario_identity_write "$kind" "$base_scenario" "$generation" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_refs "$kind" "$scenario" "$dir" > "$dir/refs.expected" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_head "$kind" "$scenario" "$dir" > "$dir/head.expected" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == wrong_upstream_san ]]; then
+        mapping_upstream_san_case "$dir" "$kind" "$scenario" || return $?
+        return 0
+    fi
     if [[ ${MAPPING_ASSERT_CASE:-} == wrong_proxy_ca || ${MAPPING_ASSERT_CASE:-} == wrong_upstream_ca ]]; then
         mapping_tls_negative_run "$MAPPING_ASSERT_CASE" "$dir" "$kind" "$scenario" || return $?
         return 0
@@ -1186,9 +1190,36 @@ mapping_negative_rejected() {
             return 0
             ;;
         wrong_upstream_san)
-            mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
-            mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return "$MAPPING_ASSERT_FIXTURE"
-            if mapping_assert_result "$kind" "$dir"; then return 1; fi
+            local baseline_exit recovery_exit request_exit proxy_before proxy_after upstream_before upstream_after
+            [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == wrong_upstream_san ]] || return 80
+            for snapshot in tls-layer.tsv baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log leaf.original leaf.wrong leaf.restored refs.expected refs.actual head.expected head.actual fsck.exit; do
+                [[ -f $dir/$snapshot && ! -L $dir/$snapshot ]] || return 80
+            done
+            mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return 1
+            baseline_exit=$(mapping_assert_uint_file "$dir/baseline.exit") || return 80
+            recovery_exit=$(mapping_assert_uint_file "$dir/recovery.exit") || return 80
+            request_exit=$(mapping_assert_uint_file "$dir/request.exit") || return 80
+            proxy_before=$(mapping_assert_uint_file "$dir/proxy.before") || return 80
+            proxy_after=$(mapping_assert_uint_file "$dir/proxy.after") || return 80
+            upstream_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 80
+            upstream_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
+            [[ $baseline_exit == 0 && $recovery_exit == 0 ]] || return 80
+            (( request_exit > 0 && proxy_after > proxy_before && upstream_after > upstream_before )) || return 1
+            [[ $(mapping_assert_uint_file "$dir/proxy.recovered") -gt $proxy_after ]] || return 1
+            cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 80
+            ! cmp -s "$dir/leaf.original" "$dir/leaf.wrong" || return 1
+            mapping_profile_load "$MAPPING_PROFILE" || return 80
+            mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 1
+            mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || return 1
+            mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
+            grep -Eqi 'SSL.*(hostname|subject alternative|certificate.*(match|name))' "$dir/request.failed.log" || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
+            mapping_assert_refs_match "$dir" || return 80
+            mapping_assert_head_match "$dir" || return 80
+            [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 80
+            MAPPING_ASSERT_REJECT_LAYER=tls-upstream
             return 0
             ;;
         *)
@@ -1257,7 +1288,8 @@ mapping_negative_prepare() {
         unreachable-map-system) MAPPING_ASSERT_SNAPSHOT_MODE=unallocated MAPPING_ASSERT_DNS_MODE=upstream ;;
         wrong_proxy_ca) MAPPING_ASSERT_SNAPSHOT_MODE=none ;;
         wrong_proxy_san) MAPPING_ASSERT_SNAPSHOT_MODE=none ;;
-        wrong_upstream_ca|wrong_upstream_san) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
+        wrong_upstream_ca) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
+        wrong_upstream_san) MAPPING_ASSERT_SNAPSHOT_MODE=none ;;
         isolation) MAPPING_ASSERT_SNAPSHOT_MODE=valid ;;
         *) return "$MAPPING_ASSERT_FIXTURE" ;;
     esac
