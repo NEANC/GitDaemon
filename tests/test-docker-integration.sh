@@ -1484,7 +1484,7 @@ check_https_sync() { check_gated FIXTURE_READY "$@"; }
 check_proxy_sync() { check_gated PROXY_READY "$@"; }
 
 # full 汇总槽位状态：按断言真实执行结果记录；未执行的槽位保持缺席，汇总判定据此拒绝。
-declare -A IT_SLOT_DONE=() IT_SLOT_FAIL=()
+declare -A IT_SLOT_DONE=() IT_SLOT_FAIL=() IT_NEGATIVE_SEEN=()
 
 integration_slot_pass() { IT_SLOT_DONE[$1]=$(( ${IT_SLOT_DONE[$1]:-0} + 1 )); }
 
@@ -1502,7 +1502,7 @@ integration_slot_record() {
 # 负例名称到 full 汇总槽位的映射；未知名称拒绝。
 integration_negative_slot() {
     case "${1:-}" in
-        dns-false-green) printf 'dns_negatives\n' ;;
+        missing-map|invalid-map|dns-false-green|unreachable-map-system) printf 'dns_negatives\n' ;;
         wrong_proxy_ca|wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san) printf 'tls_negatives\n' ;;
         isolation) printf 'isolation_negatives\n' ;;
         *) return 1 ;;
@@ -1528,12 +1528,23 @@ check_mapping_sync() {
 
 # 独立映射负例：三层退出由 mapping_negative_run 承担；夹具失败计入夹具计数，判定未拒绝即断言失败。
 check_mapping_negative() {
-    local label=$1 case_name=${2:-} kind=${3:-} dir rc=0 slot
-    [[ $# == 3 && -n $case_name && -n $kind ]] || return 2
+    local label=$1 case_id=${2:-} kind=${3:-} case_name dir rc=0 slot
+    [[ $# == 3 && -n $case_id && -n $kind ]] || return 2
+    case_name=${case_id%%/*}
     slot=$(integration_negative_slot "$case_name") || return 2
     CHECKS=$((CHECKS + 1))
-    dir=$IT_EVIDENCE_DIR/control/mapping-neg-$case_name-$kind
-    mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
+    dir=$IT_EVIDENCE_DIR/control/mapping-neg-${case_id//\//-}
+    case " $MAPPING_NEGATIVE_CASES " in
+        *" $case_id "*) ;;
+        *) return 2 ;;
+    esac
+    if [[ $case_id == wrong_proxy_ca ]]; then
+        mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
+    else
+        rc=80
+    fi
+    [[ -z ${IT_NEGATIVE_SEEN[$case_id]:-} ]] || rc=80
+    IT_NEGATIVE_SEEN[$case_id]=1
     integration_slot_record "$slot" "$rc"
     case "$rc" in
         0) printf '[PASS] %s\n' "$label" ;;
@@ -1573,7 +1584,10 @@ integration_full_summary_write() {
         for slot in "${slots[@]}"; do
             if (( ${IT_SLOT_FAIL[$slot]:-0} > 0 )); then
                 printf '%s\tFAIL\n' "$slot"
-            elif (( ${IT_SLOT_DONE[$slot]:-0} > 0 )); then
+            elif [[ $slot == dns_negatives && ${IT_SLOT_DONE[$slot]:-0} == 12 ||
+                    $slot == tls_negatives && ${IT_SLOT_DONE[$slot]:-0} == 4 ||
+                    $slot == isolation_negatives && ${IT_SLOT_DONE[$slot]:-0} == 5 ||
+                    $slot != *_negatives && ${IT_SLOT_DONE[$slot]:-0} -gt 0 ]]; then
                 printf '%s\tPASS\n' "$slot"
             else
                 printf '%s\tMISSING\n' "$slot"
@@ -1629,7 +1643,7 @@ integration_mapping_scenarios() {
 # 新映射组唯一注册点：正例两项（单项 mode 只注册对应场景）+ DNS/TLS/隔离负例（仅 full）。
 # 单项 mode 因此不能作为 full 结论：其汇总缺少另一正例与全部负例分组。
 integration_register_mapping_group() {
-    local kind
+    local kind case_id case_kind
     local -a kinds=()
     while IFS= read -r kind; do kinds+=("$kind"); done < <(integration_mapping_scenarios)
     [[ ${#kinds[@]} -gt 0 ]] || return 1
@@ -1640,12 +1654,14 @@ integration_register_mapping_group() {
         esac
     done
     [[ -z $IT_MAPPING_SCENARIO && -z ${IT_MAPPING_ORDER:-} ]] || return 0
-    check_mapping_negative '映射负例：DNS 假绿被映射判定器拒绝（fallback）' dns-false-green fallback
-    check_mapping_negative '映射负例：DNS 假绿被映射判定器拒绝（direct）' dns-false-green direct
-    check_mapping_negative '映射负例：代理/上游证书篡改被 TLS 层拒绝（fallback）' wrong_upstream_ca fallback
-    check_mapping_negative '映射负例：代理/上游证书篡改被 TLS 层拒绝（direct）' wrong_upstream_ca direct
-    check_mapping_negative '映射负例：额外网络附件被配置审计拒绝（fallback）' isolation fallback
-    check_mapping_negative '映射负例：额外网络附件被配置审计拒绝（direct）' isolation direct
+    for case_id in $MAPPING_NEGATIVE_CASES; do
+        case "$case_id" in
+            */fallback) case_kind=fallback ;;
+            */direct) case_kind=direct ;;
+            *) case_kind=fallback ;;
+        esac
+        check_mapping_negative "映射负例：$case_id" "$case_id" "$case_kind"
+    done
 }
 
 # 全量验收汇总判定 mapping_full_accept 由 docker-mapping-assertions.sh 提供：runner 结束路径
