@@ -1214,8 +1214,8 @@ mapping_negative_rejected() {
             mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 1
             mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || return 1
             mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
-            grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
-            grep -Eqi 'SSL.*(hostname|subject alternative|certificate.*(match|name))' "$dir/request.failed.log" || return 1
+            [[ $request_exit == 1 ]] || return 1
+            mapping_upstream_san_git_failure "$dir/request.failed.log" || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
             mapping_assert_refs_match "$dir" || return 80

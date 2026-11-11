@@ -5,6 +5,7 @@ source "$HERE/docker-mapping-fixture.sh"
 source "$HERE/docker-mapping-assertions.sh"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+bash "$HERE/test-docker-upstream-san-product-boundary.sh" "$WORK"
 
 upstream_evidence_survives_restart() {
     local script
@@ -133,17 +134,17 @@ run_case() {
                 printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n' >> "$dir/connect.source"
                 printf '0\n'
             elif [[ -f $dir/replaced ]]; then
-                printf '传输失败：配置的 HTTPS 代理；fatal: SSL: no alternative certificate subject name matches target host name\n' > "$dir/request.log"
-                [[ $MODE == git-other-error ]] && printf 'fatal: Could not resolve host\n' > "$dir/request.log"
+                cp "$WORK/sync.log" "$dir/request.log"
+                if [[ $MODE == git-other-error ]]; then printf "fatal: unable to access 'https://github.com/gitdaemon/fixture.git/': Could not resolve host: github.com\n" > "$dir/request.log"; fi
                 if [[ $MODE == stale-hostname ]]; then
-                    printf 'fatal: SSL: no alternative certificate subject name matches target host name\nfatal: Could not resolve host\n' > "$dir/request.log"
+                    printf "fatal: unable to access 'https://github.com/gitdaemon/fixture.git/': Could not resolve host: github.com\n" >> "$dir/request.log"
                 fi
                 printf '4\n' > "$dir/proxy.count"
                 printf '4\n' > "$dir/upstream.count"
                 if [[ $MODE != no-connect ]]; then
                     printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n' >> "$dir/connect.source"
                 fi
-                if [[ $MODE == unexpected-success ]]; then printf '0\n'; else printf '60\n'; fi
+                if [[ $MODE == unexpected-success ]]; then printf '0\n'; else cat "$WORK/sync.exit"; fi
             else
                 printf '同步传输路径：配置的 HTTPS 代理\n' > "$dir/request.log"
                 [[ $MODE == baseline-fail ]] && printf '60\n' || printf '0\n'
@@ -160,7 +161,7 @@ run_case() {
     fi
     if [[ $mode == ok || $mode == delayed-count ]]; then
         [[ $(cat "$dir/events") == *'replace'*'restart'*'leaf:wrong'*'request'*'restore'*'restart'*'leaf:restored'* ]] || return 1
-        [[ $(cat "$dir/request.exit") == 60 && $(cat "$dir/refs.actual") == "$(cat "$dir/refs.expected")" ]] || return 1
+        [[ $(cat "$dir/request.exit") == "$(cat "$WORK/sync.exit")" && $(cat "$dir/refs.actual") == "$(cat "$dir/refs.expected")" ]] || return 1
         [[ $(cat "$dir/fsck.exit") == 0 ]] || return 1
     fi
     return 0

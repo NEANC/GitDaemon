@@ -114,6 +114,21 @@ mapping_upstream_san_count_after() {
     return 80
 }
 
+mapping_upstream_san_git_failure() {
+    local file=$1 line fatal=0 url="https://${MAPPING_UPSTREAM_HOST:-github.com}/" host=${MAPPING_UPSTREAM_HOST:-github.com}
+    [[ -f $file && ! -L $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        case "$line" in
+            'fatal: unable to access '* )
+                [[ $line == *"'$url"* && $line == *"target host name '$host'"* && $line == *'SSL: no alternative certificate subject name matches target host name'* ]] || return 1
+                fatal=$((fatal + 1))
+                ;;
+            fatal:*) return 1 ;;
+        esac
+    done < "$file"
+    [[ $fatal == 1 ]]
+}
+
 mapping_upstream_san_failure() {
     local dir=$1 kind=$2 scenario=$3 before after dial_before dial_after rc
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
@@ -133,10 +148,8 @@ mapping_upstream_san_failure() {
     (( rc != 0 && after > before && dial_after > dial_before )) || return 1
     tail -n "+$(( $(wc -l < "$dir/connect.baseline") + 1 ))" "$dir/connect.log" > "$dir/connect.failed.new" || return 80
     mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || return 1
-    grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
-    [[ $rc == 60 ]] || return 1
-    grep -Eqi 'fatal:.*SSL.*(hostname|subject alternative|certificate.*(match|name))' "$dir/request.failed.log" || return 1
-    [[ $(grep -Eoic 'fatal:' "$dir/request.failed.log") == 1 ]] || return 1
+    [[ $rc == 1 ]] || return 1
+    mapping_upstream_san_git_failure "$dir/request.failed.log" || return 1
     [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
     [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
 }
