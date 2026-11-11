@@ -812,8 +812,15 @@ mapping_assert_unreachable_log() {
     local file=${1:-}
     [[ -f $file && ! -L $file && -s $file ]] || return 1
     awk -v addr="$MP_N" '
-        (index($0, "to " addr " port 443") || index($0, "to " addr ":443")) &&
-        /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ { found=1 }
+        /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ {
+            port = "to " addr " port 443"
+            position = index($0, port)
+            if (!position) {
+                port = "to " addr ":443"
+                position = index($0, port)
+            }
+            if (position && substr($0, position + length(port)) ~ /^([^[:alnum:]_]|$)/) found=1
+        }
         END { exit !found }
     ' "$file"
 }

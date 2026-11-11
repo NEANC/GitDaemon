@@ -168,11 +168,24 @@ missing_invalid_and_unreachable_keep_distinct_causes() {
     [[ $rc == 0 && $MAPPING_ASSERT_REJECT_LAYER == dns ]] || return 1
     for evidence in '' 'curl: (7) Failed to connect to unrelated.example port 443: Connection refused' \
         "curl: (7) Failed to connect to $MP_N port 80: Connection refused" \
+        "curl: (7) Failed to connect to $MP_N port 4430: Connection refused" \
+        "curl: (7) Failed to connect to $MP_N port 443x: Connection refused" \
+        "curl: (7) Failed to connect to $MP_N:4430: Connection refused" \
+        "curl: (7) Failed to connect to $MP_N:443x: Connection refused" \
         "curl: (6) Could not resolve host: $MP_N"; do
         printf '%s\n' "$evidence" > "$dir/unreachable.log"
         rc=0
         mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
         [[ $rc == 80 ]] || return 1
+    done
+    for evidence in "curl: (7) Failed to connect to $MP_N port 443: Connection refused" \
+        "curl: (7) Failed to connect to $MP_N port 443, Connection refused" \
+        "curl: (7) Failed to connect to $MP_N:443 (Connection refused)" \
+        "curl: (7) Failed to connect to $MP_N port 443"; do
+        printf '%s\n' "$evidence" > "$dir/unreachable.log"
+        rc=0
+        mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
+        [[ $rc == 0 && $MAPPING_ASSERT_REJECT_LAYER == dns ]] || return 1
     done
     printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$dir/unreachable.log"
     printf '1\n' > "$dir/sync.exit"
