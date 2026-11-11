@@ -113,6 +113,57 @@ dns_tcp_case() (
     [[ $rc == "$expected" && ${#removed[@]} == 1 && ${removed[0]} == "container:$(printf '%064d' 2)" ]]
 )
 
+dns_tcp_remove_failure_case() (
+    local response=$1 fixture_tool fixture_product rc=0 ledger
+    fixture_tool=$(printf '%064d' 2)
+    fixture_product=$(printf '%064d' 1)
+    ledger=$WORK/remove-failure-$(printf '%s' "$response" | sha256sum | cut -d' ' -f1)
+    mkdir -p "$ledger"
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=mtest
+    MP_RUN_ID=mtest MP_NETWORK_NAME=gm-mtest-m-net MPF_SCENARIO=mapping-fallback MPF_TOOLS_IMAGE=tools
+    mapping_fixture_state_load() { return 0; }
+    resource_docker() {
+        case "$1" in
+            ps)
+                printf '%s\n' "$fixture_product"
+                [[ ! -f $ledger/objects/2-container.json ]] || printf '%s\n' "$fixture_tool" ;;
+            network|volume) return 0 ;;
+            inspect)
+                if [[ ${2:-} == -f ]]; then
+                    case "$3" in
+                        '{{.Id}}') printf '%s\n' "$4" ;;
+                        *'.Config.Labels'*)
+                            if [[ $4 == "$fixture_product" ]]; then printf 'mtest\tmapping-fallback\tproduct\n'
+                            else printf 'mtest\tmapping-fallback\ttcp-dns\n'; fi ;;
+                        *) return 2 ;;
+                    esac
+                else printf '{"Id":"%s"}\n' "$2"; fi ;;
+            rm) printf '%s\n' "$3" >> "$ledger/delete-attempts"; return 9 ;;
+            *) return 2 ;;
+        esac
+    }
+    mapping_fixture_create() {
+        resource_register container "$fixture_tool" mapping-fallback tcp-dns || return 2
+        printf '%s\n' "$fixture_tool"
+    }
+    mapping_fixture_docker() {
+        case "$1" in
+            inspect)
+                if [[ $* == *'{{.Id}}'* ]]; then printf '%s\n' "$fixture_product"
+                elif [[ $* == *'{{.HostConfig.NetworkMode}}|{{.State.Running}}'* ]]; then printf 'gm-mtest-m-net|true\n'
+                else printf 'container:%s|10001:10001|true|tools|true|["ALL"]|["no-new-privileges"]\n' "$fixture_product"; fi ;;
+            start) return 0 ;;
+            exec) printf '%s\n' "$response"; return 9 ;;
+            *) return 2 ;;
+        esac
+    }
+    resource_register container "$fixture_product" mapping-fallback product || return 1
+    mapping_probe_egress product gen1 dns-tcp >/dev/null || rc=$?
+    [[ $rc == 80 && $(cat "$ledger/delete-attempts") == "$fixture_tool" ]] || return 1
+    resource_crosscheck "$ledger" || return 1
+    [[ -n ${RESOURCE_LEDGER_ACTIVE["container|$fixture_product"]:-} && -n ${RESOURCE_LEDGER_ACTIVE["container|$fixture_tool"]:-} && -z ${RESOURCE_LEDGER_REMOVED["container|$fixture_tool"]:-} ]]
+)
+
 profile_write
 failed=0
 for row in 'healthy cross-network 0' 'shared-other host-published 1' 'receiver-cross 19419 1' 'receiver-input 19420 1' 'receiver-udp udp 1' 'receiver-tcp tcp 1'; do
@@ -126,4 +177,6 @@ done
 shared_target_case || { printf 'FAIL shared-target\n'; failed=1; }
 dns_tcp_case $';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached\n;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 10' 80 || { printf 'FAIL dns-tcp-mixed-error\n'; failed=1; }
 dns_tcp_case $';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached' 0 || { printf 'FAIL dns-tcp-timeout\n'; failed=1; }
+dns_tcp_remove_failure_case $';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached' || { printf 'FAIL dns-tcp-remove-timeout\n'; failed=1; }
+dns_tcp_remove_failure_case $';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached\n;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 10' || { printf 'FAIL dns-tcp-remove-mixed\n'; failed=1; }
 exit "$failed"
