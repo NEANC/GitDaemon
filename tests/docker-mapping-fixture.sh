@@ -508,7 +508,13 @@ mapping_probe_egress() {
         spec=$(mapping_witness_spec "$key") || return 80
         IFS=$'\t' read -r proto port dest <<< "$spec"
         case "$key" in
-            dns-udp) docker exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest" || true ;;
+            dns-udp)
+                status=0
+                output=$(mapping_fixture_docker exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest" 2>&1) || status=$?
+                printf '%s\n' "$output"
+                if [[ $status == 0 ]]; then return 1; fi
+                [[ $output != *'Error response from daemon:'* && ( $status == 124 || ( $status == 1 && $output == *'connection timed out'* ) ) ]] || return 80
+                ;;
             dns-tcp)
                 mapping_fixture_state_load || return 80
                 ledger=$(resource_ledger_dir) || return 80
@@ -555,7 +561,13 @@ mapping_probe_egress() {
                 [[ $remove_rc == 0 ]] || return 80
                 [[ $probe_rc == 0 ]] || return "$probe_rc"
                 ;;
-            *) docker exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/" || true ;;
+            *)
+                status=0
+                output=$(mapping_fixture_docker exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/" 2>&1) || status=$?
+                printf '%s\n' "$output"
+                if [[ $status == 0 ]]; then return 1; fi
+                [[ $output != *'Error response from daemon:'* && $status == 28 && ( $output == *'Connection timed out'* || $output == *'Operation timed out'* ) ]] || return 80
+                ;;
         esac
     done
     return 0
