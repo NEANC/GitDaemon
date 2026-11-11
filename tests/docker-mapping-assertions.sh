@@ -708,6 +708,16 @@ mapping_negative_proxy_ca_restore() {
         "$MAPPING_ASSET_ROOT/proxy/tls/ca.crt" "$MAPPING_CLIENT_PROXY_CA"
 }
 
+mapping_negative_upstream_ca_restore() {
+    local image=${MAPPING_PRODUCT_IMAGE:-}
+    [[ -n $image ]] || return 1
+    mapping_fixture_docker run --rm --user 10001:10001 --network none \
+        -v "$(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT:ro" \
+        -v "$(mapping_ca_volume):$MAPPING_CA_MOUNT" --entrypoint /bin/sh "$image" \
+        -c 'cat "$1" > "$2" && cmp -s "$1" "$2"' sh \
+        "$MAPPING_ASSET_ROOT/upstream/tls/ca.crt" "$MAPPING_CLIENT_UPSTREAM_CA"
+}
+
 mapping_tls_injected_evidence() {
     local dir=${1:-} kind=${2:-} scenario=${3:-} before after request_rc
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
@@ -732,7 +742,11 @@ mapping_tls_injected_evidence() {
 
 mapping_tls_negative_run() {
     local case_name=${1:-} dir=${2:-} kind=${3:-} scenario=${4:-} before after recovered recovery_rc evidence_rc=0
-    [[ $case_name == wrong_proxy_ca && -d $dir && ! -L $dir ]] || return 80
+    [[ ( $case_name == wrong_proxy_ca || $case_name == wrong_upstream_ca ) && -d $dir && ! -L $dir ]] || return 80
+    if [[ $case_name == wrong_upstream_ca ]]; then
+        mapping_tls_upstream_ca_run "$dir" "$kind" "$scenario"
+        return $?
+    fi
     mapping_scenario_valid "$scenario" || return 80
     mapping_profile_load "$MAPPING_PROFILE" || return 80
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
@@ -769,6 +783,77 @@ mapping_tls_negative_run() {
     [[ $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.log") ]] || return 1
     tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
     mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+    return 0
+}
+
+mapping_tls_upstream_ca_run() {
+    local dir=${1:-} kind=${2:-} scenario=${3:-} before after recovered rc evidence_rc=0 dial_before dial_after baseline_dial
+    mapping_scenario_valid "$scenario" || return 80
+    mapping_profile_load "$MAPPING_PROFILE" || return 80
+    before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
+    printf '%s\n' "$before" > "$dir/baseline.before" || return 80
+    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.before" || return 80
+    rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
+    printf '%s\n' "$rc" > "$dir/baseline.exit" || return 80
+    [[ $rc == 0 ]] || return 80
+    grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
+    after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
+    (( after > before )) || return 80
+    printf '%s\n' "$after" > "$dir/baseline.after" || return 80
+    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.baseline" || return 80
+    tail -n "+$(( $(wc -l < "$dir/connect.before") + 1 ))" "$dir/connect.baseline" > "$dir/connect.baseline.new" || return 80
+    mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 80
+    baseline_dial=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || return 80
+    mapping_assert_uint "$baseline_dial" >/dev/null || return 80
+    printf 'wrong_upstream_ca\n' > "$dir/case.tsv" || return 80
+    if ! mapping_negative_wrong_ca upstream-ca.crt; then
+        mapping_negative_upstream_ca_restore || return 80
+        return 80
+    fi
+    before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || evidence_rc=80
+    if (( evidence_rc == 0 )); then
+        printf '%s\n' "$before" > "$dir/proxy.before" || evidence_rc=80
+        dial_before=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || evidence_rc=80
+        mapping_assert_uint "$dial_before" >/dev/null || evidence_rc=80
+        printf '%s\n' "$dial_before" > "$dir/upstream.before" || evidence_rc=80
+        rc=$(mapping_tls_product_request "$dir" "$scenario") || evidence_rc=80
+    fi
+    if (( evidence_rc == 0 )); then
+        printf '%s\n' "$rc" > "$dir/request.exit" || evidence_rc=80
+        cp "$dir/request.log" "$dir/request.failed.log" || evidence_rc=80
+        after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || evidence_rc=80
+        dial_after=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || evidence_rc=80
+        mapping_assert_uint "$after" >/dev/null && mapping_assert_uint "$dial_after" >/dev/null || evidence_rc=80
+        printf '%s\n' "$after" > "$dir/proxy.after" || evidence_rc=80
+        printf '%s\n' "$dial_after" > "$dir/upstream.after" || evidence_rc=80
+        mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.log" || evidence_rc=80
+    fi
+    if (( evidence_rc == 0 )); then
+        printf 'case\twrong_upstream_ca\nlayer\tinner-failure\nconnect_delta\t%s\nrequest_exit\t%s\n' \
+            "$((after - before))" "$rc" > "$dir/tls-layer.tsv" || evidence_rc=80
+        [[ $rc != 0 && $after -gt $before && $dial_after -gt $dial_before ]] || evidence_rc=1
+        tail -n "+$(( $(wc -l < "$dir/connect.baseline") + 1 ))" "$dir/connect.log" > "$dir/connect.failed.new" || evidence_rc=80
+        mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || evidence_rc=1
+        grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || evidence_rc=1
+        grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || evidence_rc=1
+    fi
+    mapping_negative_upstream_ca_restore || return 80
+    (( evidence_rc == 0 )) || return "$evidence_rc"
+    rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
+    printf '%s\n' "$rc" > "$dir/recovery.exit" || return 80
+    [[ $rc == 0 ]] || return 80
+    grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
+    recovered=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
+    printf '%s\n' "$recovered" > "$dir/proxy.recovered" || return 80
+    (( recovered > after )) || return 1
+    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.recovered" || return 80
+    tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
+    mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+    dial_after=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || return 80
+    mapping_assert_uint "$dial_after" >/dev/null || return 80
+    (( dial_after > $(mapping_assert_uint_file "$dir/upstream.after") )) || return 1
+    mapping_scenario_local_refs "$kind" "$scenario" "$dir" > "$dir/refs.actual" || return 80
+    cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
     return 0
 }
 
@@ -858,8 +943,8 @@ mapping_scenario_evidence() {
     mapping_scenario_identity_write "$kind" "$base_scenario" "$generation" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_refs "$kind" "$scenario" "$dir" > "$dir/refs.expected" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_head "$kind" "$scenario" "$dir" > "$dir/head.expected" || return "$MAPPING_ASSERT_FIXTURE"
-    if [[ ${MAPPING_ASSERT_CASE:-} == wrong_proxy_ca ]]; then
-        mapping_tls_negative_run wrong_proxy_ca "$dir" "$kind" "$scenario" || return $?
+    if [[ ${MAPPING_ASSERT_CASE:-} == wrong_proxy_ca || ${MAPPING_ASSERT_CASE:-} == wrong_upstream_ca ]]; then
+        mapping_tls_negative_run "$MAPPING_ASSERT_CASE" "$dir" "$kind" "$scenario" || return $?
         return 0
     fi
     mapping_scenario_apply_negative "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
@@ -1033,7 +1118,32 @@ mapping_negative_rejected() {
             MAPPING_ASSERT_REJECT_LAYER=tls-proxy
             return 0
             ;;
-        wrong_proxy_san|wrong_upstream_ca|wrong_upstream_san)
+        wrong_upstream_ca)
+            [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == wrong_upstream_ca ]] || return 80
+            [[ -f $dir/tls-layer.tsv && ! -L $dir/tls-layer.tsv ]] || return 80
+            for snapshot in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
+                [[ -f $dir/$snapshot && ! -L $dir/$snapshot ]] || return 80
+            done
+            mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return 1
+            [[ $(mapping_assert_uint_file "$dir/baseline.exit") == 0 && $(mapping_assert_uint_file "$dir/recovery.exit") == 0 ]] || return 80
+            [[ $(mapping_assert_uint_file "$dir/request.exit") -gt 0 ]] || return 1
+            mapping_profile_load "$MAPPING_PROFILE" || return 80
+            mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 1
+            mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || return 1
+            mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+            [[ $(mapping_assert_uint_file "$dir/proxy.after") -gt $(mapping_assert_uint_file "$dir/proxy.before") ]] || return 1
+            [[ $(mapping_assert_uint_file "$dir/upstream.after") -gt $(mapping_assert_uint_file "$dir/upstream.before") ]] || return 1
+            [[ $(mapping_assert_uint_file "$dir/proxy.recovered") -gt $(mapping_assert_uint_file "$dir/proxy.after") ]] || return 1
+            [[ -f $dir/refs.expected && -f $dir/refs.actual ]] || return 80
+            cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
+            grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || return 1
+            MAPPING_ASSERT_REJECT_LAYER=tls-upstream
+            return 0
+            ;;
+        wrong_proxy_san|wrong_upstream_san)
             mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return "$MAPPING_ASSERT_FIXTURE"
             if mapping_assert_result "$kind" "$dir"; then return 1; fi

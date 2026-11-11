@@ -623,7 +623,7 @@ negative_unreachable_map_system() {
 
 negative_tls_names() {
     local name failed=0
-    for name in wrong_proxy_san wrong_upstream_ca wrong_upstream_san; do
+    for name in wrong_proxy_san wrong_upstream_san; do
         sa_negative_case "$name" fallback judge || failed=1
         sa_negative_case "$name" direct judge || failed=1
     done
