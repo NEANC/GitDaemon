@@ -10,14 +10,15 @@ mkdir -p "$IT_EVIDENCE_DIR/control"
 check_mapping_sync() { return 0; }
 mapping_negative_run() { printf '%s %s\n' "$1" "$2" >> "$TEST_ROOT/cases"; }
 integration_register_mapping_group
-[[ $(wc -l < "$TEST_ROOT/cases") == 2 ]]
+[[ $(wc -l < "$TEST_ROOT/cases") == 3 ]]
 grep -Fxq 'wrong_proxy_ca fallback' "$TEST_ROOT/cases"
+grep -Fxq 'wrong_proxy_san fallback' "$TEST_ROOT/cases"
 grep -Fxq 'wrong_upstream_ca fallback' "$TEST_ROOT/cases"
 [[ ${IT_SLOT_DONE[dns_negatives]:-0} == 12 ]]
 [[ ${IT_SLOT_DONE[tls_negatives]:-0} == 4 ]]
 [[ ${IT_SLOT_DONE[isolation_negatives]:-0} == 5 ]]
 [[ ${IT_SLOT_FAIL[dns_negatives]:-0} == 12 ]]
-[[ ${IT_SLOT_FAIL[tls_negatives]:-0} == 2 ]]
+[[ ${IT_SLOT_FAIL[tls_negatives]:-0} == 1 ]]
 [[ ${IT_SLOT_FAIL[isolation_negatives]:-0} == 5 ]]
 FAILURES=0 FIXTURE_FAILURES=0 IT_DEFERRED=0 IT_PRIMARY_EXIT=0 IT_CLEANUP_EXIT=0 IT_RESIDUAL_COUNT=0
 integration_full_summary_write "$TEST_ROOT/summary.tsv"

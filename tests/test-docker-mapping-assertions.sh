@@ -10,6 +10,11 @@ source "$HERE/docker-mapping-fixture.sh"
 source "$HERE/docker-mapping-assertions.sh"
 source "$HERE/../scripts/git-mirror-sync.sh"
 
+[[ $(type -t mapping_proxy_san_case) == function ]] || {
+    printf 'mapping assertions standalone entry lacks proxy SAN case\n' >&2
+    exit 1
+}
+
 WORK=$(mktemp -d)
 LOG_FILE=$WORK/product.log
 trap 'rm -rf "$WORK"' EXIT
@@ -623,7 +628,7 @@ negative_unreachable_map_system() {
 
 negative_tls_names() {
     local name failed=0
-    for name in wrong_proxy_san wrong_upstream_san; do
+    for name in wrong_upstream_san; do
         sa_negative_case "$name" fallback judge || failed=1
         sa_negative_case "$name" direct judge || failed=1
     done

@@ -4,6 +4,8 @@
 # 本文件交付接口 D 的场景编排、判定器与安全负例；所有 Docker/Git/同步入口只经具名边界函数调用，
 # 契约测试以替身替换这些边界。判定器不设替身，直接消费证据文件，因此假绿注入无法绕过。
 
+source "$(dirname -- "${BASH_SOURCE[0]}")/docker-wrong-proxy-san.sh"
+
 # 场景与证据契约。
 MAPPING_ASSERT_KINDS='fallback direct'
 MAPPING_ASSERT_SCENARIO_FALLBACK='mapping-fallback'
