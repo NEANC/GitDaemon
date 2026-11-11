@@ -286,6 +286,20 @@ mapping_prepare() {
     mapping_evidence_volume_verify "$tools_image" || return 80
     mapping_network_create "$profile" "$ledger" "$scenario" >/dev/null || return 80
     mapping_fixture_precheck || return 80
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    resource_create_register network mapping witness-network -- \
+        resource_docker network create \
+        --label "gitdaemon.run=$MP_RUN_ID" --label gitdaemon.scenario=mapping \
+        --label gitdaemon.role=witness-network --ipv6=false \
+        --subnet 172.30.244.0/24 -o "com.docker.network.bridge.name=w$MP_RUN_ID" \
+        "gm-$MP_RUN_ID-w-net" || return 80
+    mapping_fixture_run mapping witness -d --name "gm-$MP_RUN_ID-witness" \
+        $MAPPING_SAFE_OPTIONS --network "gm-$MP_RUN_ID-w-net" --ip 172.30.244.53 \
+        --dns 172.30.244.53 -p 172.30.243.1:49382:19419 \
+        --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_DNS_PORT" \
+        --entrypoint /bin/sh "$tools_image" \
+        -c 'busybox nc -lk -p 19419 -e /bin/cat & exec dnsmasq --keep-in-foreground --no-resolv --no-hosts --address=/#/ --log-queries --log-facility=- --pid-file= --user=git-daemon' >/dev/null || return 80
+    mapping_fixture_wait "gm-$MP_RUN_ID-witness" || return 80
     return 0
 }
 

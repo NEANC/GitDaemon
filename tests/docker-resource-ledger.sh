@@ -134,7 +134,7 @@ resource_lock() {
 resource_unlock() {
     [[ -n $RESOURCE_LOCK_FD ]] || return 0
     flock -u "$RESOURCE_LOCK_FD" 2>/dev/null
-    exec {RESOURCE_LOCK_FD}>&- 2>/dev/null
+    exec {RESOURCE_LOCK_FD}>&-
     RESOURCE_LOCK_FD=''
     return 0
 }
