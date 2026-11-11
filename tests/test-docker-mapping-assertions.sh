@@ -220,8 +220,19 @@ sa_doubles() {
     }
     mapping_dns_set() { return 0; }
     mapping_fixture_docker() {
+        if [[ $1 == logs ]]; then printf '%s\n' "$MAPPING_PRODUCT_READY_MARK"; return 0; fi
+        if [[ $1 == exec && $3 == curl ]]; then
+            if [[ ${!#} == "http://$MAPPING_UPSTREAM_HOST/" ]]; then
+                printf 'curl: (6) Could not resolve host: %s\n' "$MAPPING_UPSTREAM_HOST" >&2
+                return 6
+            fi
+            if [[ ${!#} == "http://$MAPPING_PROXY_HOST/" ]]; then
+                printf '* Trying %s:80...\n' "$MP_X" >&2
+                return 28
+            fi
+        fi
         if [[ ${MAPPING_ASSERT_CASE:-} == unreachable-map-system && $1 == exec && $3 == curl ]]; then
-            printf 'curl: (7) Failed to connect to %s:443\n' "$MP_N" >&2
+            printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" >&2
             return 7
         fi
         return 80

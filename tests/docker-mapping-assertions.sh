@@ -440,7 +440,7 @@ mapping_scenario_product_up() {
         || return "$MAPPING_ASSERT_FIXTURE"
     name=$(mapping_scenario_product_container "$MAPPING_ASSERT_GENERATION")
     mapping_fixture_create "$scenario" "$MAPPING_ASSERT_PRODUCT_ROLE" -d --name "$name" \
-        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_P" --dns "$MP_D" \
+        $MAPPING_SAFE_OPTIONS --network "$MP_NETWORK_NAME" --ip "$MP_P" --dns "$MP_D" --dns-search=. \
         -v "$data:$MAPPING_ASSERT_RUN_ROOT" -v "$(mapping_ca_volume):$MAPPING_CA_MOUNT:ro" \
         -e "RUN_ROOT=$MAPPING_ASSERT_RUN_ROOT" -e "INSTALL_ROOT=$MAPPING_ASSERT_INSTALL_ROOT" \
         -e "HOME=$MAPPING_ASSERT_RUN_ROOT/home" \
@@ -591,6 +591,22 @@ mapping_scenario_dns_client_probe() {
     return 0
 }
 
+mapping_scenario_dns_system_probe() {
+    local client=${1:-} dir=${2:-} raw rc=0
+    [[ -n $client && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
+    raw=$dir/dns-system-upstream.txt
+    mapping_fixture_docker exec "$client" curl --verbose --noproxy '*' --connect-timeout 2 --max-time 3 \
+        "http://$MAPPING_UPSTREAM_HOST/" > "$raw" 2>&1 || rc=$?
+    [[ $rc == 6 ]] || return "$MAPPING_ASSERT_FIXTURE"
+    grep -Fq "Could not resolve host: $MAPPING_UPSTREAM_HOST" "$raw" || return "$MAPPING_ASSERT_FIXTURE"
+    raw=$dir/dns-system-proxy.txt
+    rc=0
+    mapping_fixture_docker exec "$client" curl --verbose --noproxy '*' --connect-timeout 2 --max-time 3 \
+        "http://$MAPPING_PROXY_HOST/" > "$raw" 2>&1 || rc=$?
+    [[ $rc != 6 ]] || return "$MAPPING_ASSERT_FIXTURE"
+    grep -Fq "Trying $MP_X:80" "$raw" || return "$MAPPING_ASSERT_FIXTURE"
+}
+
 # 受控 DNS 恢复：清除假绿开关并核验 github.com 恢复为 NXDOMAIN、gm-proxy 仍指向 X。
 # 恢复后判定器读到的 DNS 证据不再是被造假绿样本。
 mapping_scenario_dns_restore() {
@@ -602,6 +618,10 @@ mapping_scenario_dns_restore() {
     file=$dir/dns.restore
     mapping_scenario_dns_state "$kind" "$scenario" "$dir" > "$file" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_assert_dns_file "$file" || rc="$MAPPING_ASSERT_FIXTURE"
+    if [[ -n ${MAPPING_ASSERT_PRODUCT:-} ]]; then
+        mapping_scenario_product_ready "$MAPPING_ASSERT_PRODUCT" || return "$MAPPING_ASSERT_FIXTURE"
+        mapping_scenario_dns_system_probe "$MAPPING_ASSERT_PRODUCT" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    fi
     return "$rc"
 }
 
@@ -782,6 +802,9 @@ mapping_scenario_unreachable_probe() {
         --max-time 3 --noproxy '*' --resolve "$MAPPING_UPSTREAM_HOST:443:$MP_N" \
         "https://$MAPPING_UPSTREAM_HOST/health.txt" > "$dir/unreachable.log" 2>&1 || rc=$?
     [[ $rc == 7 || $rc == 28 ]] || return "$MAPPING_ASSERT_FIXTURE"
+    [[ -s $dir/unreachable.log ]] || return "$MAPPING_ASSERT_FIXTURE"
+    awk -v addr="$MP_N" 'index($0, addr) && /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ { found=1 } END { exit !found }' \
+        "$dir/unreachable.log" || return "$MAPPING_ASSERT_FIXTURE"
     printf '%s\n' "$MP_N" > "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
 }
@@ -822,7 +845,7 @@ mapping_scenario_run() {
 # 同时把被拒层次写入 MAPPING_ASSERT_REJECT_LAYER：sync 为底层同步层，mapping 为映射判定层，
 # policy 为配置审计层。
 mapping_negative_rejected() {
-    local case_name=${1:-} kind=${2:-} dir=${3:-} sync_exit system_line snapshot
+    local case_name=${1:-} kind=${2:-} dir=${3:-} sync_exit system_line snapshot judge
     [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     case "$case_name" in
         isolation)
@@ -856,6 +879,10 @@ mapping_negative_rejected() {
             else
                 [[ -f $dir/control/snapshot.content && ! -s $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
             fi
+            judge=0
+            mapping_assert_result "$kind" "$dir" || judge=$?
+            [[ $judge == 1 && $MAPPING_ASSERT_REJECT_LAYER == mapping ]] || return 1
+            MAPPING_ASSERT_JUDGE=$judge
             MAPPING_ASSERT_REJECT_LAYER=dns
             return 0
             ;;
@@ -876,6 +903,10 @@ mapping_negative_rejected() {
             else
                 grep -Fq '无地址快照，使用系统 DNS' "$dir/sync.log" || return 1
             fi
+            judge=0
+            mapping_assert_result "$kind" "$dir" || judge=$?
+            [[ $judge == 1 && $MAPPING_ASSERT_REJECT_LAYER == sync ]] || return 1
+            MAPPING_ASSERT_JUDGE=$judge
             MAPPING_ASSERT_REJECT_LAYER=sync
             return 0
             ;;
