@@ -162,10 +162,19 @@ missing_invalid_and_unreachable_keep_distinct_causes() {
     mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
     [[ $rc == 80 ]] || return 1
     printf '%s\n' "$MP_N" > "$dir/unreachable.txt"
-    printf 'connection timed out\n' > "$dir/unreachable.log"
+    printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$dir/unreachable.log"
     rc=0
     mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
     [[ $rc == 0 && $MAPPING_ASSERT_REJECT_LAYER == dns ]] || return 1
+    for evidence in '' 'curl: (7) Failed to connect to unrelated.example port 443: Connection refused' \
+        "curl: (7) Failed to connect to $MP_N port 80: Connection refused" \
+        "curl: (6) Could not resolve host: $MP_N"; do
+        printf '%s\n' "$evidence" > "$dir/unreachable.log"
+        rc=0
+        mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
+        [[ $rc == 80 ]] || return 1
+    done
+    printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$dir/unreachable.log"
     printf '1\n' > "$dir/sync.exit"
     printf 'run_id\trun\nscenario\tmapping-direct\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' > "$dir/identity.tsv"
     for case_name in missing-map invalid-map; do

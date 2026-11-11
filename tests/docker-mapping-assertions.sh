@@ -802,11 +802,20 @@ mapping_scenario_unreachable_probe() {
         --max-time 3 --noproxy '*' --resolve "$MAPPING_UPSTREAM_HOST:443:$MP_N" \
         "https://$MAPPING_UPSTREAM_HOST/health.txt" > "$dir/unreachable.log" 2>&1 || rc=$?
     [[ $rc == 7 || $rc == 28 ]] || return "$MAPPING_ASSERT_FIXTURE"
-    [[ -s $dir/unreachable.log ]] || return "$MAPPING_ASSERT_FIXTURE"
-    awk -v addr="$MP_N" 'index($0, addr) && /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ { found=1 } END { exit !found }' \
-        "$dir/unreachable.log" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_assert_unreachable_log "$dir/unreachable.log" || return "$MAPPING_ASSERT_FIXTURE"
     printf '%s\n' "$MP_N" > "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
+}
+
+# 核对直拨日志同时包含目标地址、443 端口及连接失败事实。
+mapping_assert_unreachable_log() {
+    local file=${1:-}
+    [[ -f $file && ! -L $file && -s $file ]] || return 1
+    awk -v addr="$MP_N" '
+        (index($0, "to " addr " port 443") || index($0, "to " addr ":443")) &&
+        /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ { found=1 }
+        END { exit !found }
+    ' "$file"
 }
 
 # 接口 D：单场景独立生命周期（准备→校准→基线→同步→判定→局部清理），可单独运行。
@@ -875,7 +884,7 @@ mapping_negative_rejected() {
                 [[ $snapshot == "$MP_N $MAPPING_UPSTREAM_HOST" ]] || return "$MAPPING_ASSERT_FIXTURE"
                 [[ -f $dir/unreachable.txt && ! -L $dir/unreachable.txt ]] || return "$MAPPING_ASSERT_FIXTURE"
                 grep -Fqx "$MP_N" "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
-                [[ -f $dir/unreachable.log && ! -L $dir/unreachable.log ]] || return "$MAPPING_ASSERT_FIXTURE"
+                mapping_assert_unreachable_log "$dir/unreachable.log" || return "$MAPPING_ASSERT_FIXTURE"
             else
                 [[ -f $dir/control/snapshot.content && ! -s $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
             fi
