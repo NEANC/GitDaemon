@@ -93,16 +93,18 @@ setup_case() {
     OWN_RULES=() OWN_CHAINS=() OWN_NS_RULES=() OWN_NS_CHAINS=()
     : > "$WORK/docker.calls"
     : > "$WORK/removed"
+    : > "$WORK/iptables.calls"
+    : > "$WORK/nsenter.calls"
     rm -f "$WORK/labels" "$WORK/network-labels"
     resource_docker() { docker_double "$@"; }
     resource_lock() { return 0; }
     resource_unlock() { return 0; }
     mapping_fixture_docker() { docker_double "$@"; }
     docker() { docker_double "$@"; }
-    iptables() { return 0; }
-    nsenter() { return 0; }
+    iptables() { printf '%s\n' "$*" >> "$WORK/iptables.calls"; }
+    nsenter() { printf '%s\n' "$*" >> "$WORK/nsenter.calls"; }
     guard_mapping_state_write() { return 0; }
-    guard_mapping_ack_publish() { printf 'ACK\n' >> "$WORK/acks"; }
+    guard_mapping_ack_publish() { printf '%s %s\n' "$4" "$5" > "$1/ack-$3"; printf 'ACK\n' >> "$WORK/acks"; }
     validation_environment_verify() { return 0; }
     mapping_assets_prepare() { return 0; }
     mapping_evidence_volume_prepare() { return 0; }
@@ -117,7 +119,12 @@ setup_case() {
     }
     mapping_proxy_evidence_reset() { return 0; }
     mapping_negative_prepare() { return 0; }
-    mapping_control_request() { guard_mapping_request_handle "$1" "$2" "$3" "$4" "nonce$seq" || return $?; MAPPING_ACK_GENERATION=$2; }
+    sleep() {
+        local request=$IT_CONTROL_DIR/request-$CONTROL_SEQ action generation network digest nonce
+        [[ -f $request ]] || return 1
+        read -r action generation network digest nonce < "$request"
+        guard_mapping_request_handle "$action" "$generation" "$network" "$digest" "$nonce"
+    }
     mapping_fixture_start() { return 0; }
 }
 
@@ -197,10 +204,15 @@ release_rejects_drift_without_teardown() (
     GUARD_MANIFEST=manifest GUARD_ATTESTATION=attestation
     mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
     GUARD_MAPPING_WITNESS_ID=$WITNESS_ID
-    OWN_RULES=('filter|-A GEN -j DROP') OWN_NS_RULES=('raw|-A MS -j RETURN') OWN_NS_CHAINS=('raw|MS')
+    [[ ${#OWN_RULES[@]} -gt 0 && ${#OWN_NS_RULES[@]} -gt 0 && ${#OWN_NS_CHAINS[@]} -gt 0 ]] || return 1
+    local before iptables_before nsenter_before
+    before=$(declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS)
+    iptables_before=$(wc -l < "$WORK/iptables.calls")
+    nsenter_before=$(wc -l < "$WORK/nsenter.calls")
     WITNESS_ATTACHMENT=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
     mapping_scenario_release direct mapping-direct g1 "$E" >/dev/null 2>&1 && return 1
-    [[ $GUARD_MAPPING_STATE == ACTIVE && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_NS_CHAINS[@]} == 1 && ${#OWN_RULES[@]} == 1 ]] || return 1
+    [[ $GUARD_MAPPING_STATE == ACTIVE && $(declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS) == "$before" ]] || return 1
+    [[ $(wc -l < "$WORK/iptables.calls") == "$iptables_before" && $(wc -l < "$WORK/nsenter.calls") == "$nsenter_before" ]] || return 1
     [[ ! -s $WORK/removed ]]
 )
 
@@ -209,10 +221,15 @@ release_rejects_missing_wnet_without_teardown() (
     GUARD_MANIFEST=manifest GUARD_ATTESTATION=attestation
     mapping_scenario_fixture_prepare direct mapping-direct "$E" || return 1
     GUARD_MAPPING_WITNESS_ID=$WITNESS_ID
-    OWN_RULES=('filter|-A GEN -j DROP') OWN_NS_RULES=('raw|-A MS -j RETURN') OWN_NS_CHAINS=('raw|MS')
+    [[ ${#OWN_RULES[@]} -gt 0 && ${#OWN_NS_RULES[@]} -gt 0 && ${#OWN_NS_CHAINS[@]} -gt 0 ]] || return 1
+    local before iptables_before nsenter_before
+    before=$(declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS)
+    iptables_before=$(wc -l < "$WORK/iptables.calls")
+    nsenter_before=$(wc -l < "$WORK/nsenter.calls")
     WITNESS_NET_MISSING=1
     mapping_scenario_release direct mapping-direct g1 "$E" >/dev/null 2>&1 && return 1
-    [[ $GUARD_MAPPING_STATE == ACTIVE && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_NS_CHAINS[@]} == 1 && ${#OWN_RULES[@]} == 1 ]] || return 1
+    [[ $GUARD_MAPPING_STATE == ACTIVE && $(declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS) == "$before" ]] || return 1
+    [[ $(wc -l < "$WORK/iptables.calls") == "$iptables_before" && $(wc -l < "$WORK/nsenter.calls") == "$nsenter_before" ]] || return 1
     [[ ! -s $WORK/removed ]]
 )
 

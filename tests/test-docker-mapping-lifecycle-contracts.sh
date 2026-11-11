@@ -53,6 +53,7 @@ lifecycle_docker() {
                 *'HostConfig.NetworkMode'*'gitdaemon.run'*|*'gitdaemon.run'*'HostConfig.NetworkMode'*) IFS=$'\t' read -r run scenario role network ip < "$CASE_DIR/objects/$id"; printf '%s|%s|%s|%s|%s|123|true\n' "$id" "$run" "$scenario" "$role" "$network" ;;
                 *'HostConfig.NetworkMode'*) cut -f4 "$CASE_DIR/objects/$id" | while read -r network; do printf '%s|true\n' "$network"; done ;;
                 *'NetworkSettings.Networks'*) network=$(cut -f4 "$CASE_DIR/objects/$id"); cat "$CASE_DIR/names/$network" ;;
+                *'com.docker.network.bridge.name'*) printf 'mmtest\n' ;;
                 *gitdaemon.run*) cut -f1-3 "$CASE_DIR/objects/$id" ;;
                 *'.CreatedAt'*'.Driver'*'.Mountpoint'*) printf 'created|local|/contract/%s|labels\n' "$id" ;;
                 '{{json .Mounts}}') printf '[{"Destination":"/ev","RW":true}]\n' ;;
@@ -130,11 +131,10 @@ lifecycle_docker() {
 validation_docker() { lifecycle_docker "$@"; }
 resource_docker() { lifecycle_docker "$@"; }
 docker() { lifecycle_docker "$@"; }
-nsenter() { return 0; }
+iptables() { printf '%s\n' "$*" >> "$CASE_DIR/iptables.log"; }
+nsenter() { printf '%s\n' "$*" >> "$CASE_DIR/nsenter.log"; }
 resource_lock() { return 0; }
 resource_unlock() { return 0; }
-guard_mapping_rules() { printf 'rules %s\n' "$GUARD_MAPPING_GENERATION" >> "$CASE_DIR/events"; }
-guard_remove_rules_since() { printf 'unrules %s\n' "$GUARD_MAPPING_GENERATION" >> "$CASE_DIR/events"; }
 guard_mapping_state_write() { printf 'generation\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$2" "$3" "$4" > "$1"; }
 guard_mapping_ack_publish() {
     local nonce=$4 generation=$5
@@ -164,7 +164,11 @@ lifecycle_controller() {
             if [[ $MODE == release-query-fail && $action == mapping-release ]]; then
                 resource_enumerate() { return 2; }
             fi
+            if [[ $action == mapping-release ]]; then
+                printf '%s %s\n' "$(wc -l < "$CASE_DIR/iptables.log")" "$(wc -l < "$CASE_DIR/nsenter.log")" > "$CASE_DIR/rules-before-release"
+            fi
             guard_mapping_request_handle "$action" "$generation" "$network" "$digest" "$nonce" || rc=$?
+            if [[ $rc == 0 && $action == mapping-ready && ( ${#OWN_RULES[@]} == 0 || ${#OWN_NS_RULES[@]} == 0 ) ]]; then rc=98; fi
             if [[ $rc != 0 ]]; then
                 printf 'guard-fail %s %s\n' "$action" "$rc" >> "$CASE_DIR/events"
                 : > "$CASE_DIR/done"
@@ -202,6 +206,9 @@ lifecycle_case() {
             printf 'foreign\tmapping-fallback\tprobe\tgm-mtest-m-net\t140.82.112.10\n' > "$CASE_DIR/objects/$id"
         fi
         if (( rc == 0 )); then mapping_scenario_product_up fallback mapping-fallback "$CASE_DIR/$GEN" > "$CASE_DIR/$GEN.product" 2>&1 || rc=$?; fi
+        if (( rc == 0 )); then
+            [[ -s $CASE_DIR/rules.owned && -s $CASE_DIR/witness-rules.owned ]] || rc=98
+        fi
         if [[ $MODE == second-* && $GEN == g1 || $MODE == release-query-fail && $GEN == g1 ]]; then
             [[ $rc == 0 ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
         else
@@ -226,7 +233,8 @@ lifecycle_case() {
                 before=$(wc -l < "$CASE_DIR/docker.log")
                 grep -q '^release g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 grep -q '^guard-fail mapping-release 2$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
-                ! grep -q '^unrules g1$' "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
+                read -r host_before witness_before < "$CASE_DIR/rules-before-release"
+                [[ $(wc -l < "$CASE_DIR/iptables.log") == "$host_before" && $(wc -l < "$CASE_DIR/nsenter.log") == "$witness_before" ]] || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 grep -q "^remove $(cat "$CASE_DIR/names/gm-mtest-g1-product")$" "$CASE_DIR/events" || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 mapping_scenario_fixture_prepare fallback mapping-fallback "$CASE_DIR/g2" >/dev/null 2>&1 && { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
                 ! tail -n +"$((before + 1))" "$CASE_DIR/docker.log" | grep -Eq '(^| )(create|start|rm)( |$)' || { : > "$CASE_DIR/done"; wait "$pid"; return 1; }
