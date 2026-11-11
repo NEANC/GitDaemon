@@ -501,8 +501,9 @@ mapping_calibrate_witness() {
 
 # 从产品 netns 发起五类目标探测；TCP DNS 由登记工具共享 netns 发起。
 mapping_probe_egress() {
-    local product=$1 generation=$2 spec proto port dest tool facts ledger output status probe_rc remove_rc product_id
+    local product=$1 generation=$2 target=${3:-} key spec proto port dest tool facts ledger output status probe_rc remove_rc product_id
     [[ -n $product && -n $generation ]] || return 80
+        [[ -z $target || $target == "$key" ]] || continue
     for key in $MAPPING_WITNESS_KEYS; do
         spec=$(mapping_witness_spec "$key") || return 80
         IFS=$'\t' read -r proto port dest <<< "$spec"
@@ -565,19 +566,24 @@ mapping_isolation_check() {
     local product=${1:-} generation=${2:-} profile=${3:-}
     local before after wb wa key cb ca seq_before seq_after base
     [[ -n $product && -n $generation && -n $profile ]] || return 1
-    [[ $MP_WITNESS_CALIBRATED == 1 ]] || return 1
-    base=${IT_EVIDENCE_DIR:-}
-    [[ -n $base ]] || return 1
-    network_control mapping-snapshot || return $?
-    seq_before=${CONTROL_SEQ:-0}
-    mapping_probe_egress "$product" "$generation" || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
-    network_control mapping-snapshot || return $?
-    seq_after=${CONTROL_SEQ:-0}
-    before=$base/mapping-snapshot-$seq_before.rules
-    after=$base/mapping-snapshot-$seq_after.rules
-    wb=$(mapping_witness "$base/mapping-snapshot-$seq_before.witness") || return 1
-    wa=$(mapping_witness "$base/mapping-snapshot-$seq_after.witness") || return 1
-    [[ $wb == "$wa" ]] || return 1
+    [[ $MP_WITNESS_CALIBRATED == 1 && ${MAPPING_ASSERT_CALIBRATED_GENERATION:-} == "$generation" ]] || return 1
+    [[ $generation == "${MAPPING_ASSERT_GENERATION:-}" ]] || return 1
+    mapping_profile_load "$profile" || return 80
+    if [[ -z $MP_NETWORK_ID ]]; then MP_NETWORK_ID=$(mapping_network_id_load) || return 80; fi
+    [[ -n ${IT_CONTROL_DIR:-} ]] || return 80
+    base=${IT_CONTROL_DIR%/control}
+    [[ -n $base && $base != "$IT_CONTROL_DIR" ]] || return 80
+        [[ -z ${MAPPING_ASSERT_TARGET:-} || $MAPPING_ASSERT_TARGET == "$key" ]] || continue
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        seq_before=${CONTROL_SEQ:-0}
+        mapping_probe_egress "$product" "$generation" "$key" || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        seq_after=${CONTROL_SEQ:-0}
+        before=$base/mapping-snapshot-$seq_before.rules
+        after=$base/mapping-snapshot-$seq_after.rules
+        wb=$(mapping_witness "$base/mapping-snapshot-$seq_before.witness") || return 1
+        wa=$(mapping_witness "$base/mapping-snapshot-$seq_after.witness") || return 1
+        [[ $wb == "$wa" ]] || return 1
     for key in $MAPPING_WITNESS_KEYS; do
         cb=$(mapping_count "$before" "$profile" "$key") || return 1
         ca=$(mapping_count "$after" "$profile" "$key") || return 1

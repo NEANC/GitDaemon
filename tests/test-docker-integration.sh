@@ -1538,7 +1538,8 @@ check_mapping_negative() {
         *" $case_id "*) ;;
         *) return 2 ;;
     esac
-    if [[ $case_id == wrong_proxy_ca || $case_id == wrong_proxy_san || $case_id == wrong_upstream_ca || $case_id == wrong_upstream_san ]]; then
+    if [[ $case_id == wrong_proxy_ca || $case_id == wrong_proxy_san || $case_id == wrong_upstream_ca || $case_id == wrong_upstream_san || $case_id == isolation/* ]]; then
+        local MAPPING_ASSERT_TARGET=${case_id#*/}
         mapping_negative_run "$case_name" "$kind" "$dir" || rc=$?
     else
         rc=80
