@@ -261,7 +261,6 @@ wrong_proxy_ca_assertion_and_restore_failure_returns_80() {
 # 注入已写坏 CA 后返回失败，必须恢复并保留三份原始证据。
 wrong_proxy_ca_partial_injection_failure_restores_and_preserves_evidence() {
     local dir rc=0 name restore_rc
-    dir=$(mktemp -d)
     MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
     mapping_profile_load() { MP_U=140.82.112.9; }
     mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
@@ -275,16 +274,18 @@ wrong_proxy_ca_partial_injection_failure_restores_and_preserves_evidence() {
         printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
         printf '0\n'
     }
-    mapping_negative_wrong_ca() { printf 'partial CA\n' > "$dir/ca"; return 9; }
-    mapping_negative_proxy_ca_restore() { printf 'original CA\n' > "$dir/ca"; : > "$dir/restored"; return "${restore_rc:-0}"; }
-    for name in request.exit request.failed.log tls-layer.tsv; do
-        printf '旧证据:%s\n\n' "$name" > "$dir/$name"
-        cp "$dir/$name" "$dir/$name.before"
-    done
+    mapping_negative_wrong_ca() { printf 'inject\n' >> "$dir/calls"; printf 'partial CA\n' > "$dir/ca"; return 9; }
+    mapping_negative_proxy_ca_restore() { printf 'restore\n' >> "$dir/calls"; printf 'original CA\n' > "$dir/ca"; return "$restore_rc"; }
     for restore_rc in 0 9; do
+        dir=$(mktemp -d)
+        for name in request.exit request.failed.log tls-layer.tsv; do
+            printf '旧证据:%s\n\n' "$name" > "$dir/$name"
+            cp "$dir/$name" "$dir/$name.before"
+        done
         rc=0
         mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
-        [[ $rc == 80 && -f $dir/restored && $(cat "$dir/ca") == 'original CA' ]] || return 1
+        [[ $rc == 80 && $(cat "$dir/ca") == 'original CA' ]] || return 1
+        [[ $(cat "$dir/calls") == $'inject\nrestore' ]] || return 1
         for name in request.exit request.failed.log tls-layer.tsv; do
             cmp -s "$dir/$name.before" "$dir/$name" || return 1
         done
@@ -303,10 +304,11 @@ wrong_proxy_ca_partial_injection_failure_keeps_missing_evidence() {
         printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
     }
     mapping_tls_product_request() { printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"; printf '0\n'; }
-    mapping_negative_wrong_ca() { printf 'partial CA\n' > "$dir/ca"; return 9; }
-    mapping_negative_proxy_ca_restore() { printf 'original CA\n' > "$dir/ca"; : > "$dir/restored"; }
+    mapping_negative_wrong_ca() { printf 'inject\n' >> "$dir/calls"; printf 'partial CA\n' > "$dir/ca"; return 9; }
+    mapping_negative_proxy_ca_restore() { printf 'restore\n' >> "$dir/calls"; printf 'original CA\n' > "$dir/ca"; }
     mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
-    [[ $rc == 80 && -f $dir/restored && $(cat "$dir/ca") == 'original CA' ]] || return 1
+    [[ $rc == 80 && $(cat "$dir/ca") == 'original CA' ]] || return 1
+    [[ $(cat "$dir/calls") == $'inject\nrestore' ]] || return 1
     for name in request.exit request.failed.log tls-layer.tsv; do [[ ! -e $dir/$name ]] || return 1; done
 }
 
