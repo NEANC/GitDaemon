@@ -14,6 +14,7 @@ MAPPING_ASSERT_SCENARIO_DIRECT='mapping-direct'
 MAPPING_ASSERT_FILES='identity.tsv sync.log sync.exit proxy.before proxy.after connect.log upstream.before upstream.after refs.expected refs.actual head.expected head.actual fsck.exit dns.txt'
 MAPPING_ASSERT_IDENTITY_KEYS=(run_id scenario generation network_id image_id profile_sha256 input_sha256 manifest_sha256 unique_commit)
 MAPPING_ASSERT_NEGATIVES='missing-map invalid-map dns-false-green unreachable-map-system wrong_proxy_ca wrong_proxy_san wrong_upstream_ca wrong_upstream_san isolation'
+MAPPING_NEGATIVE_CASES='missing-map/fallback missing-map/direct invalid-map/rfc1918/fallback invalid-map/rfc1918/direct invalid-map/test-net/fallback invalid-map/test-net/direct invalid-map/benchmark/fallback invalid-map/benchmark/direct dns-false-green/fallback dns-false-green/direct unreachable-map-system/fallback unreachable-map-system/direct wrong_proxy_ca wrong_proxy_san wrong_upstream_ca wrong_upstream_san isolation/cross-network isolation/host-published isolation/host-input isolation/dns-udp isolation/dns-tcp'
 # 判定器只认这些产品文案；system/proxy 成功文案一旦出现即否定 mapping 成功。
 MAPPING_ASSERT_MARK_MAPPING='同步传输路径：直连加动态地址映射'
 MAPPING_ASSERT_MARK_SYSTEM='同步传输路径：直连系统 DNS'
@@ -1452,10 +1453,11 @@ mapping_full_accept() {
     local -A seen=()
     local -a zero_fields=(failures fixture_failures deferred primary_exit cleanup_exit residual_count)
     local -a pass_fields=(mapping_fallback mapping_direct system_fallback system_direct
-        dns_negatives tls_negatives isolation_negatives)
+        dns_negatives tls_negatives isolation_negatives host_unchanged)
+    zero_fields+=(carrier_cleanup_exit carrier_residual_count)
     [[ -n $file && -f $file && ! -L $file && -r $file ]] || return 1
     while IFS= read -r line || [[ -n $line ]]; do
-        [[ -n $line ]] || continue
+        [[ -n $line && $line != *$'\r'* ]] || return 1
         [[ $line == *$'\t'* ]] || return 1
         key=${line%%$'\t'*}
         value=${line#*$'\t'}
@@ -1469,6 +1471,114 @@ mapping_full_accept() {
     for key in "${pass_fields[@]}"; do
         [[ ${seen[$key]:-} == PASS ]] || return 1
     done
+    [[ ${#seen[@]} == 16 ]] || return 1
+    return 0
+}
+
+# 严格验收 full 的 21 例负例矩阵及其原始证据目录。
+mapping_negative_matrix_accept() {
+    local file=${1:-} expected_run=${2:-} expected_manifest=${3:-} expected_input=${4:-}
+    local line case_id run scenario generation manifest input evidence assertion result want tabs
+    local -a columns=()
+    local -A seen=()
+    [[ -n $expected_run && -n $expected_manifest && -n $expected_input && -f $file && ! -L $file && -r $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line != *$'\r'* ]] || return 1
+        tabs=${line//$'\t'/}
+        [[ $((${#line} - ${#tabs})) == 8 ]] || return 1
+        IFS=$'\t' read -r -a columns <<< "$line"
+        [[ ${#columns[@]} == 9 ]] || return 1
+        case_id=${columns[0]} run=${columns[1]} scenario=${columns[2]} generation=${columns[3]}
+        manifest=${columns[4]} input=${columns[5]} evidence=${columns[6]}
+        assertion=${columns[7]} result=${columns[8]}
+        [[ -n $case_id && -n $run && -n $scenario && -n $generation && -n $manifest && -n $input && -n $evidence ]] || return 1
+        [[ $assertion == 0 && $result == PASS ]] || return 1
+        [[ -z ${seen[$case_id]:-} ]] || return 1
+        case " $MAPPING_NEGATIVE_CASES " in *" $case_id "*) ;; *) return 1 ;; esac
+        [[ $evidence == "${file%/*}/"* && -d $evidence && ! -L $evidence && -f $evidence/evidence.txt && ! -L $evidence/evidence.txt && -s $evidence/evidence.txt ]] || return 1
+        [[ $run == "$expected_run" && $manifest == "$expected_manifest" && $input == "$expected_input" ]] || return 1
+        seen[$case_id]=1
+    done < "$file"
+    for want in $MAPPING_NEGATIVE_CASES; do [[ ${seen[$want]:-} == 1 ]] || return 1; done
+    [[ ${#seen[@]} == 21 ]]
+}
+
+# 合并业务主状态与外层清理状态：主失败优先，主成功时任一清理失败返回 2。
+mapping_final_exit() {
+    local primary=${1:-} cleanup=${2:-} carrier_cleanup=${3:-}
+    [[ $primary =~ ^[0-9]+$ && $cleanup =~ ^[0-9]+$ && $carrier_cleanup =~ ^[0-9]+$ ]] || return 1
+    if (( primary != 0 )); then printf '%s\n' "$primary"; return 0; fi
+    if (( cleanup != 0 || carrier_cleanup != 0 )); then printf '2\n'; return 0; fi
+    printf '0\n'
+}
+
+# 载体外层最终汇总：三份状态和完整负例矩阵齐全后才原子发布 16 键结论。
+mapping_finalize() {
+    local dir=${1:-} guard=${2:-} carrier=${3:-} business matrix output input_file
+    local line key value run='' manifest='' input='' status
+    local -A seen=()
+    business=$dir/mapping-business-summary.tsv
+    matrix=$dir/mapping-negative-matrix.tsv
+    output=$dir/mapping-full-summary.tsv
+    input_file=$dir/mapping-run-input.tsv
+    [[ -d $dir && ! -L $dir ]] || return 1
+    rm -f -- "$output" "$output.tmp" || return 1
+    for status in "$business" "$guard" "$carrier" "$input_file"; do
+        [[ -f $status && ! -L $status && -r $status ]] || return 1
+    done
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line != *$'\r'* && $line == *$'\t'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ -n $value && $value != *$'\t'* && -z ${seen[$key]:-} ]] || return 1
+        case "$key" in
+            run_id) run=$value ;;
+            manifest_sha256) manifest=$value ;;
+            input_sha256) input=$value ;;
+            *) return 1 ;;
+        esac
+        seen[$key]=1
+    done < "$input_file"
+    [[ ${#seen[@]} == 3 && -n $run && -n $manifest && -n $input ]] || return 1
+    seen=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line != *$'\r'* && $line == *$'\t'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ -n $value && $value != *$'\t'* && -z ${seen[$key]:-} ]] || return 1
+        case "$key" in
+            failures|fixture_failures|deferred|primary_exit|cleanup_exit|residual_count) [[ $value == 0 ]] || return 1 ;;
+            mapping_fallback|mapping_direct|system_fallback|system_direct|dns_negatives|tls_negatives|isolation_negatives) [[ $value == PASS ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+        seen[$key]=1
+    done < "$business"
+    [[ ${#seen[@]} == 13 ]] || return 1
+    seen=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line != *$'\r'* && $line == *$'\t'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ -z ${seen[$key]:-} && $value == 0 ]] || return 1
+        case "$key" in primary_exit|cleanup_exit|residual_count) ;; *) return 1 ;; esac
+        seen[$key]=1
+    done < "$guard"
+    [[ ${#seen[@]} == 3 ]] || return 1
+    seen=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line != *$'\r'* && $line == *$'\t'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ -z ${seen[$key]:-} ]] || return 1
+        case "$key" in
+            carrier_cleanup_exit|carrier_residual_count) [[ $value == 0 ]] || return 1 ;;
+            host_unchanged) [[ $value == PASS ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+        seen[$key]=1
+    done < "$carrier"
+    [[ ${#seen[@]} == 3 ]] || return 1
+    mapping_negative_matrix_accept "$matrix" "$run" "$manifest" "$input" || return 1
+    cat -- "$business" > "$output.tmp" || return 1
+    cat -- "$carrier" >> "$output.tmp" || return 1
+    mapping_full_accept "$output.tmp" || return 1
+    mv -- "$output.tmp" "$output" || return 1
     return 0
 }
 
