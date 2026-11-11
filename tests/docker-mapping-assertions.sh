@@ -1447,9 +1447,9 @@ MAPPING_NEGSAN
 # 全量验收汇总判定：字段 failures/fixture_failures/deferred/primary_exit/cleanup_exit/residual_count
 # 必须为 0；mapping_fallback/mapping_direct/system_fallback/system_direct/dns_negatives/tls_negatives/
 # isolation_negatives 必须为 PASS；缺项、重复键、未知形状或非约定取值一律返回 1。
-# 汇总由集成结束路径（integration_full_summary_write）在运行期写出，runner 末尾消费本判定。
+# 仅接受同目录中由 mapping_finalize 发布、并与矩阵和本轮输入绑定的最终汇总。
 mapping_full_accept() {
-    local file=${1:-} line key value
+    local file=${1:-} line key value dir receipt run='' manifest='' input='' name digest actual
     local -A seen=()
     local -a zero_fields=(failures fixture_failures deferred primary_exit cleanup_exit residual_count)
     local -a pass_fields=(mapping_fallback mapping_direct system_fallback system_direct
@@ -1472,6 +1472,44 @@ mapping_full_accept() {
         [[ ${seen[$key]:-} == PASS ]] || return 1
     done
     [[ ${#seen[@]} == 16 ]] || return 1
+    [[ ${file##*/} == mapping-full-summary.tsv ]] || return 1
+    dir=${file%/*}
+    receipt=$dir/mapping-full-finalized.tsv
+    [[ -d $dir && ! -L $dir && -f $receipt && ! -L $receipt && -r $receipt ]] || return 1
+    seen=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *$'\t'* && $line != *$'\r'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ $value =~ ^[[:xdigit:]]{64}$ && -z ${seen[$key]:-} ]] || return 1
+        case $key in summary|matrix|input) ;; *) return 1 ;; esac
+        seen[$key]=$value
+    done < "$receipt"
+    [[ ${#seen[@]} == 3 ]] || return 1
+    for name in summary matrix input; do
+        case $name in
+            summary) actual=$file ;;
+            matrix) actual=$dir/mapping-negative-matrix.tsv ;;
+            input) actual=$dir/mapping-run-input.tsv ;;
+        esac
+        [[ -f $actual && ! -L $actual && -r $actual ]] || return 1
+        digest=$(sha256sum "$actual") || return 1
+        [[ ${digest%% *} == "${seen[$name]}" ]] || return 1
+    done
+    seen=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *$'\t'* && $line != *$'\r'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ -n $value && $value != *$'\t'* && -z ${seen[$key]:-} ]] || return 1
+        case $key in
+            run_id) run=$value ;;
+            manifest_sha256) manifest=$value ;;
+            input_sha256) input=$value ;;
+            *) return 1 ;;
+        esac
+        seen[$key]=1
+    done < "$dir/mapping-run-input.tsv"
+    [[ ${#seen[@]} == 3 ]] || return 1
+    mapping_negative_matrix_accept "$dir/mapping-negative-matrix.tsv" "$run" "$manifest" "$input" || return 1
     return 0
 }
 
@@ -1514,15 +1552,16 @@ mapping_final_exit() {
 
 # 载体外层最终汇总：三份状态和完整负例矩阵齐全后才原子发布 16 键结论。
 mapping_finalize() {
-    local dir=${1:-} guard=${2:-} carrier=${3:-} business matrix output input_file
-    local line key value run='' manifest='' input='' status
+    local dir=${1:-} guard=${2:-} carrier=${3:-} business matrix output input_file receipt
+    local line key value run='' manifest='' input='' status name digest
     local -A seen=()
     business=$dir/mapping-business-summary.tsv
     matrix=$dir/mapping-negative-matrix.tsv
     output=$dir/mapping-full-summary.tsv
     input_file=$dir/mapping-run-input.tsv
+    receipt=$dir/mapping-full-finalized.tsv
     [[ -d $dir && ! -L $dir ]] || return 1
-    rm -f -- "$output" "$output.tmp" || return 1
+    rm -f -- "$output" "$output.tmp" "$receipt" "$receipt.tmp" || return 1
     for status in "$business" "$guard" "$carrier" "$input_file"; do
         [[ -f $status && ! -L $status && -r $status ]] || return 1
     done
@@ -1577,13 +1616,25 @@ mapping_finalize() {
     mapping_negative_matrix_accept "$matrix" "$run" "$manifest" "$input" || return 1
     cat -- "$business" > "$output.tmp" || return 1
     cat -- "$carrier" >> "$output.tmp" || return 1
-    mapping_full_accept "$output.tmp" || return 1
     mv -- "$output.tmp" "$output" || return 1
+    for name in summary matrix input; do
+        case $name in
+            summary) status=$output ;;
+            matrix) status=$matrix ;;
+            input) status=$input_file ;;
+        esac
+        digest=$(sha256sum "$status") || return 1
+        printf '%s\t%s\n' "$name" "${digest%% *}" >> "$receipt.tmp" || return 1
+    done
+    mv -- "$receipt.tmp" "$receipt" || return 1
+    if ! mapping_full_accept "$output"; then
+        rm -f -- "$output" "$receipt"
+        return 1
+    fi
     return 0
 }
 
-# runner 末尾判定：对集成结束路径写出的九字段汇总运行 mapping_full_accept；判定不通过即非零，
-# 使单项模式或过滤运行写出的不完整汇总不能被当作 full 结论。
+# runner 末尾判定：仅有载体 finalized 来源的完整汇总可通过，旧 13 键业务汇总不能作为最终结论。
 integration_full_accept() {
     local file=${1:-}
     if mapping_full_accept "$file"; then

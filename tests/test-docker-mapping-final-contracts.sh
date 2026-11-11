@@ -164,6 +164,44 @@ single_mode_cannot_finalize_full() {
     rm -rf "$dir"
 }
 
+# 手写完整字段但缺少同轮矩阵、输入和 finalized 来源必须拒绝。
+handwritten_full_without_matrix_is_rejected() {
+    local dir file
+    dir=$(mktemp -d); file=$dir/mapping-full-summary.tsv
+    summary_write "$file"
+    ! mapping_full_accept "$file" || return 1
+    ! integration_full_accept "$file" >/dev/null 2>&1 || return 1
+    rm -rf "$dir"
+}
+
+# 最终汇总发布后，矩阵、输入、汇总及 finalized 来源任一变更均不能继续通过。
+finalized_full_requires_bound_sources() {
+    local dir guard carrier file
+    dir=$(mktemp -d); guard=$dir/guard.tsv; carrier=$dir/carrier.tsv
+    business_write "$dir"
+    matrix_write "$dir/mapping-negative-matrix.tsv"
+    printf 'primary_exit\t0\ncleanup_exit\t0\nresidual_count\t0\n' > "$guard"
+    printf 'carrier_cleanup_exit\t0\ncarrier_residual_count\t0\nhost_unchanged\tPASS\n' > "$carrier"
+    mapping_finalize "$dir" "$guard" "$carrier" || return 1
+    file=$dir/mapping-full-summary.tsv
+    mapping_full_accept "$file" || return 1
+    mv "$dir/mapping-negative-matrix.tsv" "$dir/matrix.saved"
+    ! mapping_full_accept "$file" || return 1
+    mv "$dir/matrix.saved" "$dir/mapping-negative-matrix.tsv"
+    printf 'tampered\n' >> "$dir/mapping-negative-matrix.tsv"
+    ! mapping_full_accept "$file" || return 1
+    matrix_write "$dir/mapping-negative-matrix.tsv"
+    printf 'run_id\tother\nmanifest_sha256\tmanifest\ninput_sha256\tinput\n' > "$dir/mapping-run-input.tsv"
+    ! mapping_full_accept "$file" || return 1
+    run_input_write "$dir"
+    printf 'unknown\tPASS\n' >> "$file"
+    ! mapping_full_accept "$file" || return 1
+    sed -i '$d' "$file"
+    printf 'old\n' > "$dir/mapping-full-finalized.tsv"
+    ! mapping_full_accept "$file" || return 1
+    rm -rf "$dir"
+}
+
 full_waits_for_guard_and_carrier_cleanup() {
     local dir guard carrier rc=0
     dir=$(mktemp -d); guard=$dir/guard.tsv; carrier=$dir/carrier.tsv
@@ -180,7 +218,7 @@ primary_error_wins_over_cleanup() {
 }
 
 failed=0
-for name in full_requires_all_21_negative_cases any_one_negative_cannot_pass_group negative_matrix_rejects_duplicate_unknown_or_foreign_case negative_matrix_requires_raw_evidence negative_matrix_requires_exact_bound_rows missing_summary_slot_rejected single_mode_cannot_finalize_full full_waits_for_guard_and_carrier_cleanup finalize_removes_stale_pass finalize_requires_raw_status_and_business primary_error_wins_over_cleanup; do
+for name in full_requires_all_21_negative_cases any_one_negative_cannot_pass_group negative_matrix_rejects_duplicate_unknown_or_foreign_case negative_matrix_requires_raw_evidence negative_matrix_requires_exact_bound_rows missing_summary_slot_rejected single_mode_cannot_finalize_full handwritten_full_without_matrix_is_rejected finalized_full_requires_bound_sources full_waits_for_guard_and_carrier_cleanup finalize_removes_stale_pass finalize_requires_raw_status_and_business primary_error_wins_over_cleanup; do
     rc=0; ( "$name" ) || rc=$?; printf '%s EXIT=%s\n' "$name" "$rc"; [[ $rc == 0 ]] || failed=1
 done
 exit "$failed"

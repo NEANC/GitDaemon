@@ -59,7 +59,7 @@ registration_moves_only_two_mapping_checks() {
     [[ $(grep -c $'^mapping\t' "$calls") == 2 ]] || { printf 'FAIL 新组正例注册次数不为 2\n'; rc=1; }
     grep -qx $'mapping\tfallback' "$calls" || { printf 'FAIL 新组未注册 fallback 场景\n'; rc=1; }
     grep -qx $'mapping\tdirect' "$calls" || { printf 'FAIL 新组未注册 direct 场景\n'; rc=1; }
-    [[ $(grep -c $'^negative\t' "$calls") == 6 ]] || { printf 'FAIL 新组负例注册次数不为 6\n'; rc=1; }
+    [[ $(grep -c $'^negative\t' "$calls") == 21 ]] || { printf 'FAIL 新组负例注册次数不为 21\n'; rc=1; }
     return "$rc"
 }
 
@@ -80,12 +80,12 @@ single_mapping_mode_is_independent() {
     return "$rc"
 }
 
-# full 汇总判定器：完整汇总接受；缺 system、缺 mapping、deferred=1、cleanup_exit=2、重复键全部拒绝。
+# 旧业务汇总仅供业务层校验，不能充当 finalized 最终结论。
 mapping_full_accept_contract() {
     local dir=$TEST_ROOT/full rc=0
     mkdir -p "$dir"
     full_summary_write "$dir/ok.tsv"
-    mapping_full_accept "$dir/ok.tsv" || { printf 'FAIL 完整汇总被拒\n'; rc=1; }
+    if mapping_full_accept "$dir/ok.tsv"; then printf 'FAIL 旧业务汇总冒充最终通过\n'; rc=1; fi
     full_summary_write "$dir/no-system.tsv" drop system_fallback
     if mapping_full_accept "$dir/no-system.tsv"; then printf 'FAIL 缺 system 汇总被接受\n'; rc=1; fi
     full_summary_write "$dir/no-mapping.tsv" drop mapping_direct
@@ -100,8 +100,7 @@ mapping_full_accept_contract() {
     return "$rc"
 }
 
-# 运行时生产者：集成结束路径写出的九字段汇总必须真实反映断言与槽位结果，并被判定器接受/拒绝。
-# 汇总由 integration_full_summary_write 生成（不是手工拼装样本），判定由 mapping_full_accept 执行。
+# 集成结束路径写出的 13 键业务汇总反映断言与槽位结果，但不得作为最终通过。
 full_summary_producer_contract() {
     local file=$TEST_ROOT/producer/summary.tsv rc=0 k
     local -a slots=(mapping_fallback mapping_direct system_fallback system_direct
@@ -113,8 +112,8 @@ full_summary_producer_contract() {
     for k in "${slots[@]}"; do integration_slot_pass "$k"; done
     integration_full_summary_write "$file" || { printf 'FAIL 汇总写出失败\n'; return 1; }
     [[ $(wc -l < "$file") == 13 ]] || { printf 'FAIL 汇总字段数 %s != 13\n' "$(wc -l < "$file")"; rc=1; }
-    mapping_full_accept "$file" || { printf 'FAIL 运行期汇总未被接受\n'; rc=1; }
-    integration_full_accept "$file" >/dev/null || { printf 'FAIL runner 判定拒绝了通过汇总\n'; rc=1; }
+    if mapping_full_accept "$file"; then printf 'FAIL 13 键业务汇总冒充最终通过\n'; rc=1; fi
+    if integration_full_accept "$file" >/dev/null 2>&1; then printf 'FAIL runner 将业务汇总当最终通过\n'; rc=1; fi
     # 断言失败计数非零：判定器必须拒绝。
     FAILURES=1
     integration_full_summary_write "$file" || rc=1
@@ -139,8 +138,7 @@ full_summary_producer_contract() {
     return "$rc"
 }
 
-# runner 结束路径：--integration 先运行集成，再对九字段汇总运行判定器；
-# 汇总被拒（缺槽位等）时 runner 必须非零，通过汇总必须为 0，绝不把部分证据当作 full 结论。
+# runner 结束路径：未 finalized 的替身汇总不论槽位是否完整都必须拒绝。
 integration_runner_judges_summary() {
     local scratch failed=0 rc=0
     scratch=$(mktemp -d)
@@ -166,7 +164,7 @@ integration_runner_judges_summary() {
     INTEGRATION_VERDICT=pass IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
         command bash "$HERE/test-docker-network.sh" --integration > "$scratch/pass.out" 2>&1 || rc=$?
     printf 'RUNNER_FULL_PASS rc=%s\n' "$rc"
-    [[ $rc == 0 ]] || { printf 'FAIL runner rejected a passing summary\n'; cat "$scratch/pass.out"; failed=1; }
+    [[ $rc != 0 ]] || { printf 'FAIL runner accepted an unfinalized summary\n'; failed=1; }
     rc=0
     INTEGRATION_VERDICT=drop IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
         command bash "$HERE/test-docker-network.sh" --integration > "$scratch/drop.out" 2>&1 || rc=$?
