@@ -77,7 +77,7 @@ guard_mapping_witness_install() {
     nsenter -t "$pid" -n iptables -t raw -N "$chain" || return 80
     OWN_NS_CHAINS+=("raw|$chain")
     printf 'raw|%s\n' "$chain" >> "$E/witness-chains.owned" || return 80
-    for spec in 'tcp 19419' 'udp 53' 'tcp 53'; do
+    for spec in 'tcp 19419' 'tcp 19420' 'udp 53' 'tcp 53'; do
         read -r proto port <<< "$spec"
         nsenter -t "$pid" -n iptables -t raw -A "$chain" -p "$proto" --dport "$port" -j RETURN || return 80
         OWN_NS_RULES+=("raw|-A $chain -p $proto --dport $port -j RETURN")

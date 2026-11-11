@@ -313,10 +313,10 @@ mapping_prepare() {
         "gm-$MP_RUN_ID-w-net" || return 80
     mapping_fixture_run mapping witness -d --name "gm-$MP_RUN_ID-witness" \
         $MAPPING_SAFE_OPTIONS --network "gm-$MP_RUN_ID-w-net" --ip 172.30.244.53 \
-        --dns 172.30.244.53 -p 172.30.243.1:49382:19419 \
+        --dns 172.30.244.53 -p 172.30.243.1:49382:19419 -p 172.30.243.1:49383:19420 \
         --sysctl "net.ipv4.ip_unprivileged_port_start=$MAPPING_DNS_PORT" \
         --entrypoint /bin/sh "$tools_image" \
-        -c 'busybox nc -lk -p 19419 -e /bin/cat & exec dnsmasq --keep-in-foreground --no-resolv --no-hosts --address=/#/ --log-queries --log-facility=- --pid-file= --user=git-daemon' >/dev/null || return 80
+        -c 'busybox nc -lk -p 19419 -e /bin/cat & busybox nc -lk -p 19420 -e /bin/cat & exec dnsmasq --keep-in-foreground --no-resolv --no-hosts --address=/#/ --log-queries --log-facility=- --pid-file= --user=git-daemon' >/dev/null || return 80
     mapping_fixture_wait "gm-$MP_RUN_ID-witness" || return 80
     return 0
 }
@@ -407,7 +407,7 @@ mapping_count() {
 
 # 接收端见证计数：复用统一解析入口，输入为映射见证快照文件，不复制旧检查实现。
 mapping_witness() {
-    witness_chain_counts "${1:-}"
+    witness_chain_counts "${1:-}" mapping
 }
 
 # 单协议增量校验：复用统一入口，仅换入参来源。
@@ -417,60 +417,84 @@ mapping_witness_delta() {
 
 # 三协议键计数必须全部严格增长；零增量或非整数一律失败。
 mapping_witness_growth() {
-    local before=${1:-} after=${2:-}
-    awk -v before="$before" -v after="$after" 'BEGIN {
-        if (split(before, b, "\n") != 3 || split(after, a, "\n") != 3) exit 1
-        for (i = 1; i <= 3; i++) {
+    local before=${1:-} after=${2:-} key=${3:-}
+    awk -v before="$before" -v after="$after" -v key="$key" 'BEGIN {
+        if (split(before, b, "\n") != 4 || split(after, a, "\n") != 4) exit 1
+        if (key == "cross-network" || key == "host-published") target=1
+        else if (key == "host-input") target=2
+        else if (key == "dns-udp") target=3
+        else if (key == "dns-tcp") target=4
+        else exit 1
+        for (i = 1; i <= 4; i++) {
             if (b[i] !~ /^[0-9]+$/ || a[i] !~ /^[0-9]+$/) exit 1
-            if (a[i] + 0 <= b[i] + 0) exit 1
+            if (i == target) { if (a[i] + 0 <= b[i] + 0) exit 1 }
+            else if (a[i] != b[i]) exit 1
         }
     }'
 }
 
-# 接收端见证链计数：经 docker exec 边界读取接收端链，未运行或链缺失即非零。
+# 接收端见证链计数：使用 guard 的只读 netns 快照，普通 runner 不进入特权命名空间。
 mapping_receiver_witness_counts() {
-    local receiver="gm-$MP_RUN_ID-witness" file rc=0
-    file=$(mktemp) || return 1
-    if ! docker exec "$receiver" sh -c "iptables -t raw -nvxL MS$MP_RUN_ID" > "$file"; then
-        rm -f "$file"
-        return 1
-    fi
-    if ! mapping_witness "$file"; then rc=1; fi
-    rm -f "$file"
-    return "$rc"
+    local root generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
+    [[ -n ${IT_CONTROL_DIR:-} && -n $generation ]] || return 80
+    root=${IT_CONTROL_DIR%/control}
+    [[ $root != "$IT_CONTROL_DIR" ]] || return 80
+    if [[ -z $MP_NETWORK_ID ]]; then MP_NETWORK_ID=$(mapping_network_id_load) || return 80; fi
+    mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+    mapping_witness "$root/mapping-snapshot-$CONTROL_SEQ.witness" || return 80
 }
 
 # 单个见证接收端的正校准探针，全部经 docker exec 边界。
 mapping_receiver_probe() {
-    local key=${1:-} spec proto port dest receiver
-    mapping_witness_key_valid "$key" || return 1
-    spec=$(mapping_witness_spec "$key") || return 1
+    local key=${1:-} spec proto port dest receiver generation token result id network_id facts ledger
+    mapping_witness_key_valid "$key" || return 80
+    generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
+    [[ -n $generation ]] || return 80
+    spec=$(mapping_witness_spec "$key") || return 80
     IFS=$'\t' read -r proto port dest <<< "$spec"
     receiver="gm-$MP_RUN_ID-witness"
+    ledger=$(resource_ledger_dir) || return 80
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    resource_crosscheck "$ledger" || return 80
+    id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$receiver") || return 80
+    network_id=$(mapping_fixture_docker network inspect -f '{{.Id}}' "gm-$MP_RUN_ID-w-net") || return 80
+    [[ $id =~ ^[0-9a-f]{64}$ && $network_id =~ ^[0-9a-f]{64}$ ]] || return 80
+    resource_verify_object container "$id" mapping witness '' || return 80
+    resource_verify_object network "$network_id" mapping witness-network '' || return 80
+    facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.State.Running}}|{{(index .NetworkSettings.Networks "gm-'"$MP_RUN_ID"'-w-net").NetworkID}}' "$id") || return 80
+    [[ $facts == "gm-$MP_RUN_ID-w-net|true|$network_id" ]] || return 80
+    token="$MP_RUN_ID-$generation-$key"
     case "$key" in
-        cross-network) docker exec "$receiver" sh -c "printf ping | nc -w1 -q1 $dest $port" ;;
-        host-published) docker exec "$receiver" sh -c "printf ping | nc -w1 -q1 $dest $port" ;;
-        host-input) docker exec "$receiver" sh -c "printf ping | nc -w1 -q1 $dest $port" ;;
-        dns-udp) docker exec "$receiver" dig +time=1 +tries=1 +notcp "@$dest" "$MP_RUN_ID-witness.invalid" A ;;
-        dns-tcp) docker exec "$receiver" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-witness.invalid" A ;;
-        *) return 1 ;;
+        cross-network|host-published|host-input)
+            [[ $key != host-input ]] || port=49383
+            result=$(mapping_fixture_docker exec "$id" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'") || return 80
+            [[ $result == "$token" ]] || return 80
+            ;;
+        dns-udp|dns-tcp)
+            if [[ $key == dns-udp ]]; then proto=+notcp; else proto=+tcp; fi
+            result=$(mapping_fixture_docker exec "$id" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A) || return 80
+            [[ $result == *'status: NXDOMAIN,'* && $result == *";$token.invalid."* && $result == *"SERVER: $dest#53("* ]] || return 80
+            ;;
     esac
+    [[ $(mapping_fixture_docker inspect -f '{{.Id}}' "$receiver") == "$id" ]] || return 80
+    return 0
 }
 
 # 正校准接收端并覆盖 UDP/TCP：先取接收端基线，逐项探测后要求计数严格增长。
 # 接收端在跑但不计数（零增量）不得通过校准。
 mapping_calibrate_witness() {
     local profile=${1:-} key spec proto port before after
+    MP_WITNESS_CALIBRATED=0
     mapping_profile_load "$profile" || return $?
-    before=$(mapping_receiver_witness_counts) || return 1
     for key in $MAPPING_WITNESS_KEYS; do
+        before=$(mapping_receiver_witness_counts) || return 80
         spec=$(mapping_witness_spec "$key") || return 1
         IFS=$'\t' read -r proto port _ <<< "$spec"
-        mapping_receiver_probe "$key" || return 1
+        mapping_receiver_probe "$key" || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
+        after=$(mapping_receiver_witness_counts) || return 80
+        mapping_witness_growth "$before" "$after" "$key" || return 1
         printf 'WITNESS_PROBE=%s PROTOCOL=%s PORT=%s\n' "$key" "$proto" "$port"
     done
-    after=$(mapping_receiver_witness_counts) || return 1
-    mapping_witness_growth "$before" "$after" || return 1
     MP_WITNESS_CALIBRATED=1
     return 0
 }

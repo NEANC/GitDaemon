@@ -212,17 +212,20 @@ network_count() {
 # 见证链计数解析（参数化入口）：恰好三个协议端口键，输出固定顺序且只接受非负整数。
 # 旧网络与映射见证共用该入口，映射入口不复制旧检查。
 witness_chain_counts() {
-    local file=${1:-}
+    local file=${1:-} mode=${2:-network} expected=3
     [[ -n $file && -f $file && ! -L $file ]] || return 1
-    awk '
+    if [[ $mode == mapping ]]; then expected=4; elif [[ $mode != network ]]; then return 1; fi
+    awk -v expected="$expected" '
     $3=="RETURN" {
         key=$4 ":" $11; n++
-        if($1!~/^[0-9]+$/ || $2!~/^[0-9]+$/ || $10!=$4 || $8!="0.0.0.0/0" || $9!="0.0.0.0/0" || (key!="tcp:dpt:19419" && key!="udp:dpt:53" && key!="tcp:dpt:53"))bad=1
+        if($1!~/^[0-9]+$/ || $2!~/^[0-9]+$/ || $10!=$4 || $8!="0.0.0.0/0" || $9!="0.0.0.0/0" || (key!="tcp:dpt:19419" && key!="udp:dpt:53" && key!="tcp:dpt:53" && !(expected==4 && key=="tcp:dpt:19420")))bad=1
         seen[key]++; count[key]=$1
     }
     END {
-        if(bad || n!=3 || seen["tcp:dpt:19419"]!=1 || seen["udp:dpt:53"]!=1 || seen["tcp:dpt:53"]!=1)exit 1
-        print count["tcp:dpt:19419"];print count["udp:dpt:53"];print count["tcp:dpt:53"]
+        if(bad || n!=expected || seen["tcp:dpt:19419"]!=1 || seen["udp:dpt:53"]!=1 || seen["tcp:dpt:53"]!=1 || (expected==4 && seen["tcp:dpt:19420"]!=1))exit 1
+        print count["tcp:dpt:19419"]
+        if(expected==4)print count["tcp:dpt:19420"]
+        print count["udp:dpt:53"];print count["tcp:dpt:53"]
     }' "$file"
 }
 # 接收端见证计数：复用同一解析入口，只换入参来源。
