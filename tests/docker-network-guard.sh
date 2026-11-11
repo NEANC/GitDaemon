@@ -339,7 +339,7 @@ guard_mapping_generation() {
 
 guard_mapping_release_verify() {
     local generation=${1:-} network_id=${2:-} profile_sha256=${3:-}
-    local ledger kind ids key
+    local ledger kind ids key witness_id witness_net_id entry attachment
     [[ -n $generation && -n $network_id && $profile_sha256 == "$MP_PROFILE_SHA256" ]] || return 65
     validation_environment_verify "$GUARD_MANIFEST" "$GUARD_ATTESTATION" || return 2
     ledger=$E/control/resources
@@ -347,12 +347,26 @@ guard_mapping_release_verify() {
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$RUN
     resource_crosscheck "$ledger" || return 2
     resource_ledger_load "$ledger" || return 2
+    witness_id=$(docker inspect -f '{{.Id}}' "gm-$RUN-witness") || return 2
+    witness_net_id=$(docker network inspect -f '{{.Id}}' "gm-$RUN-w-net") || return 2
+    [[ $witness_id =~ ^[0-9a-f]{64}$ && $witness_net_id =~ ^[0-9a-f]{64}$ ]] || return 2
+    entry=${RESOURCE_LEDGER_ACTIVE["container|$witness_id"]:-}
+    [[ $entry == *'|mapping|witness|'* && $entry == *"|$RUN" ]] || return 2
+    entry=${RESOURCE_LEDGER_ACTIVE["network|$witness_net_id"]:-}
+    [[ $entry == *'|mapping|witness-network|'* && $entry == *"|$RUN" ]] || return 2
+    guard_mapping_witness_identity >/dev/null || return 2
+    attachment=$(docker inspect -f '{{(index .NetworkSettings.Networks "gm-'"$RUN"'-w-net").NetworkID}}' "$witness_id") || return 2
+    [[ $attachment == "$witness_net_id" ]] || return 2
     for key in "${!RESOURCE_LEDGER_ACTIVE[@]}"; do
-        [[ -z ${RESOURCE_LEDGER_ACTIVE[$key]:-} ]] || return 2
+        [[ -z ${RESOURCE_LEDGER_ACTIVE[$key]:-} || $key == "container|$witness_id" || $key == "network|$witness_net_id" ]] || return 2
     done
     for kind in $RESOURCE_KINDS; do
         ids=$(resource_enumerate "$kind" "$RUN") || return 2
-        [[ -z ${ids//[[:space:]]/} ]] || return 2
+        case "$kind" in
+            container) [[ $ids == "$witness_id" ]] || return 2 ;;
+            network) [[ $ids == "$witness_net_id" ]] || return 2 ;;
+            volume) [[ -z ${ids//[[:space:]]/} ]] || return 2 ;;
+        esac
     done
     return 0
 }
