@@ -699,18 +699,39 @@ mapping_tls_product_request() {
 }
 
 mapping_negative_proxy_ca_restore() {
-    local image=${MAPPING_PRODUCT_IMAGE:-} status=0
+    local image=${MAPPING_PRODUCT_IMAGE:-}
     [[ -n $image ]] || return 1
     mapping_fixture_docker run --rm --user 10001:10001 --network none \
-        -v "$(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT" --entrypoint cat "$image" \
-        proxy/tls/ca.crt | mapping_fixture_docker run --rm -i --user 10001:10001 --network none \
-        -v "$(mapping_ca_volume):$MAPPING_FIXTURE_MOUNT" --entrypoint /bin/sh "$image" \
-        -c 'cat > proxy-ca.crt' || status=$?
-    [[ $status == 0 ]]
+        -v "$(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT:ro" \
+        -v "$(mapping_ca_volume):$MAPPING_CA_MOUNT" --entrypoint /bin/sh "$image" \
+        -c 'cat "$1" > "$2" && cmp -s "$1" "$2"' sh \
+        "$MAPPING_ASSET_ROOT/proxy/tls/ca.crt" "$MAPPING_CLIENT_PROXY_CA"
+}
+
+mapping_tls_injected_evidence() {
+    local dir=${1:-} kind=${2:-} scenario=${3:-} before after request_rc
+    before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
+    printf '%s\n' "$before" > "$dir/proxy.before" || return 80
+    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.before" || return 80
+    request_rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
+    printf '%s\n' "$request_rc" > "$dir/request.exit" || return 80
+    cp "$dir/request.log" "$dir/request.failed.log" || return 80
+    after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
+    printf '%s\n' "$after" > "$dir/proxy.after" || return 80
+    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.log" || return 80
+    printf 'case\twrong_proxy_ca\nlayer\touter-failure\nconnect_delta\t%s\nrequest_exit\t%s\n' \
+        "$((after - before))" "$request_rc" > "$dir/tls-layer.tsv" || return 80
+    [[ $request_rc != 0 && $after == "$before" ]] || return 1
+    cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
+    grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
+    [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
+    [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
+    grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || return 1
+    return 0
 }
 
 mapping_tls_negative_run() {
-    local case_name=${1:-} dir=${2:-} kind=${3:-} scenario=${4:-} before after recovered request_rc recovery_rc
+    local case_name=${1:-} dir=${2:-} kind=${3:-} scenario=${4:-} before after recovered recovery_rc evidence_rc=0
     [[ $case_name == wrong_proxy_ca && -d $dir && ! -L $dir ]] || return 80
     mapping_scenario_valid "$scenario" || return 80
     mapping_profile_load "$MAPPING_PROFILE" || return 80
@@ -730,24 +751,9 @@ mapping_tls_negative_run() {
     mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 80
     printf '%s\n' "$case_name" > "$dir/case.tsv"
     mapping_negative_wrong_ca proxy-ca.crt || return 80
-    before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
-    printf '%s\n' "$before" > "$dir/proxy.before"
-    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.before" || return 80
-    request_rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
-    printf '%s\n' "$request_rc" > "$dir/request.exit"
-    cp "$dir/request.log" "$dir/request.failed.log" || return 80
-    after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
-    printf '%s\n' "$after" > "$dir/proxy.after"
-    mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.log" || return 80
-    printf 'case\t%s\nlayer\touter-failure\nconnect_delta\t%s\nrequest_exit\t%s\n' \
-        "$case_name" "$((after - before))" "$request_rc" > "$dir/tls-layer.tsv"
-    [[ $request_rc != 0 && $after == "$before" ]] || return 1
-    cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
-    grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
-    [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
-    [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
-    grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || return 1
+    mapping_tls_injected_evidence "$dir" "$kind" "$scenario" || evidence_rc=$?
     mapping_negative_proxy_ca_restore || return 80
+    (( evidence_rc == 0 )) || return "$evidence_rc"
     recovery_rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
     printf '%s\n' "$recovery_rc" > "$dir/recovery.exit"
     [[ $recovery_rc == 0 ]] || return 80
@@ -755,6 +761,7 @@ mapping_tls_negative_run() {
     recovered=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     printf '%s\n' "$recovered" > "$dir/proxy.recovered"
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.recovered" || return 80
+    after=$(mapping_assert_uint_file "$dir/proxy.after") || return 80
     (( recovered > after )) || return 1
     [[ $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.log") ]] || return 1
     tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80

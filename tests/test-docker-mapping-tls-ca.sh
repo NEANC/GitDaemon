@@ -153,8 +153,113 @@ wrong_proxy_ca_accepts_dedicated_evidence() {
     [[ $rc != 0 ]]
 }
 
+wrong_proxy_ca_restore_uses_both_real_mounts_and_exact_bytes() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    MAPPING_PRODUCT_IMAGE=product MP_RUN_ID=contract
+    printf '%s\n' '-----BEGIN CERTIFICATE-----' first second '-----END CERTIFICATE-----' > "$dir/source"
+    mapping_fixture_docker() {
+        printf '%s\n' "$*" >> "$dir/argv"
+        [[ $* == *"-v $(mapping_assets_volume):$MAPPING_FIXTURE_MOUNT:ro"* && $* == *"-v $(mapping_ca_volume):$MAPPING_CA_MOUNT"* ]] || return 9
+        [[ $* == *"$MAPPING_ASSET_ROOT/proxy/tls/ca.crt"* && $* == *"$MAPPING_CLIENT_PROXY_CA"* && $* == *'cmp -s'* ]] || return 9
+        cp "$dir/source" "$dir/target"
+    }
+    mapping_negative_proxy_ca_restore || rc=$?
+    [[ $rc == 0 ]] && cmp -s "$dir/source" "$dir/target"
+}
+
+wrong_proxy_ca_restores_after_injected_evidence_failure() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/injected ]]; then return 9; fi
+        if [[ -f $dir/baseline.exit ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+        fi
+        printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+    }
+    mapping_tls_product_request() {
+        printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
+        printf '0\n'
+    }
+    mapping_negative_wrong_ca() { : > "$dir/injected"; }
+    mapping_negative_proxy_ca_restore() { : > "$dir/restored"; }
+    mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 80 && -f $dir/restored && -f $dir/baseline.exit && -f $dir/case.tsv ]]
+}
+
+wrong_proxy_ca_restore_failure_keeps_original_failure() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/injected ]]; then return 9; fi
+        if [[ -f $dir/baseline.exit ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+        fi
+        printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+    }
+    mapping_tls_product_request() {
+        printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
+        printf '0\n'
+    }
+    mapping_negative_wrong_ca() { : > "$dir/injected"; }
+    mapping_negative_proxy_ca_restore() { : > "$dir/restored"; return 9; }
+    mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 80 && -f $dir/restored && -f $dir/baseline.exit && -f $dir/case.tsv ]]
+}
+
+wrong_proxy_ca_assertion_failure_still_restores() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/baseline.exit ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+        fi
+        printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+    }
+    mapping_tls_product_request() {
+        printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
+        printf '0\n'
+    }
+    mapping_negative_wrong_ca() { : > "$dir/injected"; }
+    mapping_negative_proxy_ca_restore() { : > "$dir/restored"; }
+    mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 1 && -f $dir/restored && $(cat "$dir/request.exit") == 0 ]]
+}
+
+wrong_proxy_ca_assertion_and_restore_failure_returns_80() {
+    local dir rc=0
+    dir=$(mktemp -d)
+    MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/baseline.exit ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+        fi
+        printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+    }
+    mapping_tls_product_request() {
+        printf '同步传输路径：配置的 HTTPS 代理\n' > "$1/request.log"
+        printf '0\n'
+    }
+    mapping_negative_wrong_ca() { : > "$dir/injected"; }
+    mapping_negative_proxy_ca_restore() { : > "$dir/restored"; return 9; }
+    mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 80 && -f $dir/restored && $(cat "$dir/request.exit") == 0 ]]
+}
+
 failed=0
-for name in wrong_proxy_ca_uses_product_8443_and_recovers wrong_proxy_ca_rejects_unrelated_failure wrong_proxy_ca_dispatches_dedicated_path wrong_proxy_ca_rejects_unrelated_connect wrong_proxy_ca_accepts_dedicated_evidence; do
+for name in wrong_proxy_ca_uses_product_8443_and_recovers wrong_proxy_ca_rejects_unrelated_failure wrong_proxy_ca_dispatches_dedicated_path wrong_proxy_ca_rejects_unrelated_connect wrong_proxy_ca_accepts_dedicated_evidence wrong_proxy_ca_restore_uses_both_real_mounts_and_exact_bytes wrong_proxy_ca_restores_after_injected_evidence_failure wrong_proxy_ca_restore_failure_keeps_original_failure wrong_proxy_ca_assertion_failure_still_restores wrong_proxy_ca_assertion_and_restore_failure_returns_80; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
