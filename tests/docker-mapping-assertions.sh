@@ -354,12 +354,15 @@ mapping_scenario_fixture_prepare() {
     ledger=${RESOURCE_LEDGER_DIR:-${IT_CONTROL_DIR:-$dir/control}/resources}
     RESOURCE_LEDGER_DIR=$ledger
     if [[ -f $ledger/ledger.tsv ]]; then
-        local entry
+        local entry key shared_witness='' shared_network=''
         mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
         RESOURCE_RUN=$MP_RUN_ID
         resource_crosscheck "$ledger" || return "$MAPPING_ASSERT_FIXTURE"
-        for entry in "${RESOURCE_LEDGER_ACTIVE[@]}"; do
-            [[ -z $entry ]] || return "$MAPPING_ASSERT_FIXTURE"
+        shared_witness=$(resource_docker inspect -f '{{.Id}}' "gm-$MP_RUN_ID-witness" 2>/dev/null) || shared_witness=''
+        shared_network=$(resource_docker network inspect -f '{{.Id}}' "gm-$MP_RUN_ID-w-net" 2>/dev/null) || shared_network=''
+        for key in "${!RESOURCE_LEDGER_ACTIVE[@]}"; do
+            entry=${RESOURCE_LEDGER_ACTIVE[$key]:-}
+            [[ -z $entry || ( -n $shared_witness && $key == "container|$shared_witness" && $entry == *'|mapping|witness|'* && $entry == *"|$MP_RUN_ID" ) || ( -n $shared_network && $key == "network|$shared_network" && $entry == *'|mapping|witness-network|'* && $entry == *"|$MP_RUN_ID" ) ]] || return "$MAPPING_ASSERT_FIXTURE"
         done
     fi
     mapping_prepare "$MAPPING_PROFILE" "$scenario" "$MAPPING_PRODUCT_IMAGE" "$MAPPING_TOOLS_IMAGE" || return "$MAPPING_ASSERT_FIXTURE"

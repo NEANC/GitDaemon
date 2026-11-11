@@ -276,7 +276,7 @@ mapping_ready() {
 
 # 准备阶段只登记离线资产与网络，不启动任何联网容器。
 mapping_prepare() {
-    local profile=${1:-} scenario=${2:-} product_image=${3:-} tools_image=${4:-} ledger
+    local profile=${1:-} scenario=${2:-} product_image=${3:-} tools_image=${4:-} ledger witness_id network_id attachment facts key entry
     [[ -n $profile && -n $scenario && -n $product_image && -n $tools_image ]] || return 80
     mapping_scenario_valid "$scenario" || return 80
     mapping_profile_load "$profile" || return 80
@@ -287,6 +287,24 @@ mapping_prepare() {
     mapping_network_create "$profile" "$ledger" "$scenario" >/dev/null || return 80
     mapping_fixture_precheck || return 80
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    resource_crosscheck "$ledger" || return 80
+    witness_id=$(mapping_fixture_docker inspect -f '{{.Id}}' "gm-$MP_RUN_ID-witness" 2>/dev/null) || witness_id=''
+    network_id=$(resource_docker network inspect -f '{{.Id}}' "gm-$MP_RUN_ID-w-net" 2>/dev/null) || network_id=''
+    if [[ -n $witness_id || -n $network_id ]]; then
+        [[ $witness_id =~ ^[0-9a-f]{64}$ && $network_id =~ ^[0-9a-f]{64}$ ]] || return 80
+        [[ ${RESOURCE_LEDGER_ACTIVE["container|$witness_id"]:-} == *'|mapping|witness|'* && ${RESOURCE_LEDGER_ACTIVE["network|$network_id"]:-} == *'|mapping|witness-network|'* ]] || return 80
+        resource_verify_object container "$witness_id" mapping witness '' || return 80
+        resource_verify_object network "$network_id" mapping witness-network '' || return 80
+        facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.State.Running}}' "$witness_id") || return 80
+        [[ $facts == "gm-$MP_RUN_ID-w-net|true" ]] || return 80
+        attachment=$(mapping_fixture_docker inspect -f '{{(index .NetworkSettings.Networks "gm-'"$MP_RUN_ID"'-w-net").NetworkID}}' "$witness_id") || return 80
+        [[ $attachment == "$network_id" ]] || return 80
+        return 0
+    fi
+    for key in "${!RESOURCE_LEDGER_ACTIVE[@]}"; do
+        entry=${RESOURCE_LEDGER_ACTIVE[$key]:-}
+        [[ $entry != *'|mapping|witness|'* && $entry != *'|mapping|witness-network|'* ]] || return 80
+    done
     resource_create_register network mapping witness-network -- \
         resource_docker network create \
         --label "gitdaemon.run=$MP_RUN_ID" --label gitdaemon.scenario=mapping \

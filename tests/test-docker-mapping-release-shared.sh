@@ -22,6 +22,7 @@ setup_release() {
     OWN_RULES=('filter|-A GEN -j DROP') OWN_NS_RULES=() OWN_NS_CHAINS=()
     GUARD_MAPPING_WITNESS_ID=$WITNESS_ID
     PRODUCT_RUN=mtest WNET_ROLE=witness-network WNET_ATTACHMENT=$WNET_ID EXTRA_ID='' WITNESS_PRESENT=1 WNET_PRESENT=1
+    WNET_ID_NOW=$WNET_ID WITNESS_ID_NOW=$WITNESS_ID
     : > "$directory/actions"
     printf '1\tregister\tcontainer\t%s\tmtest\tmapping\twitness\thash\t%s\tpath\n2\tregister\tnetwork\t%s\tmtest\tmapping\twitness-network\thash\t%s\tpath\n3\tregister\tcontainer\t%s\tmtest\tmapping-direct\tproduct\thash\t%s\tpath\n' "$WITNESS_ID" "$WITNESS_ID" "$WNET_ID" "$WNET_ID" "$PRODUCT_ID" "$PRODUCT_ID" > "$RESOURCE_LEDGER_DIR/ledger.tsv"
 }
@@ -36,8 +37,8 @@ docker() {
             if [[ $* == *'.NetworkID'* ]]; then printf '%s\n' "$WNET_ATTACHMENT"
             elif [[ $* == *'HostConfig.NetworkMode'* ]]; then
                 printf '%s|mtest|mapping|witness|gm-mtest-w-net|123|true\n' "$WITNESS_ID"
-            else printf '%s\n' "$WITNESS_ID"; fi ;;
-        *'gm-mtest-w-net'*) printf '%s\n' "$WNET_ID" ;;
+            else printf '%s\n' "$WITNESS_ID_NOW"; fi ;;
+        *'gm-mtest-w-net'*) [[ $WNET_PRESENT == 1 ]] || return 1; printf '%s\n' "$WNET_ID_NOW" ;;
         *) return 1 ;;
     esac
 }
@@ -64,6 +65,7 @@ resource_docker() {
     esac
 }
 iptables() { printf 'rule %s\n' "$*" >> "$E/actions"; }
+nsenter() { printf 'ns-rule %s\n' "$*" >> "$E/actions"; }
 release_preserves_shared_and_enables_next_generation() (
     setup_release success
     : > "$E/product"
@@ -134,8 +136,63 @@ prepare_failure_exit_trap_refuses_identity_drift() (
     [[ $rc != 0 && ! -s $E/actions && -e $E/product ]]
 )
 
+release_rejects_bad_generation_before_ns_teardown() (
+    setup_release bad-generation
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    OWN_NS_CHAINS=('raw|MS')
+    guard_mapping_release g2 net-one "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    [[ ! -s $E/actions && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_RULES[@]} == 1 && $GUARD_MAPPING_STATE == ACTIVE ]]
+)
+
+release_rejects_bad_network_and_profile_before_ns_teardown() (
+    setup_release bad-fields
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    guard_mapping_release g1 net-two "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    guard_mapping_release g1 net-one bad-profile 0 >/dev/null 2>&1 && return 1
+    [[ ! -s $E/actions && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_RULES[@]} == 1 ]]
+)
+
+release_rejects_missing_receipt_before_ns_teardown() (
+    setup_release ns-missing-receipt
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    guard_mapping_release g1 net-one "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    [[ ! -s $E/actions && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_RULES[@]} == 1 ]]
+)
+
+release_rejects_shared_identity_swap_before_ns_teardown() (
+    setup_release swapped-witness
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    WITNESS_ID_NOW=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    guard_mapping_release g1 net-one "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    [[ ! -s $E/actions && ${#OWN_NS_RULES[@]} == 1 ]]
+)
+
+release_rejects_missing_wnet_before_ns_teardown() (
+    setup_release missing-wnet
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    WNET_PRESENT=0
+    guard_mapping_release g1 net-one "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    [[ ! -s $E/actions && ${#OWN_NS_RULES[@]} == 1 ]]
+)
+
+release_rejects_residual_with_nonempty_ns_rules() (
+    setup_release ns-residual
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    EXTRA_ID=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    guard_mapping_release g1 net-one "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    [[ $GUARD_MAPPING_STATE == ACTIVE && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_RULES[@]} == 1 && ! -s $E/actions ]]
+)
+
+release_rejects_nonactive_state_before_ns_teardown() (
+    setup_release nonactive
+    GUARD_MAPPING_STATE=RELEASED
+    OWN_NS_RULES=('raw|-A MS -j RETURN')
+    guard_mapping_release g1 net-one "$MP_PROFILE_SHA256" 0 >/dev/null 2>&1 && return 1
+    [[ ! -s $E/actions && ${#OWN_NS_RULES[@]} == 1 && ${#OWN_RULES[@]} == 1 ]]
+)
+
 failed=0
-for test in release_preserves_shared_and_enables_next_generation release_rejects_missing_receipt_without_unrules release_rejects_identity_drift_without_unrules release_rejects_witness_network_drift_without_unrules release_rejects_witness_attachment_drift_without_unrules release_rejects_unregistered_residual_without_unrules outer_cleanup_removes_shared_after_release prepare_failure_exit_trap_refuses_identity_drift; do
+for test in release_preserves_shared_and_enables_next_generation release_rejects_missing_receipt_without_unrules release_rejects_identity_drift_without_unrules release_rejects_witness_network_drift_without_unrules release_rejects_witness_attachment_drift_without_unrules release_rejects_unregistered_residual_without_unrules outer_cleanup_removes_shared_after_release prepare_failure_exit_trap_refuses_identity_drift release_rejects_bad_generation_before_ns_teardown release_rejects_bad_network_and_profile_before_ns_teardown release_rejects_missing_receipt_before_ns_teardown release_rejects_shared_identity_swap_before_ns_teardown release_rejects_missing_wnet_before_ns_teardown release_rejects_residual_with_nonempty_ns_rules release_rejects_nonactive_state_before_ns_teardown; do
     rc=0; "$test" || rc=$?
     printf '%s EXIT=%s\n' "$test" "$rc"
     [[ $rc == 0 ]] || failed=1

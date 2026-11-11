@@ -340,6 +340,7 @@ guard_mapping_generation() {
 guard_mapping_release_verify() {
     local generation=${1:-} network_id=${2:-} profile_sha256=${3:-}
     local ledger kind ids key witness_id witness_net_id entry attachment
+    [[ ${GUARD_MAPPING_STATE:-} == ACTIVE && $generation == "${GUARD_MAPPING_GENERATION:-}" && $network_id == "${GUARD_MAPPING_NETWORK_ID:-}" ]] || return 65
     [[ -n $generation && -n $network_id && $profile_sha256 == "$MP_PROFILE_SHA256" ]] || return 65
     validation_environment_verify "$GUARD_MANIFEST" "$GUARD_ATTESTATION" || return 2
     ledger=$E/control/resources
@@ -350,10 +351,12 @@ guard_mapping_release_verify() {
     witness_id=$(docker inspect -f '{{.Id}}' "gm-$RUN-witness") || return 2
     witness_net_id=$(docker network inspect -f '{{.Id}}' "gm-$RUN-w-net") || return 2
     [[ $witness_id =~ ^[0-9a-f]{64}$ && $witness_net_id =~ ^[0-9a-f]{64}$ ]] || return 2
+    [[ $witness_id == "${GUARD_MAPPING_WITNESS_ID:-}" ]] || return 2
     entry=${RESOURCE_LEDGER_ACTIVE["container|$witness_id"]:-}
     [[ $entry == *'|mapping|witness|'* && $entry == *"|$RUN" ]] || return 2
     entry=${RESOURCE_LEDGER_ACTIVE["network|$witness_net_id"]:-}
     [[ $entry == *'|mapping|witness-network|'* && $entry == *"|$RUN" ]] || return 2
+    resource_verify_object network "$witness_net_id" mapping witness-network '' || return 2
     guard_mapping_witness_identity >/dev/null || return 2
     attachment=$(docker inspect -f '{{(index .NetworkSettings.Networks "gm-'"$RUN"'-w-net").NetworkID}}' "$witness_id") || return 2
     [[ $attachment == "$witness_net_id" ]] || return 2
@@ -373,10 +376,10 @@ guard_mapping_release_verify() {
 
 guard_mapping_release() {
     local generation=${1:-} network_id=${2:-} profile_sha256=${3:-} rules_start=${4:-}
+    guard_mapping_release_verify "$generation" "$network_id" "$profile_sha256" || return $?
     if [[ ${#OWN_NS_RULES[@]} != 0 || ${#OWN_NS_CHAINS[@]} != 0 ]]; then
         guard_mapping_witness_remove || return 2
     fi
-    guard_mapping_release_verify "$generation" "$network_id" "$profile_sha256" || return $?
     guard_remove_rules_since "$rules_start" || return $?
     guard_mapping_generation mapping-release "$generation" "$network_id" "$profile_sha256"
 }
