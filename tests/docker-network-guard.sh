@@ -6,7 +6,8 @@ GUARD_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ ! -f $GUARD_DIR/docker-validation-environment.sh ]] || source "$GUARD_DIR/docker-validation-environment.sh"
 [[ ! -f $GUARD_DIR/docker-resource-ledger.sh ]] || source "$GUARD_DIR/docker-resource-ledger.sh"
 [[ ! -f $GUARD_DIR/docker-mapping-fixture.sh ]] || source "$GUARD_DIR/docker-mapping-fixture.sh"
-OWN_RULES=() OWN_CHAINS=()
+[[ ! -f $GUARD_DIR/docker-network-fixture.sh ]] || source "$GUARD_DIR/docker-network-fixture.sh"
+OWN_RULES=() OWN_CHAINS=() OWN_NS_RULES=() OWN_NS_CHAINS=()
 PENDING_SIGNAL=0
 GUARD_BOUND=0
 GUARD_SOURCE=''
@@ -40,6 +41,53 @@ guard_remove_rules() {
     done
     return "$status"
 }
+guard_mapping_witness_identity() {
+    local identity run scenario role network pid running entry facts
+    facts=$(docker inspect -f '{{.Id}}|{{index .Config.Labels "gitdaemon.run"}}|{{index .Config.Labels "gitdaemon.scenario"}}|{{index .Config.Labels "gitdaemon.role"}}|{{.HostConfig.NetworkMode}}|{{.State.Pid}}|{{.State.Running}}' "gm-$RUN-witness") || return 80
+    IFS='|' read -r identity run scenario role network pid running <<< "$facts"
+    [[ $identity =~ ^[0-9a-f]{64}$ && $run == "$RUN" && $scenario == mapping && $role == witness && $network == "gm-$RUN-w-net" && $pid =~ ^[1-9][0-9]*$ && $running == true ]] || return 80
+    RESOURCE_RUN=$RUN resource_ledger_load "$E/control/resources" || return 80
+    entry=${RESOURCE_LEDGER_ACTIVE["container|$identity"]:-}
+    [[ $entry == *'|mapping|witness|'* && $entry == *"|$RUN" ]] || return 80
+    RESOURCE_RUN=$RUN resource_verify_object container "$identity" mapping witness '' || return 80
+    if [[ -n ${GUARD_MAPPING_WITNESS_ID:-} && $identity != "$GUARD_MAPPING_WITNESS_ID" ]]; then return 80; fi
+    printf '%s\n' "$pid"
+}
+guard_mapping_witness_remove() {
+    local i table rule status=0 pid
+    local -a args
+    if [[ ${#OWN_NS_RULES[@]} == 0 && ${#OWN_NS_CHAINS[@]} == 0 ]]; then return 0; fi
+    pid=$(guard_mapping_witness_identity) || return 2
+    for ((i=${#OWN_NS_RULES[@]}-1;i>=0;i--)); do
+        table=${OWN_NS_RULES[i]%%|*}; rule=${OWN_NS_RULES[i]#*|}
+        read -ra args <<< "$rule"; args[0]=-D
+        nsenter -t "$pid" -n iptables -t "$table" "${args[@]}" || status=2
+    done
+    for ((i=${#OWN_NS_CHAINS[@]}-1;i>=0;i--)); do
+        table=${OWN_NS_CHAINS[i]%%|*}; rule=${OWN_NS_CHAINS[i]#*|}
+        nsenter -t "$pid" -n iptables -t "$table" -X "$rule" || status=2
+    done
+    if (( status == 0 )); then OWN_NS_RULES=() OWN_NS_CHAINS=(); fi
+    return "$status"
+}
+guard_mapping_witness_install() {
+    local pid proto port spec chain="MS$RUN"
+    GUARD_MAPPING_WITNESS_ID=$(docker inspect -f '{{.Id}}' "gm-$RUN-witness") || return 80
+    pid=$(guard_mapping_witness_identity) || return 80
+    nsenter -t "$pid" -n iptables -t raw -N "$chain" || return 80
+    OWN_NS_CHAINS+=("raw|$chain")
+    printf 'raw|%s\n' "$chain" >> "$E/witness-chains.owned" || return 80
+    for spec in 'tcp 19419' 'udp 53' 'tcp 53'; do
+        read -r proto port <<< "$spec"
+        nsenter -t "$pid" -n iptables -t raw -A "$chain" -p "$proto" --dport "$port" -j RETURN || return 80
+        OWN_NS_RULES+=("raw|-A $chain -p $proto --dport $port -j RETURN")
+        printf 'raw|-A %s -p %s --dport %s -j RETURN\n' "$chain" "$proto" "$port" >> "$E/witness-rules.owned" || return 80
+    done
+    nsenter -t "$pid" -n iptables -t raw -I PREROUTING -j "$chain" || return 80
+    OWN_NS_RULES+=("raw|-I PREROUTING -j $chain")
+    printf 'raw|-I PREROUTING -j %s\n' "$chain" >> "$E/witness-rules.owned" || return 80
+    return 0
+}
 # 逐条登记已成功安装的规则，部分安装失败也能精确回滚。
 guard_rule() {
     local table=$1; shift
@@ -67,8 +115,9 @@ guard_write_recovery() {
         printf 'RUN=%q\nRUNNER=%q\n' "$RUN" "$RUNNER"
         printf 'SOURCE=%q\nMANIFEST=%q\nATTESTATION=%q\n' "$GUARD_SOURCE" "$GUARD_MANIFEST" "$GUARD_ATTESTATION"
         printf 'LEDGER_DIR=%q\nLIB_HASH=%q\nLEDGER_HASH=%q\n' "$ledger_dir" "$lib_hash" "$ledger_hash"
-        declare -p OWN_RULES OWN_CHAINS
-        declare -f guard_remove_rules
+        declare -p OWN_RULES OWN_CHAINS OWN_NS_RULES OWN_NS_CHAINS
+        printf 'GUARD_MAPPING_WITNESS_ID=%q\nE=%q\n' "${GUARD_MAPPING_WITNESS_ID:-}" "$E"
+        declare -f guard_remove_rules guard_mapping_witness_identity guard_mapping_witness_remove
         resource_recovery_embed
         cat <<'RECOVERY'
 # 管理员须先确认本轮 runner 已停止，再显式授权恢复。
@@ -89,6 +138,7 @@ if [[ -n $LEDGER_HASH ]]; then
     [[ $(sha256sum "$LEDGER_DIR/ledger.tsv" | cut -d' ' -f1) == "$LEDGER_HASH" ]] || exit 77
 fi
 RESOURCE_LEDGER_DIR=$LEDGER_DIR RESOURCE_RUN=$RUN
+guard_mapping_witness_remove || exit 2
 resource_cleanup "$LEDGER_DIR" || exit 2
 guard_remove_rules
 RECOVERY
@@ -141,10 +191,15 @@ guard_cleanup() {
             docker logs "$item" > "$E/container-$item.log" 2>&1 || clean=2
         done
         # 精确删除：交叉验证通过与登记身份/标签、卷身份摘要一致才删除；差异即停止。
+        if [[ ${#OWN_NS_RULES[@]} != 0 || ${#OWN_NS_CHAINS[@]} != 0 ]]; then
+            guard_mapping_witness_remove || { clean=2; isolated=0; }
+        fi
         RESOURCE_LEDGER_DIR=$E/control/resources RESOURCE_RUN=$RUN
-        if ! resource_cleanup "$E/control/resources"; then
-            clean=2
-            isolated=0
+        if (( isolated )); then
+            if ! resource_cleanup "$E/control/resources"; then
+                clean=2
+                isolated=0
+            fi
         fi
         residual=$(docker ps -aq --filter "label=gitdaemon.run=$RUN") || { clean=2; isolated=0; }
         printf '%s\n' "$residual" > "$E/residual-containers.txt"
@@ -304,6 +359,9 @@ guard_mapping_release_verify() {
 
 guard_mapping_release() {
     local generation=${1:-} network_id=${2:-} profile_sha256=${3:-} rules_start=${4:-}
+    if [[ ${#OWN_NS_RULES[@]} != 0 || ${#OWN_NS_CHAINS[@]} != 0 ]]; then
+        guard_mapping_witness_remove || return 2
+    fi
     guard_mapping_release_verify "$generation" "$network_id" "$profile_sha256" || return $?
     guard_remove_rules_since "$rules_start" || return $?
     guard_mapping_generation mapping-release "$generation" "$network_id" "$profile_sha256"
@@ -343,11 +401,13 @@ guard_mapping_rules() {
 }
 # 保存映射两端原始计数：发起端 iptables-save -c 与接收端见证链。
 guard_mapping_snapshot() {
-    local seq=$1 pid
-    iptables-save -c > "$E/mapping-snapshot-$seq.rules"
-    pid=$(docker inspect -f '{{.State.Pid}}' "gm-$RUN-witness") || return $?
-    nsenter -t "$pid" -n iptables -t raw -nvxL "MS$RUN" > "$E/mapping-snapshot-$seq.witness"
-    chmod a+r "$E/mapping-snapshot-$seq.rules" "$E/mapping-snapshot-$seq.witness"
+    local seq=$1 pid counts
+    iptables-save -c > "$E/mapping-snapshot-$seq.rules" || return 80
+    pid=$(guard_mapping_witness_identity) || return 80
+    nsenter -t "$pid" -n iptables -t raw -nvxL "MS$RUN" > "$E/mapping-snapshot-$seq.witness" || return 80
+    counts=$(mapping_witness "$E/mapping-snapshot-$seq.witness") || return 80
+    [[ -n $counts ]] || return 80
+    chmod a+r "$E/mapping-snapshot-$seq.rules" "$E/mapping-snapshot-$seq.witness" || return 80
     return 0
 }
 
@@ -430,10 +490,11 @@ guard_mapping_control_prepare() {
 
 # 激活 READY：先迁移状态并安装规则，再通过安全写入器固化本代 network state。
 guard_mapping_ready_activate() {
-    local generation=$1 network_id=$2 profile_sha256=$3
+    local generation=$1 network_id=$2 profile_sha256=$3 state
     guard_mapping_generation mapping-ready "$generation" "$network_id" "$profile_sha256" || return $?
     rules_start=${#OWN_RULES[@]}
     guard_mapping_rules "$GUARD_PROFILE" "$network_id" || return $?
+    guard_mapping_witness_install || return 80
     IT_CONTROL_DIR=$E/control
     state=$(MAPPING_ASSERT_GENERATION="$generation" mapping_network_state_file) || return 80
     mkdir -p "${state%/*}" || return 80

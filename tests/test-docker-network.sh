@@ -698,13 +698,14 @@ STUB
             mkdir -p "$E/control"
             GUARD_MAPPING_CONTROL_IDENTITY=$(guard_mapping_directory_identity "$E/control") || return 1
             guard_mapping_rules() { printf 'rules\n' >> "$FULL_READY_TRACE"; }
+            guard_mapping_witness_install() { printf 'witness\n' >> "$FULL_READY_TRACE"; }
             guard_mapping_state_write() { printf 'state %s %s %s %s\n' "$@" >> "$FULL_READY_TRACE"; }
             guard_mapping_ack_publish() { printf 'ack\n' >> "$FULL_READY_TRACE"; printf '%s %s\n' "$4" "$5" > "$1/ack-$3"; }
             export FULL_READY_TRACE
             seq=1 last_nonce=''
             guard_full_mapping_request mapping-ready generation-1 net-1 profile nonce-1 || rc=$?
             [[ $rc == 0 ]] || return 1
-            [[ $(cat "$FULL_READY_TRACE") == $'rules\nstate '"$E/control/generations/generation-1/mapping-network.tsv"$' generation-1 net-1 profile\nack' ]] || return 1
+            [[ $(cat "$FULL_READY_TRACE") == $'rules\nwitness\nstate '"$E/control/generations/generation-1/mapping-network.tsv"$' generation-1 net-1 profile\nack' ]] || return 1
             [[ $GUARD_MAPPING_STATE == ACTIVE && ${rules_start:-} == 0 && -f $E/control/ack-1 ]] || return 1
             : > "$FULL_READY_TRACE"
             rm -rf "$E/control"
