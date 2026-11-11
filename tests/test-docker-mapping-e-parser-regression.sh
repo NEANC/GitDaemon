@@ -12,13 +12,14 @@ profile_write() {
 }
 
 snapshot_write() {
-    local file=$1 target=$2 value=$3 key spec proto port dest count
+    local file=$1 target=$2 value=$3 other=${4:-} other_value=${5:-0} key spec proto port dest count
     : > "$file"
     for key in $MAPPING_WITNESS_KEYS; do
         spec=$(mapping_witness_spec "$key")
         IFS=$'\t' read -r proto port dest <<< "$spec"
         count=0
         [[ $key != "$target" ]] || count=$value
+        [[ $key != "$other" ]] || count=$other_value
         printf '[%s:0] -A MEmtest -i mmtest -s 140.82.112.10/32 -d %s/32 -p %s --dport %s -m comment --comment "mtest-%s" -j DROP\n' "$count" "$dest" "$proto" "$port" "$key" >> "$file"
     done
 }
@@ -36,6 +37,40 @@ witness_write() {
     done
 }
 
+receiver_growth_case() (
+    local key=$1 receiver=$2 count=0 rc=0
+    mkdir -p "$WORK/receiver-$key/control"
+    IT_CONTROL_DIR=$WORK/receiver-$key/control MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
+    MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=netid-abc MAPPING_ASSERT_TARGET=$key
+    mapping_control_request() {
+        count=$((count + 1))
+        CONTROL_SEQ=$count
+        snapshot_write "$WORK/receiver-$key/mapping-snapshot-$count.rules" "$key" "$((count - 1))"
+        witness_write "$WORK/receiver-$key/mapping-snapshot-$count.witness" "$receiver" "$((count - 1))"
+    }
+    mapping_probe_egress() { [[ $3 == "$key" ]]; }
+    mapping_isolation_check product gen1 "$WORK/profile" || rc=$?
+    [[ $rc == 1 && $count == 2 ]]
+)
+
+shared_target_case() (
+    local count=0 rc=0 before after
+    mkdir -p "$WORK/shared-target/control"
+    IT_CONTROL_DIR=$WORK/shared-target/control MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
+    MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=netid-abc MAPPING_ASSERT_TARGET=cross-network
+    mapping_control_request() {
+        count=$((count + 1))
+        CONTROL_SEQ=$count
+        snapshot_write "$WORK/shared-target/mapping-snapshot-$count.rules" cross-network "$((count - 1))" host-published "$((count - 1))"
+        witness_write "$WORK/shared-target/mapping-snapshot-$count.witness" none 0
+    }
+    mapping_probe_egress() { [[ $3 == cross-network ]]; }
+    mapping_isolation_check product gen1 "$WORK/profile" || rc=$?
+    before=$WORK/shared-target/mapping-snapshot-1.rules
+    after=$WORK/shared-target/mapping-snapshot-2.rules
+    [[ $rc == 0 && $count == 2 && $(mapping_count "$before" "$WORK/profile" cross-network) == 0 && $(mapping_count "$after" "$WORK/profile" cross-network) == 1 && $(mapping_count "$after" "$WORK/profile" host-published) == 1 ]]
+)
+
 isolation_case() (
     local mode=$1 target=$2 expected=$3 count=0 rc=0
     mkdir -p "$WORK/$mode/control"
@@ -52,15 +87,16 @@ isolation_case() (
     [[ $rc == "$expected" && $count == 2 ]]
 )
 
-dns_tcp_mixed_error() (
-    local rc=0
+dns_tcp_case() (
+    local response=$1 expected=$2 rc=0
+    local -a removed=()
     MP_RUN_ID=mtest MP_NETWORK_NAME=gm-mtest-m-net MPF_SCENARIO=mapping-fallback MPF_TOOLS_IMAGE=tools
     mapping_fixture_state_load() { return 0; }
     resource_ledger_dir() { printf '%s\n' "$WORK"; }
     resource_crosscheck() { return 0; }
     resource_verify_object() { return 0; }
     mapping_fixture_create() { printf '%064d\n' 2; }
-    resource_remove() { return 0; }
+    resource_remove() { removed+=("$1:$2"); }
     mapping_fixture_docker() {
         case "$1" in
             inspect)
@@ -69,12 +105,12 @@ dns_tcp_mixed_error() (
                 else printf 'container:%064d|10001:10001|true|tools|true|["ALL"]|["no-new-privileges"]\n' 1; fi ;;
             start) return 0 ;;
             exec)
-                printf ';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached\n;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 10\n'
+                printf '%s\n' "$response"
                 return 9 ;;
         esac
     }
     mapping_probe_egress product gen1 dns-tcp >/dev/null || rc=$?
-    [[ $rc == 80 ]]
+    [[ $rc == "$expected" && ${#removed[@]} == 1 && ${removed[0]} == "container:$(printf '%064d' 2)" ]]
 )
 
 profile_write
@@ -83,5 +119,11 @@ for row in 'healthy cross-network 0' 'shared-other host-published 1' 'receiver-c
     read -r mode target expected <<< "$row"
     isolation_case "$mode" "$target" "$expected" || { printf 'FAIL %s\n' "$mode"; failed=1; }
 done
-dns_tcp_mixed_error || { printf 'FAIL dns-tcp-mixed-error\n'; failed=1; }
+for row in 'cross-network 19419' 'host-published 19419' 'host-input 19420' 'dns-udp udp' 'dns-tcp tcp'; do
+    read -r key receiver <<< "$row"
+    receiver_growth_case "$key" "$receiver" || { printf 'FAIL receiver-%s\n' "$key"; failed=1; }
+done
+shared_target_case || { printf 'FAIL shared-target\n'; failed=1; }
+dns_tcp_case $';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached\n;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 10' 80 || { printf 'FAIL dns-tcp-mixed-error\n'; failed=1; }
+dns_tcp_case $';; communications error to 172.30.244.53#53: timed out\n;; no servers could be reached' 0 || { printf 'FAIL dns-tcp-timeout\n'; failed=1; }
 exit "$failed"
