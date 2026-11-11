@@ -506,7 +506,7 @@ mapping_probe_egress() {
                     resource_verify_object container "$tool" "$MPF_SCENARIO" tcp-dns ''; then
                     if mapping_fixture_docker start "$tool" >/dev/null; then
                         facts=$(mapping_fixture_docker inspect -f '{{.HostConfig.NetworkMode}}|{{.Config.User}}|{{.State.Running}}|{{.Image}}|{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|{{json .HostConfig.SecurityOpt}}' "$tool") || facts=''
-                        if [[ $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE|true|[\"ALL\"]|[\"no-new-privileges\"]" ]]; then
+                        if [[ $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE|true|[\"ALL\"]|[\"no-new-privileges\"]" || $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE|true|[\"ALL\"]|[\"no-new-privileges:true\"]" ]]; then
                             printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product_id"
                             status=0
                             output=$(mapping_fixture_docker exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A 2>&1) || status=$?
@@ -546,7 +546,7 @@ mapping_isolation_check() {
     [[ -n $base ]] || return 1
     network_control mapping-snapshot || return $?
     seq_before=${CONTROL_SEQ:-0}
-    mapping_probe_egress "$product" "$generation" || return 1
+    mapping_probe_egress "$product" "$generation" || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
     network_control mapping-snapshot || return $?
     seq_after=${CONTROL_SEQ:-0}
     before=$base/mapping-snapshot-$seq_before.rules
