@@ -112,6 +112,9 @@ mapping_control_request mapping-snapshot gen1 netid-abc
 file=$WORK/mapping-snapshot-$CONTROL_SEQ.witness
 [[ $(mapping_witness "$file") == $'0\n0\n0\n0' ]]
 if witness_chain_counts "$file" >/dev/null 2>&1; then exit 1; fi
+printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n' > "$WORK/network.witness"
+[[ $(witness_chain_counts "$WORK/network.witness") == $'0\n0\n0' ]]
+if mapping_witness "$WORK/network.witness" >/dev/null 2>&1; then exit 1; fi
 if mapping_witness_growth $'0\n0\n0\n0' $'1\n0\n0\n0' host-input; then exit 1; fi
 if mapping_witness_growth $'0\n0\n0\n0' $'1\n1\n0\n0' cross-network; then exit 1; fi
 mapping_witness_growth $'0\n0\n0\n0' $'1\n0\n0\n0' host-published
@@ -128,3 +131,47 @@ guard_mapping_witness_install
 [[ ${#OWN_NS_RULES[@]} == 5 ]]
 grep -q -- '-A MSmtest -p tcp --dport 19420 -j RETURN' "$WORK/guard-calls"
 grep -q -- '-A MSmtest -p tcp --dport 19420 -j RETURN' "$WORK/witness-rules.owned"
+
+scenario_calibration_contract() (
+    local selected=$1 expected=$2 rc=0
+    MAPPING_PROFILE=$profile MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CASE=$selected
+    MAPPING_ASSERT_CALIBRATED_GENERATION='' MP_WITNESS_CALIBRATED=0
+    : > "$WORK/scenario-probes"
+    rm -f "$WORK/product-started"
+    mapping_scenario_fixture_prepare() { return 0; }
+    mapping_proxy_calibrate() { return 0; }
+    mapping_receiver_witness_counts() {
+        local cross=0 input=0 udp=0 tcp=0 name
+        while IFS= read -r name; do
+            case "$name" in
+                cross-network|host-published) cross=$((cross + 1)) ;;
+                host-input) input=$((input + 1)) ;;
+                dns-udp) udp=$((udp + 1)) ;;
+                dns-tcp) tcp=$((tcp + 1)) ;;
+            esac
+        done < "$WORK/scenario-probes"
+        printf '%s\n%s\n%s\n%s\n' "$cross" "$input" "$udp" "$tcp"
+    }
+    mapping_receiver_probe() {
+        [[ $expected != missing ]] || return 80
+        [[ $expected != paused || $1 != dns-tcp ]] || return 1
+        printf '%s\n' "$1" >> "$WORK/scenario-probes"
+    }
+    mapping_scenario_product_up() { : > "$WORK/product-started"; return 80; }
+    mapping_scenario_evidence fallback mapping-fallback gen1 "$WORK" || rc=$?
+    if [[ $selected == isolation/* ]]; then
+        if [[ $expected == healthy ]]; then
+            [[ $rc == 80 && -e $WORK/product-started && $MP_WITNESS_CALIBRATED == 1 ]] || return 1
+            [[ $(wc -l < "$WORK/scenario-probes") == 5 ]] || return 1
+        else
+            [[ $rc == 80 && ! -e $WORK/product-started && $MP_WITNESS_CALIBRATED == 0 ]] || return 1
+        fi
+    else
+        [[ $rc == 80 && -e $WORK/product-started && ! -s $WORK/scenario-probes ]] || return 1
+    fi
+)
+
+scenario_calibration_contract isolation/cross-network healthy
+scenario_calibration_contract isolation/cross-network missing
+scenario_calibration_contract isolation/cross-network paused
+scenario_calibration_contract '' healthy

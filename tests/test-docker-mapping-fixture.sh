@@ -472,25 +472,27 @@ mapping_counter_missing_or_duplicate_fails() {
 
 # 见证校准：以接收端计数增量为判据；接收端在跑但计数不增长必须被判失败。
 mapping_witness_pause_detected() {
-    local base=$WORK/profile/base.tsv failed=0 rc=0 file=$WORK/witness.txt counter=$WORK/wcount
+    local base=$WORK/profile/base.tsv failed=0 rc=0 file=$WORK/witness.txt counter=$WORK/wcount key
     printf '0\n' > "$counter"
     WITNESS_STATIC=0
-    docker() {
-        case "$*" in
-            *'nvxL'*)
-                local n=0
-                if [[ ${WITNESS_STATIC:-0} != 1 ]]; then
-                    n=$(cat "$counter")
-                    n=$((n + 1))
-                    printf '%s\n' "$n" > "$counter"
-                fi
-                printf '%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n' "$n"
-                printf '%s 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n' "$n"
-                printf '%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n' "$n"
-                ;;
-            *) return 0 ;;
+    IT_CONTROL_DIR=$WORK/control MAPPING_ASSERT_GENERATION=gen1 MP_NETWORK_ID=netid-abc
+    mkdir -p "$IT_CONTROL_DIR"
+    mapping_control_request() {
+        local n
+        [[ $1 == mapping-snapshot && $2 == gen1 && $3 == netid-abc ]] || return 65
+        n=$(cat "$counter")
+        CONTROL_SEQ=$((CONTROL_SEQ + 1))
+        printf '%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19420\n%s 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n%s 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n' "$n" "$(cat "$WORK/host-input-count")" "$(cat "$WORK/dns-udp-count")" "$(cat "$WORK/dns-tcp-count")" > "$WORK/mapping-snapshot-$CONTROL_SEQ.witness"
+    }
+    mapping_receiver_probe() {
+        [[ ${WITNESS_STATIC:-0} != 1 ]] || return 0
+        case "$1" in
+            cross-network|host-published) printf '%s\n' "$(($(cat "$counter") + 1))" > "$counter" ;;
+            host-input) printf '%s\n' "$(($(cat "$WORK/host-input-count") + 1))" > "$WORK/host-input-count" ;;
+            dns-udp|dns-tcp) printf '%s\n' "$(($(cat "$WORK/$1-count") + 1))" > "$WORK/$1-count" ;;
         esac
     }
+    for key in host-input dns-udp dns-tcp; do printf '0\n' > "$WORK/$key-count"; done
     MP_WITNESS_CALIBRATED=0
     mapping_calibrate_witness "$base" || { printf 'healthy calibration failed\n'; failed=1; }
     [[ $MP_WITNESS_CALIBRATED == 1 ]] || { printf 'calibration flag unset\n'; failed=1; }
@@ -504,15 +506,17 @@ mapping_witness_pause_detected() {
     WITNESS_STATIC=0
     # 双端见证：接收端计数解析与 UDP/TCP 协议校准。
     printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n' > "$file"
+    printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19420\n' >> "$file"
     printf '0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n' >> "$file"
     printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n' >> "$file"
-    [[ $(mapping_witness "$file" | tr '\n' ' ') == '0 0 0 ' ]] || { printf 'witness parse failed\n'; failed=1; }
+    [[ $(mapping_witness "$file" | tr '\n' ' ') == '0 0 0 0 ' ]] || { printf 'witness parse failed\n'; failed=1; }
+    if witness_chain_counts "$file" >/dev/null 2>&1; then printf 'old network accepted mapping key\n'; failed=1; fi
     mapping_witness_delta $'0\n0\n0' $'0\n1\n0' udp || { printf 'udp delta rejected\n'; failed=1; }
     mapping_witness_delta $'0\n0\n0' $'0\n0\n1' tcp || { printf 'tcp delta rejected\n'; failed=1; }
     if mapping_witness_delta $'0\n0\n0' $'0\n0\n1' udp; then printf 'tcp growth accepted as udp\n'; failed=1; fi
     if mapping_witness_delta $'0\n0\n0' $'0\n1\n1' udp; then printf 'multi growth accepted\n'; failed=1; fi
-    mapping_witness_growth $'0\n0\n0' $'1\n2\n3' || { printf 'growth rejected\n'; failed=1; }
-    if mapping_witness_growth $'0\n0\n0' $'1\n2\n0'; then printf 'zero increment accepted\n'; failed=1; fi
+    mapping_witness_growth $'0\n0\n0\n0' $'1\n0\n0\n0' host-published || { printf 'growth rejected\n'; failed=1; }
+    if mapping_witness_growth $'0\n0\n0\n0' $'0\n0\n0\n0' host-input; then printf 'zero increment accepted\n'; failed=1; fi
     return "$failed"
 }
 

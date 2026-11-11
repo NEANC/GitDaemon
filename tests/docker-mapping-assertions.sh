@@ -380,9 +380,12 @@ mapping_scenario_fixture_prepare() {
 # 代理校准：先证接受端口可达、拒绝端口 403、计数增长，再写 proxy.before 基线。
 mapping_scenario_calibrate() {
     local kind=${1:-} scenario=${2:-} dir=${3:-}
-    MAPPING_ASSERT_CALIBRATED_GENERATION=''
+    MAPPING_ASSERT_CALIBRATED_GENERATION='' MP_WITNESS_CALIBRATED=0
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_proxy_calibrate "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == isolation || ${MAPPING_ASSERT_CASE:-} == isolation/* ]]; then
+        mapping_calibrate_witness "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
+    fi
     MAPPING_ASSERT_CALIBRATED_GENERATION=$MAPPING_ASSERT_GENERATION
     return 0
 }
