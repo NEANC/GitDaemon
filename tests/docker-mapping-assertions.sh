@@ -860,8 +860,17 @@ mapping_tls_upstream_ca_run() {
     mapping_assert_uint "$dial_after" >/dev/null || return 80
     before=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
     (( dial_after > before )) || return 1
+    [[ -f $dir/refs.expected && -f $dir/head.expected && -f $dir/control/unique-commit && ! -L $dir/refs.expected && ! -L $dir/head.expected && ! -L $dir/control/unique-commit ]] || return 80
+    mapping_assert_identity_load "$dir" || return 80
+    [[ $MPA_UNIQUE_COMMIT == "$(sed -n '1p' "$dir/control/unique-commit")" ]] || return 1
     mapping_scenario_local_refs "$kind" "$scenario" "$dir" > "$dir/refs.actual" || return 80
-    cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
+    mapping_scenario_local_head "$kind" "$scenario" "$dir" > "$dir/head.actual" || return 80
+    mapping_scenario_local_fsck "$kind" "$scenario" "$dir" > "$dir/fsck.exit" || return 80
+    mapping_assert_refs_match "$dir" || return 1
+    mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 1
+    mapping_assert_head_match "$dir" || return 1
+    rc=$(mapping_assert_uint_file "$dir/fsck.exit") || return 80
+    [[ $rc == 0 ]] || return 1
     return 0
 }
 

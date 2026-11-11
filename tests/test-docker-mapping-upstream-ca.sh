@@ -37,7 +37,13 @@ upstream_ca_git_8443_restores_refs() {
         printf '同步传输路径：配置的 HTTPS 代理\n'
     }
     mapping_scenario_local_refs() { printf 'abc\trefs/heads/main\n'; }
+    mapping_scenario_local_head() { printf 'abc\n'; }
+    mapping_scenario_local_fsck() { printf '0\n'; }
     printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"
+    printf 'abc\n' > "$dir/head.expected"
+    mkdir -p "$dir/control"
+    printf 'abc\n' > "$dir/control/unique-commit"
+    printf 'run_id\tr1\nscenario\tmapping-fallback\ngeneration\tg1\nnetwork_id\tn1\nimage_id\ti1\nprofile_sha256\tp1\ninput_sha256\ta1\nmanifest_sha256\tm1\nunique_commit\tabc\n' > "$dir/identity.tsv"
     printf '0\n' > "$dir/proxy-count" "$dir/dial-count"
     mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
     [[ $rc == 0 && $(cat "$dir/baseline.exit") == 0 && $(cat "$dir/request.exit") == 128 && $(cat "$dir/recovery.exit") == 0 ]] || return 1
@@ -45,11 +51,73 @@ upstream_ca_git_8443_restores_refs() {
     [[ $(cat "$dir/upstream.before") == 1 && $(cat "$dir/upstream.after") == 2 ]] || return 1
     [[ $(cat "$dir/tls-layer.tsv") == *$'layer\tinner-failure'* ]] || return 1
     cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
+    cmp -s "$dir/head.expected" "$dir/head.actual" || return 1
+    [[ $(cat "$dir/fsck.exit") == 0 ]] || return 1
     mapping_negative_rejected wrong_upstream_ca fallback "$dir" || return 1
     [[ $MAPPING_ASSERT_REJECT_LAYER == tls-upstream ]] || return 1
     [[ $(wc -l < "$dir/calls") == 3 ]] || return 1
     grep -Fq 'PROXY_URL=https://gm-proxy:8443' "$dir/calls" || return 1
     ! grep -Eq '8444|--insecure|--proxy-insecure' "$dir/calls"
+}
+
+upstream_ca_recovery_requires_complete_positive_evidence() {
+    local mode dir rc n
+    for mode in stale-ref bad-head missing-object missing-refs missing-head missing-fsck invalid-fsck failed-head absent-unique absent-identity mismatched-identity; do
+        dir=$(mktemp -d)
+        MAPPING_PRODUCT_IMAGE=product MAPPING_PROXY_HOST=gm-proxy MAPPING_PROXY_ACCEPT_PORT=8443
+        MAPPING_CLIENT_UPSTREAM_CA=/ca/upstream-ca.crt MAPPING_CLIENT_PROXY_CA=/ca/proxy-ca.crt
+        MAPPING_UPSTREAM_HOST=github.com MAPPING_UPSTREAM_OWNER=acme MAPPING_UPSTREAM_REPO=demo
+        MAPPING_PROXY_AUTHORITY=github.com:443 MAPPING_UPSTREAM_PORT=443 MP_U=140.82.112.9
+        mkdir -p "$dir/control"
+        if [[ $mode != absent-unique ]]; then printf 'abc\n' > "$dir/control/unique-commit"; fi
+        if [[ $mode != absent-identity ]]; then
+            printf 'run_id\tr1\nscenario\tmapping-fallback\ngeneration\tg1\nnetwork_id\tn1\nimage_id\ti1\nprofile_sha256\tp1\ninput_sha256\ta1\nmanifest_sha256\tm1\nunique_commit\tabc\n' > "$dir/identity.tsv"
+        fi
+        if [[ $mode == mismatched-identity ]]; then printf 'different\n' > "$dir/control/unique-commit"; fi
+        mapping_profile_load() { MP_U=140.82.112.9; }
+        mapping_proxy_count_read_remote() { cat "$dir/proxy-count"; }
+        mapping_scenario_upstream_count() { cat "$dir/dial-count"; }
+        mapping_scenario_connect_evidence() {
+            for ((n=0; n<$(cat "$dir/proxy-count"); n++)); do
+                printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
+            done
+        }
+        mapping_negative_wrong_ca() { : > "$dir/injected"; }
+        mapping_negative_upstream_ca_restore() { : > "$dir/restored"; }
+        mapping_fixture_docker() {
+            n=$(cat "$dir/proxy-count"); printf '%s\n' "$((n+1))" > "$dir/proxy-count"
+            n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
+            if [[ -f $dir/injected && ! -f $dir/restored ]]; then
+                printf 'fatal: SSL certificate problem\n'
+                return 128
+            fi
+            printf '同步传输路径：配置的 HTTPS 代理\n'
+        }
+        mapping_scenario_local_refs() {
+            [[ $mode != missing-refs ]] || return 9
+            printf 'abc\trefs/heads/main\n'
+        }
+        mapping_scenario_local_head() {
+            [[ $mode != missing-head && $mode != failed-head ]] || return 9
+            if [[ $mode == bad-head ]]; then printf 'other\n'; else printf 'abc\n'; fi
+        }
+        mapping_scenario_local_fsck() {
+            [[ $mode != missing-fsck ]] || return 9
+            if [[ $mode == missing-object ]]; then printf '1\n'; elif [[ $mode == invalid-fsck ]]; then printf 'invalid\n'; else printf '0\n'; fi
+        }
+        printf '0\n' > "$dir/proxy-count" "$dir/dial-count"
+        printf 'abc\n' > "$dir/head.expected"
+        if [[ $mode == stale-ref ]]; then printf 'other\trefs/heads/main\n' > "$dir/refs.expected"; else printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"; fi
+        rc=0
+        mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
+        if [[ $mode == missing-refs || $mode == missing-head || $mode == missing-fsck || $mode == invalid-fsck || $mode == failed-head || $mode == absent-unique || $mode == absent-identity ]]; then
+            [[ $rc == 80 ]] || { printf '%s: expected 80, got %s\n' "$mode" "$rc" >&2; return 1; }
+        else
+            [[ $rc == 1 ]] || { printf '%s: expected 1, got %s\n' "$mode" "$rc" >&2; return 1; }
+        fi
+        [[ -f $dir/restored && $(cat "$dir/baseline.exit") == 0 && $(cat "$dir/request.exit") == 128 && $(cat "$dir/recovery.exit") == 0 ]] || { printf '%s: missing recovery evidence\n' "$mode" >&2; return 1; }
+        grep -Fq 'SSL certificate problem' "$dir/request.failed.log" || { printf '%s: missing failure log\n' "$mode" >&2; return 1; }
+    done
 }
 
 upstream_ca_wrong_layer_is_assertion_not_fixture() {
@@ -252,7 +320,7 @@ upstream_ca_entry_rejects_invalid_git_evidence() {
 }
 
 failed=0
-for name in upstream_ca_git_8443_restores_refs upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture upstream_ca_entry_preserves_evidence_verdict upstream_ca_entry_rejects_invalid_git_evidence; do
+for name in upstream_ca_git_8443_restores_refs upstream_ca_recovery_requires_complete_positive_evidence upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture upstream_ca_entry_preserves_evidence_verdict upstream_ca_entry_rejects_invalid_git_evidence; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
