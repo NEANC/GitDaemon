@@ -62,7 +62,7 @@ upstream_ca_git_8443_restores_refs() {
 
 upstream_ca_recovery_requires_complete_positive_evidence() {
     local mode dir rc n
-    for mode in stale-ref bad-head missing-object missing-refs missing-head missing-fsck invalid-fsck failed-head absent-unique absent-identity mismatched-identity; do
+    for mode in stale-ref equal-stale-refs bad-head missing-object missing-refs missing-head missing-fsck invalid-fsck failed-head absent-unique absent-identity mismatched-identity; do
         dir=$(mktemp -d)
         MAPPING_PRODUCT_IMAGE=product MAPPING_PROXY_HOST=gm-proxy MAPPING_PROXY_ACCEPT_PORT=8443
         MAPPING_CLIENT_UPSTREAM_CA=/ca/upstream-ca.crt MAPPING_CLIENT_PROXY_CA=/ca/proxy-ca.crt
@@ -95,7 +95,7 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
         }
         mapping_scenario_local_refs() {
             [[ $mode != missing-refs ]] || return 9
-            printf 'abc\trefs/heads/main\n'
+            if [[ $mode == equal-stale-refs ]]; then printf 'old\trefs/heads/main\n'; else printf 'abc\trefs/heads/main\n'; fi
         }
         mapping_scenario_local_head() {
             [[ $mode != missing-head && $mode != failed-head ]] || return 9
@@ -107,9 +107,14 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
         }
         printf '0\n' > "$dir/proxy-count" "$dir/dial-count"
         printf 'abc\n' > "$dir/head.expected"
-        if [[ $mode == stale-ref ]]; then printf 'other\trefs/heads/main\n' > "$dir/refs.expected"; else printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"; fi
+        if [[ $mode == stale-ref ]]; then printf 'other\trefs/heads/main\n' > "$dir/refs.expected"; elif [[ $mode == equal-stale-refs ]]; then printf 'old\trefs/heads/main\n' > "$dir/refs.expected"; else printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"; fi
         rc=0
         mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
+        if [[ $mode == equal-stale-refs ]]; then
+            cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
+            ! mapping_assert_refs_contain "$dir/refs.expected" abc || return 1
+            ! mapping_assert_refs_contain "$dir/refs.actual" abc || return 1
+        fi
         if [[ $mode == missing-refs || $mode == missing-head || $mode == missing-fsck || $mode == invalid-fsck || $mode == failed-head || $mode == absent-unique || $mode == absent-identity ]]; then
             [[ $rc == 80 ]] || { printf '%s: expected 80, got %s\n' "$mode" "$rc" >&2; return 1; }
         else
