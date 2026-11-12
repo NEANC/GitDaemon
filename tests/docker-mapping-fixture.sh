@@ -480,6 +480,60 @@ mapping_receiver_probe() {
     return 0
 }
 
+mapping_receiver_listener_control() {
+    local key=${1:-} signal=${2:-} expected=${3:-} receiver="gm-$MP_RUN_ID-witness" port process pids
+    mapping_witness_key_valid "$key" || return 80
+    case "$key" in
+        cross-network|host-published) port=19419; process=nc ;;
+        host-input) port=19420; process=nc ;;
+        dns-udp|dns-tcp) port=53; process=dnsmasq ;;
+    esac
+    [[ $signal == STOP || $signal == CONT ]] || return 80
+    [[ $signal != CONT || $expected =~ ^[0-9]+$ ]] || return 80
+    if [[ $signal == CONT ]]; then
+        mapping_fixture_docker exec "$receiver" kill -CONT "$expected" >/dev/null || return 80
+        printf '%s\n' "$expected"
+        return 0
+    fi
+    pids=$(mapping_fixture_docker exec "$receiver" sh -c '
+        for path in /proc/[0-9]*; do
+            IFS= read -r comm < "$path/comm" 2>/dev/null || continue
+            case "$comm" in "$1"|busybox) ;; *) continue ;; esac
+            args=$(tr "\000" " " < "$path/cmdline" 2>/dev/null) || continue
+            case "$args" in
+                *"nc -lk -p $2 -e /bin/cat"*) [ "$1" = nc ] || continue ;;
+                dnsmasq\ *|*/dnsmasq\ *) [ "$1" = dnsmasq ] || continue ;;
+                *) continue ;;
+            esac
+            printf "%s\n" "${path##*/}"
+        done
+    ' sh "$process" "$port") || return 80
+    [[ $pids =~ ^[0-9]+$ ]] || return 80
+    mapping_fixture_docker exec "$receiver" kill -"$signal" "$pids" >/dev/null || return 80
+    printf '%s\n' "$pids"
+}
+
+mapping_receiver_negative_probe() {
+    local key=${1:-} spec proto port dest output status=0 token
+    spec=$(mapping_witness_spec "$key") || return 80
+    IFS=$'\t' read -r proto port dest <<< "$spec"
+    token="$MP_RUN_ID-${MAPPING_ASSERT_GENERATION:-}-${key}"
+    case "$key" in
+        cross-network|host-published|host-input)
+            [[ $key != host-input ]] || port=49383
+            output=$(mapping_fixture_docker exec "gm-$MP_RUN_ID-witness" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'" 2>&1) || status=$?
+            [[ $status != 0 && $output != *'Error response from daemon:'* && ( $output == *'refused'* || $output == *'timed out'* ) ]] || return 80
+            ;;
+        dns-udp|dns-tcp)
+            [[ $key != dns-udp ]] || proto=+notcp
+            [[ $key != dns-tcp ]] || proto=+tcp
+            output=$(mapping_fixture_docker exec "gm-$MP_RUN_ID-witness" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A 2>&1) || status=$?
+            [[ $status == 9 && $output == *'no servers could be reached'* && $output != *'Error response from daemon:'* ]] || return 80
+            ;;
+    esac
+    printf '%s\n' "$output"
+}
+
 # 正校准接收端并覆盖 UDP/TCP：先取接收端基线，逐项探测后要求计数严格增长。
 # 接收端在跑但不计数（零增量）不得通过校准。
 mapping_calibrate_witness() {
@@ -576,7 +630,7 @@ mapping_probe_egress() {
 # 隔离判定：五类 DROP 计数均增长、接收端计数零变化；未完成正校准不得通过。
 mapping_isolation_check() {
     local product=${1:-} generation=${2:-} profile=${3:-}
-    local before after wb wa key cb ca seq_before seq_after base
+    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name
     [[ -n $product && -n $generation && -n $profile ]] || return 1
     [[ $MP_WITNESS_CALIBRATED == 1 && ${MAPPING_ASSERT_CALIBRATED_GENERATION:-} == "$generation" ]] || return 1
     [[ $generation == "${MAPPING_ASSERT_GENERATION:-}" ]] || return 1
@@ -587,19 +641,52 @@ mapping_isolation_check() {
     [[ -n $base && $base != "$IT_CONTROL_DIR" ]] || return 80
     for key in $MAPPING_WITNESS_KEYS; do
         [[ -z ${MAPPING_ASSERT_TARGET:-} || $MAPPING_ASSERT_TARGET == "$key" ]] || continue
+        dir=${IT_EVIDENCE_DIR:-}/isolation/$key
+        [[ -n ${IT_EVIDENCE_DIR:-} && ! -e $dir && ! -L $dir ]] || return 80
+        mkdir -p "$dir" || return 80
+        mapping_receiver_probe "$key" || return 80
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/calibration.before.witness" || return 80
+        mapping_receiver_probe "$key" || return 80
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/calibration.after.witness" || return 80
+        wb=$(mapping_witness "$dir/calibration.before.witness") || return 80
+        wa=$(mapping_witness "$dir/calibration.after.witness") || return 80
+        mapping_witness_growth "$wb" "$wa" "$key" || return 1
+        mapping_receiver_listener_control "$key" STOP > "$dir/listener.pid" || return 80
+        negative_rc=0
+        mapping_receiver_negative_probe "$key" > "$dir/negative.log" || negative_rc=$?
+        printf '%s\n' "$negative_rc" > "$dir/negative.exit" || return 80
+        if ! mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" ||
+            ! cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/negative.witness"; then
+            mapping_receiver_listener_control "$key" CONT "$(cat "$dir/listener.pid")" >/dev/null || :
+            return 80
+        fi
+        mapping_receiver_listener_control "$key" CONT "$(cat "$dir/listener.pid")" > "$dir/listener.restored.pid" || return 80
+        printf 'probe_exit\t%s\n' "$negative_rc" > "$dir/negative.tsv" || return 80
+        [[ $negative_rc == 0 ]] || return 80
+        mapping_receiver_probe "$key" || return 80
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
         seq_before=${CONTROL_SEQ:-0}
-        mapping_probe_egress "$product" "$generation" "$key" || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
+        printf '%s\n' "$seq_before" > "$dir/seq.before" || return 80
+        mapping_probe_egress "$product" "$generation" "$key" > "$dir/probe.log" 2>&1 || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
         seq_after=${CONTROL_SEQ:-0}
+        printf '%s\n' "$seq_after" > "$dir/seq.after" || return 80
         before=$base/mapping-snapshot-$seq_before.rules
         after=$base/mapping-snapshot-$seq_after.rules
-        wb=$(mapping_witness "$base/mapping-snapshot-$seq_before.witness") || return 1
-        wa=$(mapping_witness "$base/mapping-snapshot-$seq_after.witness") || return 1
+        for name in rules witness; do
+            cp -- "$base/mapping-snapshot-$seq_before.$name" "$dir/before.$name" || return 80
+            cp -- "$base/mapping-snapshot-$seq_after.$name" "$dir/after.$name" || return 80
+        done
+        wb=$(mapping_witness "$dir/before.witness") || return 80
+        wa=$(mapping_witness "$dir/after.witness") || return 80
         [[ $wb == "$wa" ]] || return 1
         cb=$(mapping_count "$before" "$profile" "$key") || return 1
         ca=$(mapping_count "$after" "$profile" "$key") || return 1
         [[ $ca -gt $cb ]] || return 1
+        printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$key" "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" > "$dir/binding.tsv" || return 80
+        printf 'policy\n' > "$dir/reject.layer" || return 80
     done
     return 0
 }

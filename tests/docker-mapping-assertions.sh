@@ -411,6 +411,7 @@ mapping_scenario_calibrate() {
     [[ -n $kind && -n $scenario && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     mapping_proxy_calibrate "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     if [[ ${MAPPING_ASSERT_CASE:-} == isolation || ${MAPPING_ASSERT_CASE:-} == isolation/* ]]; then
+        [[ ${MAPPING_ASSERT_CASE:-} != isolation/* ]] || mapping_witness_key_valid "${MAPPING_ASSERT_TARGET:-}" || return "$MAPPING_ASSERT_FIXTURE"
         mapping_calibrate_witness "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
     fi
     MAPPING_ASSERT_CALIBRATED_GENERATION=$MAPPING_ASSERT_GENERATION
@@ -1580,12 +1581,42 @@ mapping_full_accept() {
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
-    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name dial_baseline_before dial_baseline dial_recovered
+    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name dial_baseline_before dial_baseline dial_recovered key sub wb wa cb ca seq_before seq_after
     [[ -d $dir && ! -L $dir ]] || return 80
     mapping_assert_identity_load "$dir" || return 80
     [[ $MPA_RUN_ID == "$run" && $MPA_SCENARIO == "$scenario" && $MPA_GENERATION == "$generation" \
         && $MPA_MANIFEST_SHA256 == "$manifest" && $MPA_INPUT_SHA256 == "$input" ]] || return 80
     case $case_id in
+        isolation/*)
+            key=${case_id#isolation/}
+            mapping_witness_key_valid "$key" || return 80
+            sub=$dir/isolation/$key
+            [[ -d $sub && ! -L $sub ]] || return 80
+            for name in binding.tsv calibration.before.witness calibration.after.witness negative.tsv negative.exit negative.log negative.witness listener.pid listener.restored.pid seq.before seq.after before.rules after.rules before.witness after.witness probe.log reject.layer; do
+                [[ -f $sub/$name && ! -L $sub/$name && -r $sub/$name ]] || return 80
+            done
+            mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
+            [[ $MP_RUN_ID == "$run" && $MP_PROFILE_SHA256 == "$MPA_PROFILE_SHA256" ]] || return 1
+            [[ $(cat "$sub/binding.tsv") == "$(printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s' "$key" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256")" ]] || return 1
+            [[ $(cat "$sub/negative.tsv") == $'probe_exit\t0' && $(cat "$sub/reject.layer") == policy && -s $sub/negative.log && -s $sub/probe.log ]] || return 1
+            [[ $(mapping_assert_uint_file "$sub/negative.exit") == 0 ]] || return 1
+            [[ $(cat "$sub/listener.pid") =~ ^[0-9]+$ && $(cat "$sub/listener.pid") == "$(cat "$sub/listener.restored.pid")" ]] || return 1
+            seq_before=$(mapping_assert_uint_file "$sub/seq.before") || return 80
+            seq_after=$(mapping_assert_uint_file "$sub/seq.after") || return 80
+            (( seq_after > seq_before )) || return 1
+            wb=$(mapping_witness "$sub/calibration.before.witness") || return 1
+            wa=$(mapping_witness "$sub/calibration.after.witness") || return 1
+            mapping_witness_growth "$wb" "$wa" "$key" || return 1
+            wb=$(mapping_witness "$sub/negative.witness") || return 1
+            [[ $wb == "$wa" ]] || return 1
+            wb=$(mapping_witness "$sub/before.witness") || return 1
+            wa=$(mapping_witness "$sub/after.witness") || return 1
+            [[ $wb == "$wa" ]] || return 1
+            cb=$(mapping_count "$sub/before.rules" "$MAPPING_PROFILE" "$key") || return 1
+            ca=$(mapping_count "$sub/after.rules" "$MAPPING_PROFILE" "$key") || return 1
+            (( ca > cb )) || return 1
+            return 0
+            ;;
         wrong_proxy_ca)
             [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == "$case_id" ]] || return 80
             for name in tls-layer.tsv baseline.exit recovery.exit request.exit baseline.before baseline.after proxy.before proxy.after proxy.recovered connect.initial connect.before connect.baseline connect.baseline.new connect.log connect.recovered connect.recovered.new request.baseline.log request.recovery.log request.failed.log upstream.before upstream.after; do
