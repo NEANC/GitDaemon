@@ -57,18 +57,78 @@ isolation_produces_and_consumes_five_bound_cases() (
         [[ $2 != CONT || $3 == 123 ]] || return 80
         printf '123\n'
     }
-    mapping_receiver_negative_probe() { [[ $paused == 1 ]] || return 80; printf 'connection refused\n'; }
+    mapping_receiver_negative_probe() {
+        [[ $paused == 1 ]] || return 80
+        if [[ $1 == dns-* ]]; then
+            printf 'no servers could be reached\n'
+            printf '9\n' > "$2/negative/raw.exit"
+            printf 'no servers could be reached\n' > "$2/negative/raw.log"
+        else
+            printf 'connection refused\n'
+            printf '7\n' > "$2/negative/raw.exit"
+            printf 'connection refused\n' > "$2/negative/raw.log"
+        fi
+    }
     mapping_receiver_listener_running() { [[ $paused == 0 ]]; }
+    mapping_receiver_listener_observed_state() { if [[ $paused == 1 ]]; then printf 'T\n'; else printf 'R\n'; fi; }
     mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
     mapping_receiver_probe() { [[ $paused == 0 ]] || return 1; received=$((received + 1)); }
-    mapping_probe_egress() { printf 'connection timed out\n'; }
+    mapping_probe_egress() {
+        if [[ $3 == dns-tcp ]]; then
+            printf 'no servers could be reached\n'
+            printf '9\n' > "$4/probe/raw.exit"
+            printf 'no servers could be reached\n' > "$4/probe/raw.log"
+        elif [[ $3 == dns-udp ]]; then
+            printf 'connection timed out\n'
+            printf '124\n' > "$4/probe/raw.exit"
+            printf 'connection timed out\n' > "$4/probe/raw.log"
+        else
+            printf 'connection timed out\n'
+            printf '28\n' > "$4/probe/raw.exit"
+            printf 'connection timed out\n' > "$4/probe/raw.log"
+        fi
+    }
     for key in $MAPPING_WITNESS_KEYS; do
         MAPPING_ASSERT_TARGET=$key
         mapping_isolation_check product g1 "$MAPPING_PROFILE" || return 1
         [[ -d $dir/isolation/$key ]] || return 1
+        local sub=$dir/isolation/$key proto port dest
+        IFS=$'\t' read -r proto port dest <<< "$(mapping_witness_spec "$key")"
+        [[ $(cat "$sub/probe.target.tsv") == "$(printf 'target\t%s\nprotocol\t%s\nport\t%s\ndestination\t%s' "$key" "$proto" "$port" "$dest")" ]] || return 1
+        [[ $(cat "$sub/negative.target.tsv") == "$(cat "$sub/probe.target.tsv")" ]] || return 1
+        [[ $(cat "$sub/listener.stopped.state") == T && $(cat "$sub/listener.restored.state") == R ]] || return 1
+        [[ -s $sub/probe/raw.log && -s $sub/negative/raw.log && -s $sub/probe/raw.exit && -s $sub/negative/raw.exit ]] || return 1
         mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     done
     [[ $count == 25 ]] || return 1
+    local sub=$dir/isolation/cross-network
+    for name in probe/raw.exit negative/raw.exit probe.target.tsv negative.target.tsv listener.stopped.state listener.restored.state; do
+        cp "$sub/$name" "$WORK/${name//\//-}"
+        rm "$sub/$name"
+        rc=0; mapping_negative_case_evidence_accept isolation/cross-network mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+        [[ $rc == 80 ]] || { printf '%s missing: %s\n' "$name" "$rc" >&2; return 1; }
+        cp "$WORK/${name//\//-}" "$sub/$name"
+    done
+    printf '0\n' > "$sub/probe/raw.exit"
+    rc=0; mapping_negative_case_evidence_accept isolation/cross-network mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/probe-raw.exit" "$sub/probe/raw.exit"
+    printf 'invalid\n' > "$sub/negative/raw.exit"
+    rc=0; mapping_negative_case_evidence_accept isolation/cross-network mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 80 ]] || return 1
+    cp "$WORK/negative-raw.exit" "$sub/negative/raw.exit"
+    printf 'target\tother\n' > "$sub/probe.target.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/cross-network mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/probe.target.tsv" "$sub/probe.target.tsv"
+    printf 'R\n' > "$sub/listener.stopped.state"
+    rc=0; mapping_negative_case_evidence_accept isolation/cross-network mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/listener.stopped.state" "$sub/listener.stopped.state"
+    printf 'T\n' > "$sub/listener.restored.state"
+    rc=0; mapping_negative_case_evidence_accept isolation/cross-network mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/listener.restored.state" "$sub/listener.restored.state"
     for name in calibration.before calibration.after negative before after; do
         cp "$dir/isolation/dns-udp/$name.receipt" "$dir/isolation/host-input/$name.receipt"
         cp "$dir/isolation/dns-udp/$name.rules" "$dir/isolation/host-input/$name.rules"
@@ -225,6 +285,7 @@ isolation_stop_failure_restores_or_blocks() (
         printf '123\n'
     }
     mapping_receiver_listener_running() { [[ $paused == 0 && $mode != running_failure ]]; }
+    mapping_receiver_listener_observed_state() { if [[ $paused == 1 ]]; then printf 'T\n'; else printf 'R\n'; fi; }
     mapping_receiver_negative_probe() { [[ $mode != negative_failure ]] || return 77; printf 'connection refused\n'; }
     mapping_isolation_check product g1 "$MAPPING_PROFILE" || rc=$?
     [[ $rc == 80 && $probes == 2 ]] || return 1

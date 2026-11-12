@@ -616,7 +616,7 @@ mapping_receiver_listener_state() {
 }
 
 mapping_receiver_negative_probe() {
-    local key=${1:-} spec proto port dest output status=0 token
+    local key=${1:-} dir=${2:-} spec proto port dest output status=0 token
     spec=$(mapping_witness_spec "$key") || return 80
     IFS=$'\t' read -r proto port dest <<< "$spec"
     token="$MP_RUN_ID-${MAPPING_ASSERT_GENERATION:-}-${key}"
@@ -624,14 +624,21 @@ mapping_receiver_negative_probe() {
         cross-network|host-published|host-input)
             [[ $key != host-input ]] || port=49383
             output=$(mapping_fixture_docker exec "gm-$MP_RUN_ID-witness" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'" 2>&1) || status=$?
-            [[ $status != 0 && $output != *'Error response from daemon:'* && ( $output == *'refused'* || $output == *'timed out'* ) ]] || return 80
             ;;
         dns-udp|dns-tcp)
             [[ $key != dns-udp ]] || proto=+notcp
             [[ $key != dns-tcp ]] || proto=+tcp
             output=$(mapping_fixture_docker exec "gm-$MP_RUN_ID-witness" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A 2>&1) || status=$?
-            [[ $status == 9 && $output == *'no servers could be reached'* && $output != *'Error response from daemon:'* ]] || return 80
             ;;
+    esac
+    if [[ -n $dir ]]; then
+        mkdir -p "$dir/negative" || return 80
+        printf '%s\n' "$status" > "$dir/negative/raw.exit" || return 80
+        printf '%s\n' "$output" > "$dir/negative/raw.log" || return 80
+    fi
+    case "$key" in
+        dns-*) [[ $status == 9 && $output == *'no servers could be reached'* && $output != *'Error response from daemon:'* ]] || return 80 ;;
+        *) [[ $status != 0 && $output != *'Error response from daemon:'* && ( $output == *'refused'* || $output == *'timed out'* ) ]] || return 80 ;;
     esac
     printf '%s\n' "$output"
 }
@@ -657,7 +664,7 @@ mapping_calibrate_witness() {
 
 # 从产品 netns 发起五类目标探测；TCP DNS 由登记工具共享 netns 发起。
 mapping_probe_egress() {
-    local product=$1 generation=$2 target=${3:-} key spec proto port dest tool facts ledger output status probe_rc remove_rc product_id
+    local product=$1 generation=$2 target=${3:-} dir=${4:-} key spec proto port dest tool facts ledger output status probe_rc remove_rc product_id write_rc
     [[ -n $product && -n $generation ]] || return 80
     for key in $MAPPING_WITNESS_KEYS; do
         [[ -z $target || $target == "$key" ]] || continue
@@ -668,6 +675,10 @@ mapping_probe_egress() {
                 status=0
                 output=$(mapping_fixture_docker exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest" 2>&1) || status=$?
                 printf '%s\n' "$output"
+                if [[ -n $dir ]]; then
+                    printf '%s\n' "$status" > "$dir/probe/raw.exit" || return 80
+                    printf '%s\n' "$output" > "$dir/probe/raw.log" || return 80
+                fi
                 if [[ $status == 0 ]]; then return 1; fi
                 [[ $output != *'Error response from daemon:'* && ( $status == 124 || ( $status == 1 && $output == *'connection timed out'* ) ) ]] || return 80
                 ;;
@@ -698,9 +709,14 @@ mapping_probe_egress() {
                             status=0
                             output=$(mapping_fixture_docker exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A 2>&1) || status=$?
                             printf '%s\n' "$output"
-                            if [[ $status == 0 && $output == *"SERVER: $dest#53("* && $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), ]]; then
+                            write_rc=0
+                            if [[ -n $dir ]]; then
+                                printf '%s\n' "$status" > "$dir/probe/raw.exit" || write_rc=80
+                                printf '%s\n' "$output" > "$dir/probe/raw.log" || write_rc=80
+                            fi
+                            if [[ $write_rc == 0 && $status == 0 && $output == *"SERVER: $dest#53("* && $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), ]]; then
                                 probe_rc=1
-                            elif [[ $status == 9 && $output != *'Error response from daemon:'* && ! $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), && $output == *"communications error to $dest#53: timed out"* && $output == *'no servers could be reached'* ]]; then
+                            elif [[ $write_rc == 0 && $status == 9 && $output != *'Error response from daemon:'* && ! $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), && $output == *"communications error to $dest#53: timed out"* && $output == *'no servers could be reached'* ]]; then
                                 probe_rc=0
                             fi
                         fi
@@ -721,6 +737,10 @@ mapping_probe_egress() {
                 status=0
                 output=$(mapping_fixture_docker exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/" 2>&1) || status=$?
                 printf '%s\n' "$output"
+                if [[ -n $dir ]]; then
+                    printf '%s\n' "$status" > "$dir/probe/raw.exit" || return 80
+                    printf '%s\n' "$output" > "$dir/probe/raw.log" || return 80
+                fi
                 if [[ $status == 0 ]]; then return 1; fi
                 [[ $output != *'Error response from daemon:'* && $status == 28 && ( $output == *'Connection timed out'* || $output == *'Operation timed out'* || $output == *'Timeout was reached'* ) ]] || return 80
                 ;;
@@ -743,11 +763,25 @@ mapping_receiver_listener_running() {
     ' sh "$pid" >/dev/null 2>&1
 }
 
+mapping_receiver_listener_observed_state() {
+    local key=$1 pid=$2 id
+    id=$(mapping_receiver_listener_container_id) || return 80
+    mapping_receiver_listener_identity "$pid" "$key" "$id" >/dev/null || return 80
+    mapping_fixture_docker exec "$id" sh -c '
+        IFS= read -r stat < "/proc/$1/stat" || exit 80
+        state=${stat##*) }; state=${state%% *}
+        printf "%s\n" "$state"
+    ' sh "$pid"
+}
+
 # 保留原失败阶段及恢复结果；恢复不可靠时拒绝继续下一例。
 mapping_isolation_resume() {
     local key=$1 dir=$2 stage=$3 original_rc=$4 pid=$5 restore_rc=0 running_rc=0
     mapping_receiver_listener_control "$key" CONT "$pid" > "$dir/listener.restored.pid" || restore_rc=$?
     mapping_receiver_listener_running "$key" "$pid" || running_rc=$?
+    if [[ $restore_rc == 0 && $running_rc == 0 ]]; then
+        mapping_receiver_listener_observed_state "$key" "$pid" > "$dir/listener.restored.state" || running_rc=80
+    fi
     printf 'failure_stage\t%s\noriginal_exit\t%s\nrestore_exit\t%s\nrunning_exit\t%s\n' \
         "$stage" "$original_rc" "$restore_rc" "$running_rc" > "$dir/stop.outcome.tsv" || return 80
     [[ $restore_rc == 0 && $running_rc == 0 ]] || return 80
@@ -770,7 +804,7 @@ mapping_isolation_stop_failure() {
 # 隔离判定：五类 DROP 计数均增长、接收端计数零变化；未完成正校准不得通过。
 mapping_isolation_check() {
     local product=${1:-} generation=${2:-} profile=${3:-}
-    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name stage original_rc pid
+    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name stage original_rc pid spec proto port dest
     [[ -n $product && -n $generation && -n $profile ]] || return 1
     [[ $MP_WITNESS_CALIBRATED == 1 && ${MAPPING_ASSERT_CALIBRATED_GENERATION:-} == "$generation" ]] || return 1
     [[ $generation == "${MAPPING_ASSERT_GENERATION:-}" ]] || return 1
@@ -784,6 +818,11 @@ mapping_isolation_check() {
         dir=${IT_EVIDENCE_DIR:-}/isolation/$key
         [[ -n ${IT_EVIDENCE_DIR:-} && ! -e $dir && ! -L $dir ]] || return 80
         mkdir -p "$dir" || return 80
+        spec=$(mapping_witness_spec "$key") || return 80
+        IFS=$'\t' read -r proto port dest <<< "$spec"
+        printf 'target\t%s\nprotocol\t%s\nport\t%s\ndestination\t%s\n' "$key" "$proto" "$port" "$dest" > "$dir/probe.target.tsv" || return 80
+        cp -- "$dir/probe.target.tsv" "$dir/negative.target.tsv" || return 80
+        mkdir -p "$dir/probe" "$dir/negative" || return 80
         mapping_receiver_probe "$key" || return 80
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         for name in rules witness receipt; do
@@ -804,9 +843,11 @@ mapping_isolation_check() {
             mapping_isolation_stop_failure "$key" "$dir" "${original_rc:-80}"
             return 80
         fi
+        mapping_receiver_listener_observed_state "$key" "$pid" > "$dir/listener.stopped.state" || { mapping_isolation_resume "$key" "$dir" stopped-state 80 "$pid"; return 80; }
+        [[ $(cat "$dir/listener.stopped.state") == T ]] || { mapping_isolation_resume "$key" "$dir" stopped-state 1 "$pid"; return 80; }
         stage=none original_rc=0
         negative_rc=0
-        mapping_receiver_negative_probe "$key" > "$dir/negative.log" || negative_rc=$?
+        mapping_receiver_negative_probe "$key" "$dir" > "$dir/negative.log" || negative_rc=$?
         if ! printf '%s\n' "$negative_rc" > "$dir/negative.exit"; then
             stage=negative-exit original_rc=80
         elif [[ $negative_rc != 0 ]]; then
@@ -827,7 +868,7 @@ mapping_isolation_check() {
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         seq_before=${CONTROL_SEQ:-0}
         printf '%s\n' "$seq_before" > "$dir/seq.before" || return 80
-        mapping_probe_egress "$product" "$generation" "$key" > "$dir/probe.log" 2>&1 || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
+        mapping_probe_egress "$product" "$generation" "$key" "$dir" > "$dir/probe.log" 2>&1 || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         seq_after=${CONTROL_SEQ:-0}
         printf '%s\n' "$seq_after" > "$dir/seq.after" || return 80

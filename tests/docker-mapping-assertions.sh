@@ -1611,12 +1611,37 @@ mapping_negative_case_evidence_accept() {
             mapping_witness_key_valid "$key" || return 80
             sub=$dir/isolation/$key
             [[ -d $sub && ! -L $sub ]] || return 80
-            for name in binding.tsv calibration.before.rules calibration.before.witness calibration.before.receipt calibration.after.rules calibration.after.witness calibration.after.receipt negative.tsv negative.exit negative.log negative.rules negative.witness negative.receipt listener.pid listener.restored.pid seq.before seq.after before.rules after.rules before.witness after.witness before.receipt after.receipt probe.log reject.layer; do
+            for name in binding.tsv calibration.before.rules calibration.before.witness calibration.before.receipt calibration.after.rules calibration.after.witness calibration.after.receipt negative.tsv negative.exit negative.log negative.rules negative.witness negative.receipt listener.pid listener.restored.pid listener.stopped.state listener.restored.state negative.target.tsv probe.target.tsv negative/raw.exit negative/raw.log probe/raw.exit probe/raw.log seq.before seq.after before.rules after.rules before.witness after.witness before.receipt after.receipt probe.log reject.layer; do
                 [[ -f $sub/$name && ! -L $sub/$name && -r $sub/$name && -s $sub/$name ]] || return 80
             done
             mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
             [[ $MP_RUN_ID == "$run" && $MP_PROFILE_SHA256 == "$MPA_PROFILE_SHA256" ]] || return 1
             [[ $(cat "$sub/binding.tsv") == "$(printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s' "$key" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256")" ]] || return 1
+            spec=$(mapping_witness_spec "$key") || return 80
+            IFS=$'\t' read -r proto port dest <<< "$spec"
+            for name in negative probe; do
+                [[ $(cat "$sub/$name.target.tsv") == "$(printf 'target\t%s\nprotocol\t%s\nport\t%s\ndestination\t%s' "$key" "$proto" "$port" "$dest")" ]] || return 1
+            done
+            stopped=$(cat "$sub/listener.stopped.state") || return 80
+            restored=$(cat "$sub/listener.restored.state") || return 80
+            [[ $stopped == T && $restored =~ ^[RSDI]$ ]] || return 1
+            negative_raw=$(mapping_assert_uint_file "$sub/negative/raw.exit") || return 80
+            probe_raw=$(mapping_assert_uint_file "$sub/probe/raw.exit") || return 80
+            [[ -s $sub/negative/raw.log && -s $sub/probe/raw.log ]] || return 80
+            case $key in
+                dns-udp) [[ $negative_raw == 9 && ( $probe_raw == 124 || $probe_raw == 1 ) && $(cat "$sub/probe/raw.log") == *'timed out'* ]] || return 1 ;;
+                dns-tcp) [[ $negative_raw == 9 && $probe_raw == 9 && $(cat "$sub/probe/raw.log") == *'no servers could be reached'* ]] || return 1 ;;
+                *) (( negative_raw > 0 && probe_raw == 28 )) || return 1 ;;
+            esac
+            if [[ $key == dns-* ]]; then
+                [[ $(cat "$sub/negative/raw.log") == *'no servers could be reached'* ]] || return 1
+            else
+                [[ $(cat "$sub/negative/raw.log") == *'refused'* || $(cat "$sub/negative/raw.log") == *'timed out'* ]] || return 1
+                [[ $(cat "$sub/probe/raw.log") == *'timed out'* || $(cat "$sub/probe/raw.log") == *'Timeout'* ]] || return 1
+            fi
+            [[ $(cat "$sub/negative.log") == "$(cat "$sub/negative/raw.log")" ]] || return 1
+            [[ $(cat "$sub/probe.log") == *"$(cat "$sub/probe/raw.log")"* ]] || return 1
+            [[ $(cat "$sub/negative/raw.log") != *'Error response from daemon:'* && $(cat "$sub/probe/raw.log") != *'Error response from daemon:'* ]] || return 1
             [[ $(cat "$sub/negative.tsv") == $'probe_exit\t0' && $(cat "$sub/reject.layer") == policy && -s $sub/negative.log && -s $sub/probe.log ]] || return 1
             request=$(mapping_assert_uint_file "$sub/negative.exit") || return 80
             [[ $request == 0 ]] || return 1
