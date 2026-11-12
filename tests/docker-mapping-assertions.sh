@@ -200,6 +200,21 @@ mapping_assert_log_line() {
 }
 
 # CONNECT 证据必须含合法接受记录：authority 精确、拨号目的只能是冻结 U:443。
+mapping_upstream_ca_git_diagnostic() {
+    local file=${1:-} target
+    [[ -f $file && ! -L $file && -r $file ]] || return 1
+    target="fatal: unable to access 'https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/': "
+    awk -v target="$target" '
+        /^fatal: / {
+            if (index($0, target) != 1) { invalid = 1; next }
+            detail = substr($0, length(target) + 1)
+            if (detail ~ /^SSL certificate problem: / && detail ~ /(issuer|certificate)/) found++
+            else invalid = 1
+        }
+        END { exit invalid || found != 1 }
+    ' "$file"
+}
+
 mapping_assert_connect_legal() {
     local file=${1:-} upstream=${2:-} line auth mode dial field
     local -a encoded=()
@@ -878,8 +893,7 @@ mapping_tls_upstream_ca_run() {
         [[ $rc != 0 && $after -gt $before && $dial_after -gt $dial_before ]] || evidence_rc=1
         tail -n "+$(( $(wc -l < "$dir/connect.baseline") + 1 ))" "$dir/connect.log" > "$dir/connect.failed.new" || evidence_rc=80
         mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || evidence_rc=1
-        grep -Fqi "unable to access https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" "$dir/request.failed.log" || evidence_rc=1
-        grep -Eqi 'SSL certificate problem:.*(issuer|certificate)' "$dir/request.failed.log" || evidence_rc=1
+        mapping_upstream_ca_git_diagnostic "$dir/request.failed.log" || evidence_rc=1
     fi
     mapping_negative_upstream_ca_restore || return 80
     ca_recovered=$(mapping_tls_client_upstream_ca_hash) || return 80
@@ -1219,8 +1233,7 @@ mapping_negative_rejected() {
             cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
-            grep -Fqi "unable to access https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" "$dir/request.failed.log" || return 1
-            grep -Eqi 'SSL certificate problem:.*(issuer|certificate)' "$dir/request.failed.log" || return 1
+            mapping_upstream_ca_git_diagnostic "$dir/request.failed.log" || return 1
             MAPPING_ASSERT_REJECT_LAYER=tls-upstream
             return 0
             ;;
@@ -1640,8 +1653,7 @@ mapping_negative_case_evidence_accept() {
             mapping_tls_layer_accept "$case_id" "$dir/tls-layer.tsv" || return 1
             [[ $(awk -F '\t' '$1 == "request_exit" {print $2}' "$dir/tls-layer.tsv") == "$request" && $(awk -F '\t' '$1 == "connect_delta" {print $2}' "$dir/tls-layer.tsv") == "$((after - before))" ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") && -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
-            grep -Fqi "unable to access https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" "$dir/request.failed.log" || return 1
-            grep -Eqi 'SSL certificate problem:.*(issuer|certificate)' "$dir/request.failed.log" || return 1
+            mapping_upstream_ca_git_diagnostic "$dir/request.failed.log" || return 1
             mapping_assert_refs_match "$dir" || return 1
             mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 1
             mapping_assert_refs_contain "$dir/refs.actual" "$MPA_UNIQUE_COMMIT" || return 1

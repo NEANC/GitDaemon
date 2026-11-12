@@ -34,7 +34,7 @@ upstream_ca_git_8443_restores_refs() {
         n=$(cat "$dir/proxy-count"); printf '%s\n' "$((n+1))" > "$dir/proxy-count"
         n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
         if [[ -f $dir/injected && ! -f $dir/restored ]]; then
-            printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n'
+            printf "fatal: unable to access 'https://github.com/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n"
             return 128
         fi
         printf '同步传输路径：配置的 HTTPS 代理\n'
@@ -63,7 +63,7 @@ upstream_ca_git_8443_restores_refs() {
     printf 'fatal: unable to access https://elsewhere.invalid/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/request.failed.log"
     rc=0; mapping_negative_rejected wrong_upstream_ca fallback "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
-    printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/request.failed.log"
+    printf "fatal: unable to access 'https://github.com/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/request.failed.log"
     mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || return 1
     local matrix="${dir}-matrix.tsv"
     printf 'wrong_upstream_ca\tr1\tmapping-fallback\tg1\tm1\ta1\t%s\t0\tPASS\n' "$dir" > "$matrix"
@@ -100,7 +100,7 @@ upstream_ca_git_8443_restores_refs() {
     printf 'fatal: unrelated error\n' > "$dir/request.failed.log"
     rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
-    printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/request.failed.log"
+    printf "fatal: unable to access 'https://github.com/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/request.failed.log"
     printf 'old\trefs/heads/main\n' > "$dir/refs.actual"
     rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
@@ -155,7 +155,7 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
                 n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
             fi
             if [[ -f $dir/injected && ! -f $dir/restored ]]; then
-                if [[ $mode == unrelated-ssl ]]; then printf 'fatal: unable to access https://elsewhere.invalid/: SSL certificate problem\n'; else printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n'; fi
+                if [[ $mode == unrelated-ssl ]]; then printf "fatal: unable to access 'https://elsewhere.invalid/': SSL certificate problem: unable to get local issuer certificate\n"; else printf "fatal: unable to access 'https://github.com/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n"; fi
                 return 128
             fi
             printf '同步传输路径：配置的 HTTPS 代理\n'
@@ -351,6 +351,31 @@ upstream_ca_entry_preserves_evidence_verdict() {
 }
 
 # 完整入口使用真实 TLS 取证与恢复，拒绝没有上游拨号增长或证书诊断的失败。
+upstream_ca_git_diagnostic_binds_target_and_certificate() {
+    local dir sample expected rc
+    dir=$(mktemp -d)
+    MAPPING_UPSTREAM_HOST=github.com MAPPING_UPSTREAM_OWNER=acme MAPPING_UPSTREAM_REPO=demo
+    for sample in valid other-host other-repo unquoted split old-mixed mixed-fatal prefix suffix; do
+        expected=1
+        case $sample in
+            valid)
+                printf "fatal: unable to access 'https://github.com/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log"
+                expected=0 ;;
+            other-host) printf "fatal: unable to access 'https://elsewhere.invalid/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+            other-repo) printf "fatal: unable to access 'https://github.com/acme/other.git/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+            unquoted) printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/git.log" ;;
+            split) printf "fatal: unable to access 'https://github.com/acme/demo.git/': repository not found\nfatal: unable to access 'https://elsewhere.invalid/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+            old-mixed) printf "fatal: unable to access 'https://github.com/acme/demo.git/': old error\nSSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+            mixed-fatal) printf "fatal: unable to access 'https://elsewhere.invalid/': repository not found\nfatal: unable to access 'https://github.com/acme/demo.git/': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+            prefix) printf "fatal: unable to access 'https://github.com/acme/demo.git/extra': SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+            suffix) printf "fatal: unable to access 'https://github.com/acme/demo.git/': repository not found; SSL certificate problem: unable to get local issuer certificate\n" > "$dir/git.log" ;;
+        esac
+        rc=0
+        mapping_upstream_ca_git_diagnostic "$dir/git.log" || rc=$?
+        [[ $rc == "$expected" ]] || { printf '%s: expected %s got %s\n' "$sample" "$expected" "$rc" >&2; return 1; }
+    done
+}
+
 upstream_ca_entry_rejects_invalid_git_evidence() {
     local test_root mode rc n
     for mode in flat-dial bad-log; do
@@ -405,7 +430,7 @@ upstream_ca_entry_rejects_invalid_git_evidence() {
 }
 
 failed=0
-for name in upstream_ca_git_8443_restores_refs upstream_ca_recovery_requires_complete_positive_evidence upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture upstream_ca_entry_preserves_evidence_verdict upstream_ca_entry_rejects_invalid_git_evidence; do
+for name in upstream_ca_git_diagnostic_binds_target_and_certificate upstream_ca_git_8443_restores_refs upstream_ca_recovery_requires_complete_positive_evidence upstream_ca_wrong_layer_is_assertion_not_fixture upstream_ca_restore_uses_upstream_asset_and_client_volume upstream_ca_missing_dial_is_not_inner_failure upstream_ca_missing_count_restores_and_returns_fixture upstream_ca_missing_verdict_count_is_fixture upstream_ca_entry_preserves_evidence_verdict upstream_ca_entry_rejects_invalid_git_evidence; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
