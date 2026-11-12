@@ -1513,10 +1513,42 @@ mapping_full_accept() {
     return 0
 }
 
+mapping_negative_case_evidence_accept() {
+    local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
+    local request baseline recovery before after recovered name
+    [[ -d $dir && ! -L $dir ]] || return 80
+    mapping_assert_identity_load "$dir" || return 80
+    [[ $MPA_RUN_ID == "$run" && $MPA_SCENARIO == "$scenario" && $MPA_GENERATION == "$generation" \
+        && $MPA_MANIFEST_SHA256 == "$manifest" && $MPA_INPUT_SHA256 == "$input" ]] || return 80
+    case $case_id in
+        wrong_proxy_ca)
+            [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == "$case_id" ]] || return 80
+            for name in tls-layer.tsv baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered connect.before connect.log request.failed.log; do
+                [[ -f $dir/$name && ! -L $dir/$name ]] || return 80
+            done
+            baseline=$(mapping_assert_uint_file "$dir/baseline.exit") || return 80
+            recovery=$(mapping_assert_uint_file "$dir/recovery.exit") || return 80
+            request=$(mapping_assert_uint_file "$dir/request.exit") || return 80
+            before=$(mapping_assert_uint_file "$dir/proxy.before") || return 80
+            after=$(mapping_assert_uint_file "$dir/proxy.after") || return 80
+            recovered=$(mapping_assert_uint_file "$dir/proxy.recovered") || return 80
+            [[ $baseline == 0 && $recovery == 0 ]] || return 80
+            (( request > 0 && recovered > after )) || return 1
+            mapping_tls_layer_accept "$case_id" "$dir/tls-layer.tsv" || return 1
+            [[ $(awk -F '\t' '$1 == "request_exit" {print $2}' "$dir/tls-layer.tsv") == "$request" ]] || return 1
+            (( before == after )) || return 1
+            cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
+            grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || return 1
+            return 0
+            ;;
+        *) return 80 ;;
+    esac
+}
+
 # 严格验收 full 的 21 例负例矩阵及其原始证据目录。
 mapping_negative_matrix_accept() {
     local file=${1:-} expected_run=${2:-} expected_manifest=${3:-} expected_input=${4:-}
-    local line case_id run scenario generation manifest input evidence assertion result want tabs
+    local line case_id run scenario generation manifest input evidence assertion result want tabs rc
     local -a columns=()
     local -A seen=()
     [[ -n $expected_run && -n $expected_manifest && -n $expected_input && -f $file && ! -L $file && -r $file ]] || return 1
@@ -1533,8 +1565,9 @@ mapping_negative_matrix_accept() {
         [[ $assertion == 0 && $result == PASS ]] || return 1
         [[ -z ${seen[$case_id]:-} ]] || return 1
         case " $MAPPING_NEGATIVE_CASES " in *" $case_id "*) ;; *) return 1 ;; esac
-        [[ $evidence == "${file%/*}/"* && -d $evidence && ! -L $evidence && -f $evidence/evidence.txt && ! -L $evidence/evidence.txt && -s $evidence/evidence.txt ]] || return 1
+        [[ $evidence == "${file%/*}/"* && $evidence != *'/../'* && -d $evidence && ! -L $evidence ]] || return 1
         [[ $run == "$expected_run" && $manifest == "$expected_manifest" && $input == "$expected_input" ]] || return 1
+        mapping_negative_case_evidence_accept "$case_id" "$run" "$scenario" "$generation" "$manifest" "$input" "$evidence" || { rc=$?; return "$rc"; }
         seen[$case_id]=1
     done < "$file"
     for want in $MAPPING_NEGATIVE_CASES; do [[ ${seen[$want]:-} == 1 ]] || return 1; done

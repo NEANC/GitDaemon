@@ -13,11 +13,69 @@ matrix_write() {
     done
 }
 
-full_requires_all_21_negative_cases() {
-    local dir file
-    dir=$(mktemp -d); file=$dir/matrix.tsv; matrix_write "$file"
-    mapping_negative_matrix_accept "$file" run manifest input
+placeholder_matrix_cannot_finalize() {
+    local dir guard carrier rc=0 status=0
+    dir=$(mktemp -d); guard=$dir/guard.tsv; carrier=$dir/carrier.tsv
+    business_write "$dir"
+    matrix_write "$dir/mapping-negative-matrix.tsv"
+    printf 'primary_exit\t0\ncleanup_exit\t0\nresidual_count\t0\n' > "$guard"
+    printf 'carrier_cleanup_exit\t0\ncarrier_residual_count\t0\nhost_unchanged\tPASS\n' > "$carrier"
+    mapping_negative_matrix_accept "$dir/mapping-negative-matrix.tsv" run manifest input || status=$?
+    [[ $status == 80 ]] || rc=1
+    mapping_finalize "$dir" "$guard" "$carrier" && rc=1
+    [[ ! -e $dir/mapping-full-summary.tsv && ! -e $dir/mapping-full-finalized.tsv ]] || rc=1
     rm -rf "$dir"
+    [[ $rc == 0 ]]
+}
+
+single_raw_case_is_independently_verified() {
+    local dir evidence rc=0
+    dir=$(mktemp -d); evidence=$dir/raw-wrong_proxy_ca
+    mkdir -p "$evidence"
+    printf 'wrong_proxy_ca\n' > "$evidence/case.tsv"
+    printf 'run_id\trun\nscenario\tscenario\ngeneration\tgeneration\nnetwork_id\tnet\nimage_id\timage\nprofile_sha256\tprofile\ninput_sha256\tinput\nmanifest_sha256\tmanifest\nunique_commit\tcommit\n' > "$evidence/identity.tsv"
+    printf 'case\twrong_proxy_ca\nlayer\touter-failure\nconnect_delta\t0\nrequest_exit\t1\n' > "$evidence/tls-layer.tsv"
+    printf '0\n' > "$evidence/baseline.exit"
+    printf '1\n' > "$evidence/request.exit"
+    printf '0\n' > "$evidence/recovery.exit"
+    printf '3\n' > "$evidence/proxy.before"
+    printf '3\n' > "$evidence/proxy.after"
+    printf '4\n' > "$evidence/proxy.recovered"
+    printf 'CONNECT github.com:443\n' > "$evidence/connect.before"
+    cp "$evidence/connect.before" "$evidence/connect.log"
+    printf 'SSL certificate problem\n' > "$evidence/request.failed.log"
+    mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || rc=1
+    printf '2\n' > "$evidence/request.exit"
+    mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" && rc=1
+    printf '1\n' > "$evidence/request.exit"
+    mapping_negative_case_evidence_accept wrong_proxy_ca run other generation manifest input "$evidence" && rc=1
+    rm -rf "$dir"
+    [[ $rc == 0 ]]
+}
+
+remaining_cases_are_unimplemented() {
+    local dir evidence case_id rc=0 count=0 status
+    dir=$(mktemp -d)
+    for case_id in $MAPPING_NEGATIVE_CASES; do
+        [[ $case_id == wrong_proxy_ca ]] && continue
+        count=$((count + 1))
+        evidence=$dir/raw-${case_id//\//-}
+        mkdir -p "$evidence"
+        printf 'run_id\trun\nscenario\tscenario\ngeneration\tgeneration\nnetwork_id\tnet\nimage_id\timage\nprofile_sha256\tprofile\ninput_sha256\tinput\nmanifest_sha256\tmanifest\nunique_commit\tcommit\n' > "$evidence/identity.tsv"
+        status=0
+        mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || status=$?
+        [[ $status == 80 ]] || rc=1
+    done
+    rm -rf "$dir"
+    [[ $count == 20 && $rc == 0 ]]
+}
+
+full_requires_all_21_negative_cases() {
+    local dir file status=0
+    dir=$(mktemp -d); file=$dir/matrix.tsv; matrix_write "$file"
+    mapping_negative_matrix_accept "$file" run manifest input || status=$?
+    rm -rf "$dir"
+    [[ $status == 80 ]]
 }
 
 any_one_negative_cannot_pass_group() {
@@ -50,7 +108,7 @@ negative_matrix_requires_raw_evidence() {
 negative_matrix_requires_exact_bound_rows() {
     local dir file raw
     dir=$(mktemp -d); file=$dir/matrix.tsv; matrix_write "$file"
-    mapping_negative_matrix_accept "$file" run manifest input || return 1
+    ! mapping_negative_matrix_accept "$file" run manifest input || return 1
     printf '\textra' >> "$file"
     ! mapping_negative_matrix_accept "$file" run manifest input || return 1
     matrix_write "$file"
@@ -95,8 +153,8 @@ finalize_requires_raw_status_and_business() {
     matrix_write "$dir/mapping-negative-matrix.tsv"
     printf 'primary_exit\t0\ncleanup_exit\t0\nresidual_count\t0\n' > "$guard"
     printf 'carrier_cleanup_exit\t0\ncarrier_residual_count\t0\nhost_unchanged\tPASS\n' > "$carrier"
-    mapping_finalize "$dir" "$guard" "$carrier" || return 1
-    mapping_full_accept "$dir/mapping-full-summary.tsv" || return 1
+    ! mapping_finalize "$dir" "$guard" "$carrier" || return 1
+    [[ ! -e $dir/mapping-full-summary.tsv && ! -e $dir/mapping-full-finalized.tsv ]] || return 1
     for key in primary_exit cleanup_exit residual_count; do
         printf 'old\tPASS\n' > "$dir/mapping-full-summary.tsv"
         awk -F '\t' -v k="$key" '$1 != k' "$guard" > "$guard.next"; mv "$guard.next" "$guard"
@@ -174,7 +232,6 @@ handwritten_full_without_matrix_is_rejected() {
     rm -rf "$dir"
 }
 
-# 最终汇总发布后，矩阵、输入、汇总及 finalized 来源任一变更均不能继续通过。
 finalized_full_requires_bound_sources() {
     local dir guard carrier file
     dir=$(mktemp -d); guard=$dir/guard.tsv; carrier=$dir/carrier.tsv
@@ -182,9 +239,11 @@ finalized_full_requires_bound_sources() {
     matrix_write "$dir/mapping-negative-matrix.tsv"
     printf 'primary_exit\t0\ncleanup_exit\t0\nresidual_count\t0\n' > "$guard"
     printf 'carrier_cleanup_exit\t0\ncarrier_residual_count\t0\nhost_unchanged\tPASS\n' > "$carrier"
-    mapping_finalize "$dir" "$guard" "$carrier" || return 1
+    ! mapping_finalize "$dir" "$guard" "$carrier" || return 1
     file=$dir/mapping-full-summary.tsv
-    mapping_full_accept "$file" || return 1
+    summary_write "$file"
+    finalized_receipt_write "$dir"
+    ! mapping_full_accept "$file" || return 1
     mv "$dir/mapping-negative-matrix.tsv" "$dir/matrix.saved"
     ! mapping_full_accept "$file" || return 1
     mv "$dir/matrix.saved" "$dir/mapping-negative-matrix.tsv"
@@ -209,25 +268,23 @@ finalized_full_rejects_duplicate_and_failed_slot() {
     matrix_write "$dir/mapping-negative-matrix.tsv"
     printf 'primary_exit\t0\ncleanup_exit\t0\nresidual_count\t0\n' > "$guard"
     printf 'carrier_cleanup_exit\t0\ncarrier_residual_count\t0\nhost_unchanged\tPASS\n' > "$carrier"
-    mapping_finalize "$dir" "$guard" "$carrier" || return 1
+    ! mapping_finalize "$dir" "$guard" "$carrier" || return 1
     file=$dir/mapping-full-summary.tsv
-    mapping_full_accept "$file" || return 1
+    summary_write "$file"
+    finalized_receipt_write "$dir"
+    ! mapping_full_accept "$file" || return 1
     ! integration_business_accept "$file" > "$dir/runner.out" 2>&1 || return 1
     ! grep -q 'MAPPING_FULL_ACCEPT=0' "$dir/runner.out" || return 1
     cp "$file" "$dir/valid-summary.tsv"
     printf 'mapping_direct\tPASS\n' >> "$file"
-    finalized_summary_digest_refresh "$dir" || return 1
     ! mapping_full_accept "$file" || return 1
     cp "$dir/valid-summary.tsv" "$file"
-    finalized_summary_digest_refresh "$dir" || return 1
-    mapping_full_accept "$file" || return 1
+    ! mapping_full_accept "$file" || return 1
     awk -F '\t' 'BEGIN {OFS="\t"} $1 == "tls_negatives" {$2="FAIL"} {print}' "$file" > "$dir/failed-summary.tsv"
     cp "$dir/failed-summary.tsv" "$file"
-    finalized_summary_digest_refresh "$dir" || return 1
     ! mapping_full_accept "$file" || return 1
     cp "$dir/valid-summary.tsv" "$file"
-    finalized_summary_digest_refresh "$dir" || return 1
-    mapping_full_accept "$file" || return 1
+    ! mapping_full_accept "$file" || return 1
     rm -rf "$dir"
 }
 
@@ -239,6 +296,20 @@ finalized_summary_digest_refresh() {
     mv "$dir/receipt.next" "$dir/mapping-full-finalized.tsv"
 }
 
+finalized_receipt_write() {
+    local dir=$1 name file digest
+    : > "$dir/mapping-full-finalized.tsv"
+    for name in summary matrix input; do
+        case $name in
+            summary) file=$dir/mapping-full-summary.tsv ;;
+            matrix) file=$dir/mapping-negative-matrix.tsv ;;
+            input) file=$dir/mapping-run-input.tsv ;;
+        esac
+        digest=$(sha256sum "$file") || return 1
+        printf '%s\t%s\n' "$name" "${digest%% *}" >> "$dir/mapping-full-finalized.tsv"
+    done
+}
+
 finalized_full_rejects_forbidden_field_after_digest_refresh() {
     local dir guard carrier file
     dir=$(mktemp -d); guard=$dir/guard.tsv; carrier=$dir/carrier.tsv
@@ -246,15 +317,17 @@ finalized_full_rejects_forbidden_field_after_digest_refresh() {
     matrix_write "$dir/mapping-negative-matrix.tsv"
     printf 'primary_exit\t0\ncleanup_exit\t0\nresidual_count\t0\n' > "$guard"
     printf 'carrier_cleanup_exit\t0\ncarrier_residual_count\t0\nhost_unchanged\tPASS\n' > "$carrier"
-    mapping_finalize "$dir" "$guard" "$carrier" || return 1
+    ! mapping_finalize "$dir" "$guard" "$carrier" || return 1
     file=$dir/mapping-full-summary.tsv
-    mapping_full_accept "$file" || return 1
+    summary_write "$file"
+    finalized_receipt_write "$dir"
+    ! mapping_full_accept "$file" || return 1
     printf 'forbidden\tPASS\n' >> "$file"
     finalized_summary_digest_refresh "$dir" || return 1
     ! mapping_full_accept "$file" || return 1
     sed -i '$d' "$file"
     finalized_summary_digest_refresh "$dir" || return 1
-    mapping_full_accept "$file" || return 1
+    ! mapping_full_accept "$file" || return 1
     rm -rf "$dir"
 }
 
@@ -274,7 +347,7 @@ primary_error_wins_over_cleanup() {
 }
 
 failed=0
-for name in full_requires_all_21_negative_cases any_one_negative_cannot_pass_group negative_matrix_rejects_duplicate_unknown_or_foreign_case negative_matrix_requires_raw_evidence negative_matrix_requires_exact_bound_rows missing_summary_slot_rejected single_mode_cannot_finalize_full handwritten_full_without_matrix_is_rejected finalized_full_requires_bound_sources finalized_full_rejects_duplicate_and_failed_slot finalized_full_rejects_forbidden_field_after_digest_refresh full_waits_for_guard_and_carrier_cleanup finalize_removes_stale_pass finalize_requires_raw_status_and_business primary_error_wins_over_cleanup; do
+for name in single_raw_case_is_independently_verified remaining_cases_are_unimplemented placeholder_matrix_cannot_finalize full_requires_all_21_negative_cases any_one_negative_cannot_pass_group negative_matrix_rejects_duplicate_unknown_or_foreign_case negative_matrix_requires_raw_evidence negative_matrix_requires_exact_bound_rows missing_summary_slot_rejected single_mode_cannot_finalize_full handwritten_full_without_matrix_is_rejected finalized_full_requires_bound_sources finalized_full_rejects_duplicate_and_failed_slot finalized_full_rejects_forbidden_field_after_digest_refresh full_waits_for_guard_and_carrier_cleanup finalize_removes_stale_pass finalize_requires_raw_status_and_business primary_error_wins_over_cleanup; do
     rc=0; ( "$name" ) || rc=$?; printf '%s EXIT=%s\n' "$name" "$rc"; [[ $rc == 0 ]] || failed=1
 done
 exit "$failed"
