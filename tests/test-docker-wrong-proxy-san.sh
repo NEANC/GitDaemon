@@ -85,6 +85,28 @@ leaf_original_reads_live_pair() (
     [[ $rc == 80 ]]
 )
 
+leaf_original_rejects_replaced_live_pair() (
+    local dir=$WORK/leaf-replaced rc=0
+    mkdir -p "$dir"
+    MAPPING_ASSERT_PRODUCT=product
+    mapping_proxy_container() { printf 'proxy\n'; }
+    mapping_fixture_docker() {
+        if [[ $1 == exec && $2 == proxy && $3 == openssl ]]; then
+            openssl x509 -in "$WORK/original.crt" -noout -fingerprint -sha256
+        elif [[ $1 == exec && $2 == product ]]; then
+            cat "$WORK/original.crt"
+        elif [[ $1 == exec && $2 == proxy && $3 == test ]]; then
+            return 0
+        elif [[ $1 == exec && $2 == proxy && $3 == cmp ]]; then
+            return 1
+        else
+            return 1
+        fi
+    }
+    mapping_proxy_san_leaf "$dir" original || rc=$?
+    [[ $rc == 80 && ! -e $dir/leaf.original ]]
+)
+
 hostname_probe_status() {
     local mode=$1 expected=$2 rc=0 dir=$WORK/probe-$1
     mkdir -p "$dir"
@@ -132,6 +154,9 @@ run_case() {
                     printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
                 fi
             fi
+            if [[ -f $dir/git.new ]]; then
+                printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+            fi
         }
         mapping_scenario_upstream_count() { printf '2\n'; }
         mapping_scenario_upstream_refs() { printf 'abc\trefs/heads/main\n'; }
@@ -166,6 +191,7 @@ run_case() {
         mapping_scenario_sync_exec() {
             printf 'request\n' >> "$EVENTS"
             if [[ -f $dir/recovered.marker ]]; then
+                : > "$dir/git.new"
                 printf '同步传输路径：配置的 HTTPS 代理\n' > "$dir/sync.log"
                 printf '0\n' > "$dir/sync.exit"
                 return 0
@@ -204,6 +230,8 @@ volume_sign_failure_restores_pair || failed=1
 printf 'volume_sign_failure_restores_pair EXIT=%s\n' "$failed"
 leaf_original_reads_live_pair || failed=1
 printf 'leaf_original_reads_live_pair EXIT=%s\n' "$failed"
+leaf_original_rejects_replaced_live_pair || failed=1
+printf 'leaf_original_rejects_replaced_live_pair EXIT=%s\n' "$failed"
 for spec in hostname:0 other-certificate:1 timeout:80 exec-timeout:80 exec-error:80 curl-error:1 completed-error:1; do
     mode=${spec%:*} expected=${spec#*:}
     hostname_probe_status "$mode" "$expected" || failed=1

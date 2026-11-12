@@ -72,7 +72,12 @@ mapping_proxy_san_leaf() {
         'openssl s_client -connect gm-proxy:8443 -servername gm-proxy -showcerts </dev/null 2>/dev/null') || return 80
     observed=$(printf '%s\n' "$peer" | openssl x509 -noout -fingerprint -sha256) || return 80
     [[ -n $expected && $observed == "$expected" ]] || return 80
-    if [[ $phase == wrong ]]; then
+    if [[ $phase == original ]]; then
+        if mapping_fixture_docker exec "$(mapping_proxy_container)" test -e "$MAPPING_ASSET_ROOT/proxy/tls/srv.original.crt"; then
+            mapping_fixture_docker exec "$(mapping_proxy_container)" cmp -s \
+                "$MAPPING_ASSET_ROOT/proxy/tls/srv.crt" "$MAPPING_ASSET_ROOT/proxy/tls/srv.original.crt" || return 80
+        fi
+    elif [[ $phase == wrong ]]; then
         mapping_fixture_docker exec "$(mapping_proxy_container)" openssl verify \
             -CAfile "$MAPPING_ASSET_ROOT/proxy/tls/ca.crt" \
             "$MAPPING_ASSET_ROOT/proxy/tls/srv.crt" >/dev/null || return 80
@@ -206,9 +211,8 @@ mapping_proxy_san_case() {
         [[ $recovered =~ ^[0-9]+$ && $recovered -gt $before ]] || return 80
         printf '%s\n' "$recovered" > "$dir/proxy.recovered" || return 80
         mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.recovered" || return 80
-        if [[ -f $dir/connect.log ]]; then
-            tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
-        fi
+        tail -n "+$(( $(wc -l < "$dir/connect.health.after") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
+        mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || rc=1
         mapping_proxy_san_recovery_git "$dir" "$kind" "$scenario" || return 80
     fi
     return "$rc"

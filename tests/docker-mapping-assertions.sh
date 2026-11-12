@@ -238,6 +238,17 @@ mapping_assert_connect_legal() {
     return 1
 }
 
+mapping_assert_connect_all_legal() {
+    local file=${1:-} upstream=${2:-} line
+    [[ -s $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || return 1
+        printf '%s\n' "$line" | awk -F '\t' -v auth="authority=$MAPPING_PROXY_AUTHORITY" \
+            -v dial="dial_target=$upstream:$MAPPING_UPSTREAM_PORT" \
+            'NF == 3 && $1 == auth && $2 == "mode=accept" && $3 == dial { ok=1 } END { exit !ok }' || return 1
+    done < "$file"
+}
+
 # dns.txt 必须证明受控 DNS 状态：github.com 的 A 与 AAAA 为 NXDOMAIN（成功不依赖系统 DNS），
 # gm-proxy 解析到 X。记录数、名称、类型或取值任一不符一律拒绝。
 mapping_assert_dns_file() {
@@ -1680,12 +1691,17 @@ mapping_negative_case_evidence_accept() {
             cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
             [[ -s $dir/connect.baseline ]] || return 1
             mapping_assert_connect_legal "$dir/connect.baseline" "$MP_U" || return 1
-            [[ $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.log") ]] || return 1
+            [[ $(wc -c < "$dir/connect.recovered") -gt $(wc -c < "$dir/connect.health.after") ]] || return 1
+            head -c "$(wc -c < "$dir/connect.health.after")" "$dir/connect.recovered" | cmp -s - "$dir/connect.health.after" || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.health.after") + 1 ))" "$dir/connect.recovered" | cmp -s - "$dir/connect.recovered.new" || return 1
+            mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+            [[ $(wc -c < "$dir/connect.health.after") -gt $(wc -c < "$dir/connect.health.before") ]] || return 1
+            head -c "$(wc -c < "$dir/connect.health.before")" "$dir/connect.health.after" | cmp -s - "$dir/connect.health.before" || return 1
+            mapping_assert_connect_all_legal "$dir/connect.recovered.new" "$MP_U" || return 1
             head -n "$(wc -l < "$dir/connect.health.before")" "$dir/connect.recovered" | cmp -s - "$dir/connect.health.before" || return 1
             tail -n "+$(( $(wc -l < "$dir/connect.health.before") + 1 ))" "$dir/connect.health.after" | cmp -s - "$dir/connect.health.new" || return 1
             mapping_assert_connect_legal "$dir/connect.health.new" "$MP_U" || return 1
-            tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" | cmp -s - "$dir/connect.recovered.new" || return 1
-            mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+            mapping_assert_connect_all_legal "$dir/connect.health.new" "$MP_U" || return 1
             [[ $(cat "$dir/leaf.original") != "$(cat "$dir/leaf.wrong")" ]] || return 1
             cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 1
             [[ $(cat "$dir/cert.original") != "$(cat "$dir/cert.wrong")" && $(cat "$dir/key.original") != "$(cat "$dir/key.wrong")" ]] || return 1

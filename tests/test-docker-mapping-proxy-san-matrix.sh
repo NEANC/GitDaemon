@@ -23,13 +23,14 @@ proxy_san_matrix_proof() {
     printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n' > "$dir/connect.baseline"
     cp "$dir/connect.baseline" "$dir/connect.before"
     cp "$dir/connect.before" "$dir/connect.log"
-    cp "$dir/connect.baseline" "$dir/connect.recovered"
-    cat "$dir/connect.baseline" >> "$dir/connect.recovered"
-    cp "$dir/connect.baseline" "$dir/connect.recovered.new"
-    cp "$dir/connect.recovered" "$dir/connect.health.before"
+    cp "$dir/connect.log" "$dir/connect.health.before"
+    cat "$dir/connect.baseline" >> "$dir/connect.health.before"
     cp "$dir/connect.health.before" "$dir/connect.health.after"
     cat "$dir/connect.baseline" >> "$dir/connect.health.after"
     cp "$dir/connect.baseline" "$dir/connect.health.new"
+    cp "$dir/connect.health.after" "$dir/connect.recovered"
+    cat "$dir/connect.baseline" >> "$dir/connect.recovered"
+    cp "$dir/connect.baseline" "$dir/connect.recovered.new"
     printf 'aabbcc\n' > "$dir/leaf.original"
     printf 'ddeeff\n' > "$dir/leaf.wrong"
     cp "$dir/leaf.original" "$dir/leaf.restored"
@@ -62,6 +63,17 @@ proxy_san_matrix_proof() {
         rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
         [[ $rc == 1 ]] || { printf 'bad health CONNECT %s: %s\n' "$name" "$rc"; failed=1; }
         mv "$dir/$name.saved" "$dir/$name"
+    done
+    for spec in 'connect.recovered:connect.recovered.new' 'connect.health.after:connect.health.new'; do
+        name=${spec%%:*}; saved=${spec#*:}
+        cp "$dir/$name" "$dir/$name.saved"
+        cp "$dir/$saved" "$dir/$saved.saved"
+        printf 'authority=elsewhere.invalid:443\tmode=accept\tdial_target=140.82.112.11:443\n' >> "$dir/$name"
+        printf 'authority=elsewhere.invalid:443\tmode=accept\tdial_target=140.82.112.11:443\n' >> "$dir/$saved"
+        rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+        [[ $rc == 1 ]] || { printf 'illegal incremental CONNECT %s: %s\n' "$name" "$rc"; failed=1; }
+        mv "$dir/$name.saved" "$dir/$name"
+        mv "$dir/$saved.saved" "$dir/$saved"
     done
     cp "$dir/connect.health.after" "$dir/connect.health.after.saved"
     printf 'authority=elsewhere.invalid:443\tmode=accept\tdial_target=140.82.112.11:443\n' > "$dir/connect.health.after"
@@ -128,6 +140,9 @@ proxy_san_dedicated_production() {
         if [[ -f $dir/health.new ]]; then
             printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
         fi
+        if [[ -f $dir/git.new ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+        fi
     }
     mapping_proxy_san_health() {
         printf 'healthy\n' > "$1/health.$2"
@@ -149,6 +164,7 @@ proxy_san_dedicated_production() {
     mapping_proxy_san_hostname_probe() { printf 'SSL: no alternative certificate subject name matches target host name\n' > "$1/hostname.log"; }
     mapping_scenario_sync_exec() {
         if [[ -f $dir/recovered.marker ]]; then
+            : > "$dir/git.new"
             printf '同步传输路径：配置的 HTTPS 代理\n' > "$3/sync.log"
             printf '0\n' > "$3/sync.exit"
         else
@@ -161,6 +177,7 @@ proxy_san_dedicated_production() {
     mapping_scenario_local_fsck() { printf '0\n'; }
     mapping_proxy_san_case "$dir" fallback scenario || rc=$?
     [[ $rc == 0 ]] || { printf 'dedicated producer: %s\n' "$rc"; return 1; }
+    [[ $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.health.after") ]] || { printf 'missing product Git CONNECT snapshot\n'; return 1; }
     mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || { printf 'dedicated consumer rejected\n'; return 1; }
     rm -rf "$root"
 }
