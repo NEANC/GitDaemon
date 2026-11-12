@@ -64,7 +64,7 @@ mapping_proxy_san_restart() {
 
 # 比对产品连接收到的叶证书与代理卷内容的指纹。
 mapping_proxy_san_leaf() {
-    local dir=$1 phase=$2 expected observed product=${MAPPING_ASSERT_PRODUCT:-} peer
+    local dir=$1 phase=$2 expected observed product=${MAPPING_ASSERT_PRODUCT:-} peer probe
     [[ -n $product ]] || return 80
     expected=$(mapping_fixture_docker exec "$(mapping_proxy_container)" openssl x509 \
         -in "$MAPPING_ASSET_ROOT/proxy/tls/srv.crt" -noout -fingerprint -sha256) || return 80
@@ -73,7 +73,11 @@ mapping_proxy_san_leaf() {
     observed=$(printf '%s\n' "$peer" | openssl x509 -noout -fingerprint -sha256) || return 80
     [[ -n $expected && $observed == "$expected" ]] || return 80
     if [[ $phase == original ]]; then
-        if mapping_fixture_docker exec "$(mapping_proxy_container)" test -e "$MAPPING_ASSET_ROOT/proxy/tls/srv.original.crt"; then
+        probe=$(mapping_fixture_docker exec "$(mapping_proxy_container)" sh -c \
+            'if test -e "$1"; then printf present; else printf absent; fi' sh \
+            "$MAPPING_ASSET_ROOT/proxy/tls/srv.original.crt") || return 80
+        [[ $probe == present || $probe == absent ]] || return 80
+        if [[ $probe == present ]]; then
             mapping_fixture_docker exec "$(mapping_proxy_container)" cmp -s \
                 "$MAPPING_ASSET_ROOT/proxy/tls/srv.crt" "$MAPPING_ASSET_ROOT/proxy/tls/srv.original.crt" || return 80
         fi

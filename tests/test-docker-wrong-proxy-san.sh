@@ -70,6 +70,7 @@ leaf_original_reads_live_pair() (
     mapping_proxy_container() { printf 'proxy\n'; }
     mapping_fixture_docker() {
         if [[ $1 == exec && $2 == proxy && $3 == cmp ]]; then return 1; fi
+        if [[ $1 == exec && $2 == proxy && $3 == sh ]]; then printf 'absent\n'; return 0; fi
         if [[ $1 == exec && $2 == proxy && $3 == openssl ]]; then
             openssl x509 -in "$WORK/original.crt" -noout -fingerprint -sha256
         elif [[ $1 == exec && $2 == product ]]; then
@@ -95,10 +96,31 @@ leaf_original_rejects_replaced_live_pair() (
             openssl x509 -in "$WORK/original.crt" -noout -fingerprint -sha256
         elif [[ $1 == exec && $2 == product ]]; then
             cat "$WORK/original.crt"
-        elif [[ $1 == exec && $2 == proxy && $3 == test ]]; then
-            return 0
+        elif [[ $1 == exec && $2 == proxy && $3 == sh ]]; then
+            printf 'present\n'
         elif [[ $1 == exec && $2 == proxy && $3 == cmp ]]; then
             return 1
+        else
+            return 1
+        fi
+    }
+    mapping_proxy_san_leaf "$dir" original || rc=$?
+    [[ $rc == 80 && ! -e $dir/leaf.original ]]
+)
+
+# 证书可读取而备份探针的容器执行失败时拒绝 original 证据。
+leaf_original_rejects_exec_probe_failure() (
+    local dir=$WORK/leaf-probe-failure rc=0
+    mkdir -p "$dir"
+    MAPPING_ASSERT_PRODUCT=product
+    mapping_proxy_container() { printf 'proxy\n'; }
+    mapping_fixture_docker() {
+        if [[ $1 == exec && $2 == proxy && $3 == openssl ]]; then
+            openssl x509 -in "$WORK/original.crt" -noout -fingerprint -sha256
+        elif [[ $1 == exec && $2 == product ]]; then
+            cat "$WORK/original.crt"
+        elif [[ $1 == exec && $2 == proxy && $3 == sh ]]; then
+            return 125
         else
             return 1
         fi
@@ -232,6 +254,8 @@ leaf_original_reads_live_pair || failed=1
 printf 'leaf_original_reads_live_pair EXIT=%s\n' "$failed"
 leaf_original_rejects_replaced_live_pair || failed=1
 printf 'leaf_original_rejects_replaced_live_pair EXIT=%s\n' "$failed"
+leaf_original_rejects_exec_probe_failure || failed=1
+printf 'leaf_original_rejects_exec_probe_failure EXIT=%s\n' "$failed"
 for spec in hostname:0 other-certificate:1 timeout:80 exec-timeout:80 exec-error:80 curl-error:1 completed-error:1; do
     mode=${spec%:*} expected=${spec#*:}
     hostname_probe_status "$mode" "$expected" || failed=1
