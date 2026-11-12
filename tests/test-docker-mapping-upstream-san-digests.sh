@@ -66,9 +66,11 @@ for name in cert key; do
         mv "$file" "$file.saved"
         check 80
         cp "$file.saved" "$file"
-        chmod 000 "$file"
-        check 80
-        chmod 600 "$file"
+        if [[ $EUID != 0 ]]; then
+            chmod 000 "$file"
+            check 80
+            chmod 600 "$file"
+        fi
         printf 'invalid\n' > "$file"
         check 1
         cp "$file.saved" "$file"
