@@ -1939,7 +1939,7 @@ mapping_negative_matrix_accept() {
     local file=${1:-} expected_run=${2:-} expected_manifest=${3:-} expected_input=${4:-}
     local line case_id run scenario generation manifest input evidence assertion result want tabs rc
     local -a columns=()
-    local -A seen=()
+    local -A seen=() isolation_generations=()
     [[ -n $expected_run && -n $expected_manifest && -n $expected_input && -f $file && ! -L $file && -r $file ]] || return 1
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -n $line && $line != *$'\r'* ]] || return 1
@@ -1957,6 +1957,10 @@ mapping_negative_matrix_accept() {
         [[ $evidence == "${file%/*}/"* && $evidence != *'/../'* && -d $evidence && ! -L $evidence ]] || return 1
         [[ $run == "$expected_run" && $manifest == "$expected_manifest" && $input == "$expected_input" ]] || return 1
         mapping_negative_case_evidence_accept "$case_id" "$run" "$scenario" "$generation" "$manifest" "$input" "$evidence" || { rc=$?; return "$rc"; }
+        if [[ $case_id == isolation/* ]]; then
+            [[ -z ${isolation_generations[$generation]:-} ]] || return 1
+            isolation_generations[$generation]=1
+        fi
         seen[$case_id]=1
     done < "$file"
     for want in $MAPPING_NEGATIVE_CASES; do [[ ${seen[$want]:-} == 1 ]] || return 1; done
