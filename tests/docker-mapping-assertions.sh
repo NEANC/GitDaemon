@@ -1634,13 +1634,21 @@ mapping_finalize() {
     return 0
 }
 
-# runner 末尾判定：仅有载体 finalized 来源的完整汇总可通过，旧 13 键业务汇总不能作为最终结论。
-integration_full_accept() {
+integration_business_accept() {
     local file=${1:-}
-    if mapping_full_accept "$file"; then
-        printf 'MAPPING_FULL_ACCEPT=0\n'
-        return 0
-    fi
-    printf 'MAPPING_FULL_ACCEPT=REJECT file=%s\n' "${file:-none}" >&2
-    return 1
+    local line key value
+    local -A seen=()
+    [[ ${file##*/} == mapping-business-summary.tsv && -f $file && ! -L $file && -r $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *$'\t'* && $line != *$'\r'* ]] || return 1
+        key=${line%%$'\t'*} value=${line#*$'\t'}
+        [[ -n $key && -n $value && $value != *$'\t'* && -z ${seen[$key]:-} ]] || return 1
+        case $key in
+            failures|fixture_failures|deferred|primary_exit|cleanup_exit|residual_count) [[ $value == 0 ]] || return 1 ;;
+            mapping_fallback|mapping_direct|system_fallback|system_direct|dns_negatives|tls_negatives|isolation_negatives) [[ $value == PASS ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+        seen[$key]=1
+    done < "$file"
+    [[ ${#seen[@]} == 13 ]]
 }

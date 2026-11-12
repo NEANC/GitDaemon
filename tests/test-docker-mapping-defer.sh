@@ -102,18 +102,26 @@ mapping_full_accept_contract() {
 
 # 集成结束路径写出的 13 键业务汇总反映断言与槽位结果，但不得作为最终通过。
 full_summary_producer_contract() {
-    local file=$TEST_ROOT/producer/summary.tsv rc=0 k
+    local file=$TEST_ROOT/producer/mapping-business-summary.tsv rc=0 k count
     local -a slots=(mapping_fallback mapping_direct system_fallback system_direct
         dns_negatives tls_negatives isolation_negatives)
     mkdir -p "$TEST_ROOT/producer"
     FAILURES=0 FIXTURE_FAILURES=0
     IT_DEFERRED=0 IT_PRIMARY_EXIT=0 IT_CLEANUP_EXIT=0 IT_RESIDUAL_COUNT=0
     IT_SLOT_DONE=() IT_SLOT_FAIL=()
-    for k in "${slots[@]}"; do integration_slot_pass "$k"; done
+    for k in "${slots[@]}"; do
+        case $k in dns_negatives) count=12 ;; tls_negatives) count=4 ;; isolation_negatives) count=5 ;; *) count=1 ;; esac
+        IT_SLOT_DONE[$k]=$count
+    done
     integration_full_summary_write "$file" || { printf 'FAIL 汇总写出失败\n'; return 1; }
     [[ $(wc -l < "$file") == 13 ]] || { printf 'FAIL 汇总字段数 %s != 13\n' "$(wc -l < "$file")"; rc=1; }
+    [[ ${file##*/} == mapping-business-summary.tsv ]] || { printf 'FAIL 业务汇总文件名错误\n'; rc=1; }
+    [[ ! -e $TEST_ROOT/producer/mapping-full-summary.tsv ]] || { printf 'FAIL 集成提前生成最终汇总\n'; rc=1; }
     if mapping_full_accept "$file"; then printf 'FAIL 13 键业务汇总冒充最终通过\n'; rc=1; fi
-    if integration_full_accept "$file" >/dev/null 2>&1; then printf 'FAIL runner 将业务汇总当最终通过\n'; rc=1; fi
+    if ! integration_business_accept "$file"; then printf 'FAIL runner 拒绝完整业务摘要\n'; rc=1; fi
+    printf 'mapping_direct\tPASS\n' >> "$file"
+    if integration_business_accept "$file"; then printf 'FAIL 重复业务键被接受\n'; rc=1; fi
+    integration_full_summary_write "$file" || rc=1
     # 断言失败计数非零：判定器必须拒绝。
     FAILURES=1
     integration_full_summary_write "$file" || rc=1
@@ -122,7 +130,7 @@ full_summary_producer_contract() {
     # 槽位缺席（单项 mode 或过滤运行）：判定器必须拒绝。
     IT_SLOT_DONE=() IT_SLOT_FAIL=()
     integration_full_summary_write "$file" || rc=1
-    if integration_full_accept "$file" >/dev/null 2>&1; then printf 'FAIL 缺槽位汇总被接受\n'; rc=1; fi
+    if integration_business_accept "$file"; then printf 'FAIL 缺槽位汇总被接受\n'; rc=1; fi
     # 槽位失败：判定器必须拒绝。
     for k in "${slots[@]}"; do integration_slot_pass "$k"; done
     integration_slot_fail tls_negatives
@@ -138,20 +146,18 @@ full_summary_producer_contract() {
     return "$rc"
 }
 
-# runner 结束路径：未 finalized 的替身汇总不论槽位是否完整都必须拒绝。
 integration_runner_judges_summary() {
     local scratch failed=0 rc=0
     scratch=$(mktemp -d)
     mkdir -p "$scratch/evidence/control"
     : > "$scratch/evidence/control/start"
-    # 集成脚本替身：按 INTEGRATION_VERDICT 写出一份通过或缺失槽位的汇总后返回 0。
     bash() {
         case "$1" in
             *test-docker-integration.sh)
                 if [[ ${INTEGRATION_VERDICT:-pass} == pass ]]; then
-                    full_summary_write "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv"
+                    full_summary_write "$IT_EVIDENCE_DIR/control/mapping-business-summary.tsv"
                 else
-                    full_summary_write "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv" drop mapping_direct
+                    full_summary_write "$IT_EVIDENCE_DIR/control/mapping-business-summary.tsv" drop mapping_direct
                 fi
                 return 0
                 ;;
@@ -164,14 +170,15 @@ integration_runner_judges_summary() {
     INTEGRATION_VERDICT=pass IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
         command bash "$HERE/test-docker-network.sh" --integration > "$scratch/pass.out" 2>&1 || rc=$?
     printf 'RUNNER_FULL_PASS rc=%s\n' "$rc"
-    [[ $rc != 0 ]] || { printf 'FAIL runner accepted an unfinalized summary\n'; failed=1; }
+    [[ $rc == 0 ]] || { printf 'FAIL runner rejected business summary\n'; failed=1; }
+    [[ -e $scratch/evidence/control/mapping-business-summary.tsv && ! -e $scratch/evidence/control/mapping-full-summary.tsv ]] || { printf 'FAIL runner produced final summary\n'; failed=1; }
+    ! grep -q 'MAPPING_FULL_ACCEPT=0' "$scratch/pass.out" || { printf 'FAIL runner announced final PASS\n'; failed=1; }
     rc=0
     INTEGRATION_VERDICT=drop IT_EVIDENCE_DIR=$scratch/evidence IT_NETWORK_GUARD_READY=1 \
         command bash "$HERE/test-docker-network.sh" --integration > "$scratch/drop.out" 2>&1 || rc=$?
     printf 'RUNNER_FULL_REJECT rc=%s\n' "$rc"
     [[ $rc != 0 ]] || { printf 'FAIL runner accepted an incomplete summary\n'; failed=1; }
-    grep -q 'MAPPING_FULL_ACCEPT=REJECT' "$scratch/drop.out" \
-        || { printf 'FAIL reject marker missing\n'; failed=1; }
+    ! grep -q 'MAPPING_FULL_ACCEPT=0' "$scratch/drop.out" || { printf 'FAIL runner announced final PASS\n'; failed=1; }
     rm -rf "$scratch"
     return "$failed"
 }

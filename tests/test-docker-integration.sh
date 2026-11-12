@@ -396,7 +396,7 @@ cleanup() {
     IT_RESIDUAL_COUNT=$(integration_residual_count) || { IT_RESIDUAL_COUNT=1; clean=2; }
     [[ $IT_RESIDUAL_COUNT == 0 ]] || clean=2
     IT_CLEANUP_EXIT=$clean
-    integration_full_summary_write "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv" || clean=2
+    integration_full_summary_write "$IT_EVIDENCE_DIR/control/mapping-business-summary.tsv" || clean=2
     printf 'INTEGRATION_PRIMARY_EXIT=%s\nINTEGRATION_CLEANUP_EXIT=%s\nTEST_ROOT=%s\nCOMPOSE_IMAGE=%s\n' \
         "$primary" "$clean" "$TEST_ROOT" "$COMPOSE_IMAGE" > "$IT_EVIDENCE_DIR/control/integration-status.txt" || clean=2
     if (( primary != 0 )); then exit "$primary"; fi

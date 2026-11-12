@@ -806,10 +806,8 @@ runner_handshake() {
     cd -- "$HERE/.." || exit $?
 }
 
-# 集成运行：单项 mode 由 IT_MAPPING_SCENARIO 只选对应场景；full 结束后对集成写出的九字段汇总
-# 运行判定器，汇总不完整（单项/过滤运行）即非零，绝不把部分证据当作 full 结论。
 runner_integration() {
-    local rc=0 judge=0
+    local rc=0
     [[ $(id -u) != 0 && ${IT_NETWORK_GUARD_READY:-} == 1 ]] || exit 77
     if [[ -n ${GUARD_RUNNER_MANIFEST:-} || -n ${GUARD_RUNNER_ATTESTATION:-} ]]; then
         [[ -n ${GUARD_RUNNER_MANIFEST:-} && -n ${GUARD_RUNNER_ATTESTATION:-} ]] || exit 77
@@ -817,12 +815,11 @@ runner_integration() {
         [[ -n ${VE_DOCKER_ENDPOINT:-} ]] || exit 77
     fi
     bash "$HERE/test-docker-integration.sh" || rc=$?
-    if [[ -z ${IT_MAPPING_SCENARIO:-} && -z ${IT_FILTER:-} ]]; then
+    if (( rc == 0 )) && [[ -z ${IT_MAPPING_SCENARIO:-} && -z ${IT_FILTER:-} && -z ${IT_MAPPING_ORDER:-} ]]; then
         source "$HERE/docker-mapping-assertions.sh"
-        integration_full_accept "$IT_EVIDENCE_DIR/control/mapping-full-summary.tsv" || judge=$?
+        integration_business_accept "$IT_EVIDENCE_DIR/control/mapping-business-summary.tsv" || rc=1
     fi
-    (( rc == 0 )) || exit "$rc"
-    exit "$judge"
+    exit "$rc"
 }
 
 case "${1:-}" in
