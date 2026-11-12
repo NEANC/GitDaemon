@@ -48,14 +48,19 @@ mapping_fixture_docker() {
         printf 'inspect\n' >> "$work/inspects"
         if [[ ${rebind_after_inspect:-0} == 1 && $(wc -l < "$work/inspects") -gt 1 ]]; then
             printf '%s\n' "$rebound_id"
+        elif [[ -e $work/rebound ]]; then
+            printf '%s\n' "$rebound_id"
         else
             printf '%s\n' "$name_target"
+        fi
+        if [[ -n ${rebind_on_inspect:-} && $(wc -l < "$work/inspects") -eq $rebind_on_inspect ]]; then
+            : > "$work/rebound"
         fi
     elif [[ $1 == inspect && $2 == -f && $4 == "$container_id" ]]; then
         [[ $id_alive == 1 ]] || return 1
         printf '%s\n' "$container_id"
     elif [[ $1 == exec && ( $2 == "$receiver" || $2 == "$container_id" ) ]]; then
-        if [[ $2 == "$receiver" && ${rebind_after_inspect:-0} == 1 && -s $work/inspects ]]; then
+        if [[ $2 == "$receiver" && ( ( ${rebind_after_inspect:-0} == 1 && -s $work/inspects ) || -e $work/rebound ) ]]; then
             printf 'new-container-access\n' >> "$work/accesses"
         fi
         [[ $id_alive == 1 ]] || return 1
@@ -65,6 +70,7 @@ mapping_fixture_docker() {
             script=${script//\/proc\//$work\/proc\/}
             sh -c "$script" "${@:4}"
         elif [[ $1 == kill ]]; then
+            printf '%s\n' "$(wc -l < "$work/inspects")" > "$work/pre-signal-inspects"
             [[ $3 == 101 ]] || return 80
             case $2 in
                 -STOP) write_stat 101 T 1 ;;
@@ -208,3 +214,18 @@ rc=0
 mapping_receiver_listener_control dns-tcp CONT 101 >/dev/null || rc=$?
 [[ $rc == 80 && ! -e $work/accesses && $(cat "$work/signals") == $'-STOP 101\n-CONT 101\n-STOP 101\n-CONT 101\n-STOP 101' ]]
 printf 'listener name rebinding and original exit rejected without new-container access\n'
+
+name_target=$container_id
+: > "$work/inspects"
+[[ $(mapping_receiver_listener_control dns-tcp CONT 101) == 101 ]]
+: > "$work/inspects"
+[[ $(mapping_receiver_listener_control dns-udp STOP) == 101 ]]
+rebind_on_inspect=$(cat "$work/pre-signal-inspects")
+: > "$work/inspects"
+rc=0
+mapping_receiver_listener_control dns-tcp CONT 101 >/dev/null || rc=$?
+[[ $rc == 80 ]]
+[[ -e $work/rebound && ! -e $work/accesses ]]
+[[ $(cat "$work/pre-signal-inspects") == "$rebind_on_inspect" ]]
+[[ $(cat "$work/signals") == $'-STOP 101\n-CONT 101\n-STOP 101\n-CONT 101\n-STOP 101\n-CONT 101\n-STOP 101\n-CONT 101' ]]
+printf 'listener uses registered full ID after pre-signal name rebinding\n'
