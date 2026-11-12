@@ -1632,11 +1632,24 @@ mapping_isolation_probe_command_accept() {
     [[ $before == "$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/$([[ $kind == negative ]] && printf calibration.after || printf before).receipt")" ]] || return 1
     [[ $after == "$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/$([[ $kind == negative ]] && printf negative || printf after).receipt")" ]] || return 1
 }
+mapping_isolation_raw_log_accept() {
+    local sub=$1 kind=$2
+    [[ -f $sub/$kind/raw.log && ! -L $sub/$kind/raw.log && -f $sub/$kind.log && ! -L $sub/$kind.log ]] || return 80
+    cmp -s "$sub/$kind/raw.log" "$sub/$kind.log" || return 1
+}
+
+mapping_isolation_tcp_dns_raw_log_accept() {
+    local sub=$1 tool=$2 product=$3 header
+    [[ -f $sub/probe/raw.log && ! -L $sub/probe/raw.log && -f $sub/probe.log && ! -L $sub/probe.log ]] || return 80
+    header=$(printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product")
+    head -c "$((${#header} + 1))" "$sub/probe.log" | cmp -s - <(printf '%s\n' "$header") || return 1
+    tail -n +2 "$sub/probe.log" | cmp -s - "$sub/probe/raw.log" || return 1
+}
 
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
-    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name dial_baseline_before dial_baseline dial_recovered key sub wb wa cb ca seq_before seq_after
+    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name dial_baseline_before dial_baseline dial_recovered ca_before ca_after ca_recovered key sub wb wa cb ca seq_before seq_after spec proto port dest negative_raw probe_raw stopped restored product_id
     [[ -d $dir && ! -L $dir ]] || return 80
     mapping_assert_identity_load "$dir" || return 80
     [[ $MPA_RUN_ID == "$run" && $MPA_SCENARIO == "$scenario" && $MPA_GENERATION == "$generation" \
@@ -1667,19 +1680,23 @@ mapping_negative_case_evidence_accept() {
             probe_raw=$(mapping_assert_uint_file "$sub/probe/raw.exit") || return 80
             [[ -s $sub/negative/raw.log && -s $sub/probe/raw.log ]] || return 80
             case $key in
-                dns-udp) [[ $negative_raw == 9 && ( $probe_raw == 124 || $probe_raw == 1 ) && $(cat "$sub/probe/raw.log") == *'timed out'* ]] || return 1 ;;
-                dns-tcp) [[ $negative_raw == 9 && $probe_raw == 9 && $(cat "$sub/probe/raw.log") == *'no servers could be reached'* ]] || return 1 ;;
+                dns-udp) [[ $negative_raw == 9 && ( $probe_raw == 124 || $probe_raw == 1 ) ]] && grep -aFq 'timed out' "$sub/probe/raw.log" || return 1 ;;
+                dns-tcp) [[ $negative_raw == 9 && $probe_raw == 9 ]] && grep -aFq 'no servers could be reached' "$sub/probe/raw.log" || return 1 ;;
                 *) (( negative_raw > 0 && probe_raw == 28 )) || return 1 ;;
             esac
             if [[ $key == dns-* ]]; then
-                [[ $(cat "$sub/negative/raw.log") == *'no servers could be reached'* ]] || return 1
+                grep -aFq 'no servers could be reached' "$sub/negative/raw.log" || return 1
             else
-                [[ $(cat "$sub/negative/raw.log") == *'refused'* || $(cat "$sub/negative/raw.log") == *'timed out'* ]] || return 1
-                [[ $(cat "$sub/probe/raw.log") == *'timed out'* || $(cat "$sub/probe/raw.log") == *'Timeout'* ]] || return 1
+                { grep -aFq 'refused' "$sub/negative/raw.log" || grep -aFq 'timed out' "$sub/negative/raw.log"; } || return 1
+                { grep -aFq 'timed out' "$sub/probe/raw.log" || grep -aFq 'Timeout' "$sub/probe/raw.log"; } || return 1
             fi
-            [[ $(cat "$sub/negative.log") == "$(cat "$sub/negative/raw.log")" ]] || return 1
-            [[ $(cat "$sub/probe.log") == *"$(cat "$sub/probe/raw.log")"* ]] || return 1
-            [[ $(cat "$sub/negative/raw.log") != *'Error response from daemon:'* && $(cat "$sub/probe/raw.log") != *'Error response from daemon:'* ]] || return 1
+            mapping_isolation_raw_log_accept "$sub" negative || return $?
+            if [[ $key == dns-tcp ]]; then
+                mapping_isolation_tcp_dns_raw_log_accept "$sub" "$(sed -n '8s/^arg\t//p' "$sub/probe/command.tsv")" "$product_id" || return $?
+            else
+                mapping_isolation_raw_log_accept "$sub" probe || return $?
+            fi
+            ! grep -aFq 'Error response from daemon:' "$sub/negative/raw.log" && ! grep -aFq 'Error response from daemon:' "$sub/probe/raw.log" || return 1
             [[ $(cat "$sub/negative.tsv") == $'probe_exit\t0' && $(cat "$sub/reject.layer") == policy && -s $sub/negative.log && -s $sub/probe.log ]] || return 1
             request=$(mapping_assert_uint_file "$sub/negative.exit") || return 80
             [[ $request == 0 ]] || return 1
