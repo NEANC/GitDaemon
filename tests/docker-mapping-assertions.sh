@@ -1521,7 +1521,7 @@ mapping_full_accept() {
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
-    local request baseline recovery baseline_before baseline_after before after recovered name
+    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name
     [[ -d $dir && ! -L $dir ]] || return 80
     mapping_assert_identity_load "$dir" || return 80
     [[ $MPA_RUN_ID == "$run" && $MPA_SCENARIO == "$scenario" && $MPA_GENERATION == "$generation" \
@@ -1555,7 +1555,9 @@ mapping_negative_case_evidence_accept() {
             [[ $(awk -F '\t' '$1 == "request_exit" {print $2}' "$dir/tls-layer.tsv") == "$request" ]] || return 1
             (( before == after )) || return 1
             cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
-            [[ $(mapping_assert_uint_file "$dir/upstream.before") == $(mapping_assert_uint_file "$dir/upstream.after") ]] || return 1
+            upstream_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 80
+            upstream_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
+            [[ $upstream_before == "$upstream_after" ]] || return 1
             grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1

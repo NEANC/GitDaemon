@@ -77,6 +77,26 @@ matrix_tls_requires_bound_raw_layer() {
     printf '1\n' > "$evidence/upstream.after"
     ! mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || rc=1
     printf '0\n' > "$evidence/upstream.after"
+    for name in upstream.before upstream.after; do
+        printf 'bogus\n' > "$evidence/$name"
+        result=0
+        mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || result=$?
+        [[ $result == 80 ]] || rc=1
+        printf '0\n' > "$evidence/$name"
+        mv "$evidence/$name" "$evidence/$name.saved"
+        result=0
+        mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || result=$?
+        [[ $result == 80 ]] || rc=1
+        mv "$evidence/$name.saved" "$evidence/$name"
+    done
+    printf 'bogus\n' > "$evidence/upstream.before"
+    printf 'bogus\n' > "$evidence/upstream.after"
+    result=0
+    mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || result=$?
+    [[ $result == 80 ]] || rc=1
+    printf '0\n' > "$evidence/upstream.before"
+    printf '0\n' > "$evidence/upstream.after"
+    mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || rc=1
     printf 'only a failed request\n' > "$evidence/request.baseline.log"
     ! mapping_negative_case_evidence_accept "$case_id" run scenario generation manifest input "$evidence" || rc=1
     cp "$evidence/request.recovery.log" "$evidence/request.baseline.log"
@@ -161,6 +181,19 @@ matrix_proxy_ca_accepts_real_dedicated_run() {
     result=0; mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || result=$?
     [[ $result == 1 ]] || return 1
     printf '4\n' > "$evidence/upstream.after"
+    for name in upstream.before upstream.after; do
+        printf 'bogus\n' > "$evidence/$name"
+        result=0; mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || result=$?
+        [[ $result == 80 ]] || return 1
+        printf '4\n' > "$evidence/$name"
+    done
+    printf 'bogus\n' > "$evidence/upstream.before"
+    printf 'bogus\n' > "$evidence/upstream.after"
+    result=0; mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || result=$?
+    [[ $result == 80 ]] || return 1
+    printf '4\n' > "$evidence/upstream.before"
+    printf '4\n' > "$evidence/upstream.after"
+    mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || return 1
     for name in upstream.before upstream.after; do
         mv "$evidence/$name" "$evidence/$name.saved"
         result=0; mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || result=$?
