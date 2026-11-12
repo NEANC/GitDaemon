@@ -39,12 +39,13 @@ upstream_ca_git_8443_restores_refs() {
     mapping_scenario_local_refs() { printf 'abc\trefs/heads/main\n'; }
     mapping_scenario_local_head() { printf 'abc\n'; }
     mapping_scenario_local_fsck() { printf '0\n'; }
+    printf '0\n' > "$dir/proxy-count"
+    printf '0\n' > "$dir/dial-count"
     printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"
     printf 'abc\n' > "$dir/head.expected"
     mkdir -p "$dir/control"
     printf 'abc\n' > "$dir/control/unique-commit"
     printf 'run_id\tr1\nscenario\tmapping-fallback\ngeneration\tg1\nnetwork_id\tn1\nimage_id\ti1\nprofile_sha256\tp1\ninput_sha256\ta1\nmanifest_sha256\tm1\nunique_commit\tabc\n' > "$dir/identity.tsv"
-    printf '0\n' > "$dir/proxy-count" "$dir/dial-count"
     mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
     [[ $rc == 0 && $(cat "$dir/baseline.exit") == 0 && $(cat "$dir/request.exit") == 128 && $(cat "$dir/recovery.exit") == 0 ]] || return 1
     [[ $(cat "$dir/proxy.before") == 1 && $(cat "$dir/proxy.after") == 2 && $(cat "$dir/proxy.recovered") == 3 ]] || return 1
@@ -55,6 +56,45 @@ upstream_ca_git_8443_restores_refs() {
     [[ $(cat "$dir/fsck.exit") == 0 ]] || return 1
     mapping_negative_rejected wrong_upstream_ca fallback "$dir" || return 1
     [[ $MAPPING_ASSERT_REJECT_LAYER == tls-upstream ]] || return 1
+    mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || return 1
+    local matrix="${dir}-matrix.tsv"
+    printf 'wrong_upstream_ca\tr1\tmapping-fallback\tg1\tm1\ta1\t%s\t0\tPASS\n' "$dir" > "$matrix"
+    for n in $MAPPING_NEGATIVE_CASES; do
+        [[ $n == wrong_upstream_ca ]] && continue
+        mkdir -p "$dir/raw-${n//\//-}"
+        printf '%s\tr1\tmapping-fallback\tg1\tm1\ta1\t%s\t0\tPASS\n' "$n" "$dir/raw-${n//\//-}" >> "$matrix"
+    done
+    rc=0; mapping_negative_matrix_accept "$matrix" r1 m1 a1 || rc=$?
+    [[ $rc == 80 ]] || return 1
+    printf 'other\n' > "$dir/head.actual"
+    rc=0; mapping_negative_matrix_accept "$matrix" r1 m1 a1 || rc=$?
+    [[ $rc == 1 ]] || return 1
+    printf 'abc\n' > "$dir/head.actual"
+    rm -f "$matrix"
+    for n in baseline.before baseline.after upstream.baseline.before upstream.baseline request.baseline.log request.recovery.log connect.failed.new; do
+        mv "$dir/$n" "$dir/$n.saved"
+        rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
+        [[ $rc == 80 ]] || return 1
+        mv "$dir/$n.saved" "$dir/$n"
+    done
+    printf 'fatal: unrelated error\n' > "$dir/request.failed.log"
+    rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/request.failed.log"
+    printf 'old\trefs/heads/main\n' > "$dir/refs.actual"
+    rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    printf 'abc\trefs/heads/main\n' > "$dir/refs.actual"
+    printf 'other\n' > "$dir/head.actual"
+    rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    printf 'abc\n' > "$dir/head.actual"
+    mv "$dir/fsck.exit" "$dir/fsck.saved"
+    rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
+    [[ $rc == 80 ]] || return 1
+    mv "$dir/fsck.saved" "$dir/fsck.exit"
+    rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback other m1 a1 "$dir" || rc=$?
+    [[ $rc == 80 ]] || return 1
     [[ $(wc -l < "$dir/calls") == 3 ]] || return 1
     grep -Fq 'PROXY_URL=https://gm-proxy:8443' "$dir/calls" || return 1
     ! grep -Eq '8444|--insecure|--proxy-insecure' "$dir/calls"
@@ -64,6 +104,8 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
     local mode dir rc n
     for mode in stale-ref equal-stale-refs bad-head missing-object missing-refs missing-head missing-fsck invalid-fsck failed-head absent-unique absent-identity mismatched-identity; do
         dir=$(mktemp -d)
+        printf '0\n' > "$dir/proxy-count"
+        printf '0\n' > "$dir/dial-count"
         MAPPING_PRODUCT_IMAGE=product MAPPING_PROXY_HOST=gm-proxy MAPPING_PROXY_ACCEPT_PORT=8443
         MAPPING_CLIENT_UPSTREAM_CA=/ca/upstream-ca.crt MAPPING_CLIENT_PROXY_CA=/ca/proxy-ca.crt
         MAPPING_UPSTREAM_HOST=github.com MAPPING_UPSTREAM_OWNER=acme MAPPING_UPSTREAM_REPO=demo
@@ -105,7 +147,6 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
             [[ $mode != missing-fsck ]] || return 9
             if [[ $mode == missing-object ]]; then printf '1\n'; elif [[ $mode == invalid-fsck ]]; then printf 'invalid\n'; else printf '0\n'; fi
         }
-        printf '0\n' > "$dir/proxy-count" "$dir/dial-count"
         printf 'abc\n' > "$dir/head.expected"
         if [[ $mode == stale-ref ]]; then printf 'other\trefs/heads/main\n' > "$dir/refs.expected"; elif [[ $mode == equal-stale-refs ]]; then printf 'old\trefs/heads/main\n' > "$dir/refs.expected"; else printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"; fi
         rc=0
@@ -172,7 +213,7 @@ upstream_ca_missing_dial_is_not_inner_failure() {
     mapping_proxy_count_read_remote() {
         if [[ -f $dir/injected ]]; then printf '2\n'; elif [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi
     }
-    mapping_scenario_upstream_count() { printf '1\n'; }
+    mapping_scenario_upstream_count() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
     mapping_scenario_connect_evidence() {
         printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'
         if [[ -f $dir/baseline.exit ]]; then
