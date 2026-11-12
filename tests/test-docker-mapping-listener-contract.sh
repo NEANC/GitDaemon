@@ -13,7 +13,7 @@ resource_verify_object() { [[ $1 == container && $2 == "$CONTRACT_ID" && $3 == m
 mapping_fixture_docker() {
     case "$1 $2" in
         'inspect -f') printf '%s\n' "$CONTRACT_ID" ;;
-        'exec gm-contract-witness')
+        "exec $CONTRACT_ID")
             shift 2
             if [[ $1 == sh ]]; then
                 if [[ $* == *'start=$1'* ]]; then

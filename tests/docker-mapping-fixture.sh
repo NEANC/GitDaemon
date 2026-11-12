@@ -479,23 +479,32 @@ mapping_receiver_probe() {
     [[ $(mapping_fixture_docker inspect -f '{{.Id}}' "$receiver") == "$id" ]] || return 80
     return 0
 }
-
-# 按账本登记容器与监听进程特征获取唯一 PID，拒绝猜测信号目标。
-mapping_receiver_listener_pid() {
-    local key=${1:-} receiver="gm-$MP_RUN_ID-witness" port process pids id ledger
-    mapping_witness_key_valid "$key" || return 80
-    case "$key" in
-        cross-network|host-published) port=19419; process=nc ;;
-        host-input) port=19420; process=nc ;;
-        dns-udp|dns-tcp) port=53; process=dnsmasq ;;
-    esac
+mapping_receiver_listener_container_id() {
+    local receiver="gm-$MP_RUN_ID-witness" ledger id
     ledger=$(resource_ledger_dir) || return 80
     RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
     resource_crosscheck "$ledger" || return 80
     id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$receiver") || return 80
     [[ $id =~ ^[0-9a-f]{64}$ ]] || return 80
     resource_verify_object container "$id" mapping witness '' || return 80
-    pids=$(mapping_fixture_docker exec "$receiver" sh -c '
+    [[ $(mapping_fixture_docker inspect -f '{{.Id}}' "$id") == "$id" ]] || return 80
+    [[ $(mapping_fixture_docker inspect -f '{{.Id}}' "$receiver") == "$id" ]] || return 80
+    printf '%s\n' "$id"
+}
+
+
+# 按账本登记容器与监听进程特征获取唯一 PID，拒绝猜测信号目标。
+mapping_receiver_listener_pid() {
+    local key=${1:-} expected_id=${2:-} port process pids id
+    mapping_witness_key_valid "$key" || return 80
+    case "$key" in
+        cross-network|host-published) port=19419; process=nc ;;
+        host-input) port=19420; process=nc ;;
+        dns-udp|dns-tcp) port=53; process=dnsmasq ;;
+    esac
+    id=$(mapping_receiver_listener_container_id) || return 80
+    [[ -z $expected_id || $id == "$expected_id" ]] || return 80
+    pids=$(mapping_fixture_docker exec "$id" sh -c '
         for path in /proc/[0-9]*; do
             IFS= read -r comm < "$path/comm" 2>/dev/null || continue
             case "$comm" in "$1"|busybox) ;; *) continue ;; esac
@@ -533,31 +542,35 @@ mapping_receiver_listener_pid() {
 }
 
 mapping_receiver_listener_control() {
-    local key=${1:-} signal=${2:-} expected=${3:-} receiver="gm-$MP_RUN_ID-witness" pids identity saved file
+    local key=${1:-} signal=${2:-} expected=${3:-} pids identity saved file id
     [[ $signal == STOP || $signal == CONT ]] || return 80
-    pids=$(mapping_receiver_listener_pid "$key") || return 80
+    id=$(mapping_receiver_listener_container_id) || return 80
+    pids=$(mapping_receiver_listener_pid "$key" "$id") || return 80
     [[ $signal != CONT || $expected == "$pids" ]] || return 80
     file=${IT_CONTROL_DIR:-}/listener-$([[ $key == dns-* ]] && printf dns || printf '%s' "$key").identity
     [[ -n ${IT_CONTROL_DIR:-} && -d $IT_CONTROL_DIR && ! -L $file ]] || return 80
-    identity=$(mapping_receiver_listener_identity "$pids" "$key") || return 80
+    identity=$(mapping_receiver_listener_identity "$pids" "$key" "$id") || return 80
     if [[ $signal == CONT ]]; then
         [[ -f $file ]] || return 80
         saved=$(cat -- "$file") || return 80
         [[ $saved == "$identity" ]] || return 80
     fi
-    mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf R || printf T)" || return 80
+    mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf R || printf T)" "$id" || return 80
     if [[ $signal == STOP ]]; then
         printf '%s\n' "$identity" > "$file" || return 80
     fi
-    mapping_fixture_docker exec "$receiver" kill -"$signal" "$pids" >/dev/null || return 80
-    mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf T || printf R)" || return 80
+    [[ $(mapping_receiver_listener_container_id) == "$id" ]] || return 80
+    mapping_fixture_docker exec "$id" kill -"$signal" "$pids" >/dev/null || return 80
+    mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf T || printf R)" "$id" || return 80
     if [[ $signal == CONT ]]; then rm -f -- "$file" || return 80; fi
     printf '%s\n' "$pids"
 }
 
 mapping_receiver_listener_identity() {
-    local pid=$1 key=$2 receiver="gm-$MP_RUN_ID-witness"
-    mapping_fixture_docker exec "$receiver" sh -c '
+    local pid=$1 key=$2 id=${3:-}
+    [[ -n $id ]] || id=$(mapping_receiver_listener_container_id) || return 80
+    [[ $(mapping_receiver_listener_container_id) == "$id" ]] || return 80
+    mapping_fixture_docker exec "$id" sh -c '
         IFS= read -r stat < "/proc/$1/stat" || exit 80
         pid=$1
         key=$2
@@ -590,9 +603,11 @@ mapping_receiver_listener_identity() {
 }
 
 mapping_receiver_listener_state() {
-    local pid=$1 expected_state=$2 receiver="gm-$MP_RUN_ID-witness"
+    local pid=$1 expected_state=$2 id=${3:-}
     [[ $pid =~ ^[0-9]+$ ]] || return 80
-    mapping_fixture_docker exec "$receiver" sh -c '
+    [[ -n $id ]] || id=$(mapping_receiver_listener_container_id) || return 80
+    [[ $(mapping_receiver_listener_container_id) == "$id" ]] || return 80
+    mapping_fixture_docker exec "$id" sh -c '
         IFS= read -r stat < "/proc/$1/stat" || exit 80
         state=${stat##*) }; state=${state%% *}
         case "$2:$state" in T:T|R:R|R:S|R:D|R:I) exit 0 ;; *) exit 80 ;; esac
@@ -715,8 +730,10 @@ mapping_probe_egress() {
 
 # 核验 CONT 后原监听 PID 仍存在且不处于停止态。
 mapping_receiver_listener_running() {
-    local key=$1 pid=$2 receiver="gm-$MP_RUN_ID-witness"
-    mapping_fixture_docker exec "$receiver" sh -c '
+    local key=$1 pid=$2 id
+    id=$(mapping_receiver_listener_container_id) || return 80
+    mapping_receiver_listener_identity "$pid" "$key" "$id" >/dev/null || return 80
+    mapping_fixture_docker exec "$id" sh -c '
         kill -0 "$1" 2>/dev/null || exit 1
         IFS= read -r stat < "/proc/$1/stat" || exit 1
         state=${stat##*) }
