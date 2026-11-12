@@ -784,12 +784,12 @@ mapping_isolation_check() {
         [[ -n ${IT_EVIDENCE_DIR:-} && ! -e $dir && ! -L $dir ]] || return 80
         mkdir -p "$dir" || return 80
         mapping_receiver_probe "$key" || return 80
-        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         for name in rules witness receipt; do
             cp -- "$base/mapping-snapshot-$CONTROL_SEQ.$name" "$dir/calibration.before.$name" || return 80
         done
         mapping_receiver_probe "$key" || return 80
-        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         for name in rules witness receipt; do
             cp -- "$base/mapping-snapshot-$CONTROL_SEQ.$name" "$dir/calibration.after.$name" || return 80
         done
@@ -812,7 +812,7 @@ mapping_isolation_check() {
             stage=negative-probe original_rc=$negative_rc
         fi
         if [[ $stage == none ]]; then
-            mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || { original_rc=$?; stage=snapshot; }
+            mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || { original_rc=$?; stage=snapshot; }
         fi
         if [[ $stage == none ]]; then
             for name in rules witness receipt; do
@@ -823,11 +823,11 @@ mapping_isolation_check() {
         [[ $stage == none ]] || return 80
         printf 'probe_exit\t%s\n' "$negative_rc" > "$dir/negative.tsv" || return 80
         mapping_receiver_probe "$key" || return 80
-        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         seq_before=${CONTROL_SEQ:-0}
         printf '%s\n' "$seq_before" > "$dir/seq.before" || return 80
         mapping_probe_egress "$product" "$generation" "$key" > "$dir/probe.log" 2>&1 || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
-        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+        mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         seq_after=${CONTROL_SEQ:-0}
         printf '%s\n' "$seq_after" > "$dir/seq.after" || return 80
         before=$base/mapping-snapshot-$seq_before.rules

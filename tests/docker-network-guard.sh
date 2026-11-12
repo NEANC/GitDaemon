@@ -418,20 +418,24 @@ guard_mapping_rules() {
 }
 # 保存映射两端原始计数：发起端 iptables-save -c 与接收端见证链。
 guard_mapping_snapshot() {
-    local seq=$1 generation=$2 network_id=$3 profile_sha256=$4 pid counts receipt temporary
+    local seq=$1 generation=$2 network_id=$3 profile_sha256=$4 target=${5:-} pid counts receipt temporary rules_sha witness_sha
+    mapping_witness_key_valid "$target" || return 80
     iptables-save -c > "$E/mapping-snapshot-$seq.rules" || return 80
     pid=$(guard_mapping_witness_identity) || return 80
     nsenter -t "$pid" -n iptables -t raw -nvxL "MS$RUN" > "$E/mapping-snapshot-$seq.witness" || return 80
     counts=$(mapping_witness "$E/mapping-snapshot-$seq.witness") || return 80
     [[ -n $counts ]] || return 80
     chmod a+r "$E/mapping-snapshot-$seq.rules" "$E/mapping-snapshot-$seq.witness" || return 80
+    rules_sha=$(sha256sum "$E/mapping-snapshot-$seq.rules") || return 80
+    witness_sha=$(sha256sum "$E/mapping-snapshot-$seq.witness") || return 80
+    rules_sha=${rules_sha%% *}
+    witness_sha=${witness_sha%% *}
+    [[ $rules_sha =~ ^[0-9a-f]{64}$ && $witness_sha =~ ^[0-9a-f]{64}$ ]] || return 80
     receipt="$E/mapping-snapshot-$seq.receipt"
     [[ ! -e $receipt && ! -L $receipt ]] || return 80
     temporary=$(mktemp "$E/.mapping-snapshot-$seq.XXXXXXXX") || return 80
-    if ! printf 'seq\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' \
-        "$seq" "$generation" "$network_id" "$profile_sha256" \
-        "$(sha256sum "$E/mapping-snapshot-$seq.rules" | cut -d' ' -f1)" \
-        "$(sha256sum "$E/mapping-snapshot-$seq.witness" | cut -d' ' -f1)" > "$temporary" || \
+    if ! printf 'target\t%s\nseq\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' \
+        "$target" "$seq" "$generation" "$network_id" "$profile_sha256" "$rules_sha" "$witness_sha" > "$temporary" || \
         ! chmod 644 "$temporary" || ! mv -T -- "$temporary" "$receipt"; then
         rm -f -- "$temporary"
         return 80
@@ -532,13 +536,14 @@ guard_mapping_ready_activate() {
 
 # 统一处理专用 mapping 与 full 的三类 mapping 控制请求，并在成功后写 ACK。
 guard_mapping_request_handle() {
-    local request=$1 generation=$2 network_id=$3 profile_sha256=$4 nonce=$5
+    local request=$1 generation=$2 network_id=$3 profile_sha256=$4 nonce=$5 target=${6:-}
     [[ -n $nonce && $nonce != "$last_nonce" ]] || return 65
     case "$request" in
         mapping-ready) guard_mapping_ready_activate "$generation" "$network_id" "$profile_sha256" || return $? ;;
         mapping-snapshot)
+            mapping_witness_key_valid "$target" || return 65
             guard_mapping_generation "$request" "$generation" "$network_id" "$profile_sha256" || return $?
-            guard_mapping_snapshot "$seq" "$generation" "$network_id" "$profile_sha256" || return $?
+            guard_mapping_snapshot "$seq" "$generation" "$network_id" "$profile_sha256" "$target" || return $?
             ;;
         mapping-release) guard_mapping_release "$generation" "$network_id" "$profile_sha256" "$rules_start" || return $? ;;
         *) return 65 ;;
@@ -557,7 +562,7 @@ guard_full_mapping_request() {
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
 guard_mapping_main() {
     local mode=$1 source=$2 run=$3 evidence=$4 image=$5 tools=$6 manifest=$7 attestation=$8 profile=$9
-    local bridge chain early returnc seq=1 ready=0 rc=0 request nonce sha netid generation rules_start last_nonce='' state
+    local bridge chain early returnc seq=1 ready=0 rc=0 request nonce sha netid generation target rules_start last_nonce='' state
     local existing routes resources links rules table c ids parent command
     [[ -n $profile && -f $profile ]] || return 2
     mapping_profile_load "$profile" || return $?
@@ -635,12 +640,15 @@ guard_mapping_main() {
     while kill -0 "$CHILD" 2>/dev/null; do
         guard_signal_checkpoint
         if [[ -f $E/control/request-$seq ]]; then
-            read -r request generation netid sha nonce < "$E/control/request-$seq"
+            read -r request generation netid sha target nonce < "$E/control/request-$seq"
             case "$request" in
-                mapping-ready|mapping-snapshot|mapping-release)
-                    guard_mapping_request_handle "$request" "$generation" "$netid" "$sha" "$nonce" || exit $?
+                mapping-ready|mapping-release)
+                    guard_mapping_request_handle "$request" "$generation" "$netid" "$sha" "$target" || exit $?
                     [[ $request != mapping-ready ]] || ready=1
                     [[ $request != mapping-release ]] || ready=0
+                    ;;
+                mapping-snapshot)
+                    guard_mapping_request_handle "$request" "$generation" "$netid" "$sha" "$nonce" "$target" || exit $?
                     ;;
                 *) exit 65 ;;
             esac

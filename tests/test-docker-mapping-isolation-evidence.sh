@@ -43,11 +43,11 @@ isolation_produces_and_consumes_five_bound_cases() (
     mapping_profile_load "$MAPPING_PROFILE"
     identity_write "$dir"
     mapping_control_request() {
-        [[ $1 == mapping-snapshot && $2 == g1 && $3 == net-one && $4 == "$MP_PROFILE_SHA256" ]] || return 65
+        [[ $1 == mapping-snapshot && $2 == g1 && $3 == net-one && $4 == "$MP_PROFILE_SHA256" && ${5:-} == "$MAPPING_ASSERT_TARGET" ]] || return 65
         count=$((count + 1)); CONTROL_SEQ=$count
         snapshot_write "$root/mapping-snapshot-$count.rules" "$((count % 5 == 0 ? 20 : 10))"
         witness_write "$received" "$root/mapping-snapshot-$count.witness" "$MAPPING_ASSERT_TARGET"
-        printf 'seq\t%s\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' "$count" "$MP_PROFILE_SHA256" \
+        printf 'target\t%s\nseq\t%s\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' "$MAPPING_ASSERT_TARGET" "$count" "$MP_PROFILE_SHA256" \
             "$(sha256sum "$root/mapping-snapshot-$count.rules" | cut -d' ' -f1)" \
             "$(sha256sum "$root/mapping-snapshot-$count.witness" | cut -d' ' -f1)" > "$root/mapping-snapshot-$count.receipt"
     }
@@ -69,6 +69,26 @@ isolation_produces_and_consumes_five_bound_cases() (
         mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     done
     [[ $count == 25 ]] || return 1
+    for name in calibration.before calibration.after negative before after; do
+        cp "$dir/isolation/dns-udp/$name.receipt" "$dir/isolation/host-input/$name.receipt"
+        cp "$dir/isolation/dns-udp/$name.rules" "$dir/isolation/host-input/$name.rules"
+        cp "$dir/isolation/dns-udp/$name.witness" "$dir/isolation/host-input/$name.witness"
+    done
+    cp "$dir/isolation/host-input/seq.before" "$WORK/seq.before"
+    cp "$dir/isolation/host-input/seq.after" "$WORK/seq.after"
+    cp "$dir/isolation/dns-udp/seq.before" "$dir/isolation/host-input/seq.before"
+    cp "$dir/isolation/dns-udp/seq.after" "$dir/isolation/host-input/seq.after"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/seq.before" "$dir/isolation/host-input/seq.before"
+    cp "$WORK/seq.after" "$dir/isolation/host-input/seq.after"
+    count=11
+    for name in calibration.before calibration.after negative before after; do
+        for key in rules witness receipt; do
+            cp "$root/mapping-snapshot-$count.$key" "$dir/isolation/host-input/$name.$key"
+        done
+        count=$((count + 1))
+    done
     for key in $MAPPING_WITNESS_KEYS; do
         [[ -s $dir/isolation/$key/calibration.before.receipt && -s $dir/isolation/$key/calibration.after.receipt \
             && -s $dir/isolation/$key/negative.receipt && -s $dir/isolation/$key/before.receipt \
@@ -174,11 +194,12 @@ isolation_stop_failure_restores_or_blocks() (
     mapping_receiver_probe() { probes=$((probes + 1)); [[ $paused == 0 ]] || return 80; }
     mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
     mapping_control_request() {
+        [[ $1 == mapping-snapshot && ${5:-} == cross-network ]] || return 65
         [[ $mode != snapshot_failure || $paused == 0 ]] || return 77
         CONTROL_SEQ=$(( ${CONTROL_SEQ:-0} + 1 ))
         snapshot_write "$root/mapping-snapshot-$CONTROL_SEQ.rules" 10
         witness_write "$probes" "$root/mapping-snapshot-$CONTROL_SEQ.witness" cross-network
-        printf 'seq\t%s\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' "$CONTROL_SEQ" "$MP_PROFILE_SHA256" \
+        printf 'target\tcross-network\nseq\t%s\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' "$CONTROL_SEQ" "$MP_PROFILE_SHA256" \
             "$(sha256sum "$root/mapping-snapshot-$CONTROL_SEQ.rules" | cut -d' ' -f1)" \
             "$(sha256sum "$root/mapping-snapshot-$CONTROL_SEQ.witness" | cut -d' ' -f1)" > "$root/mapping-snapshot-$CONTROL_SEQ.receipt"
         if [[ $mode == snapshot_copy_failure && $paused == 1 ]]; then

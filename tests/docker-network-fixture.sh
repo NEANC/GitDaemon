@@ -55,10 +55,16 @@ network_control() {
 
 # 发送绑定 generation、网络和档案摘要的封闭控制请求。
 mapping_control_request() {
-    local action=${1:-} generation=${2:-} network_id=${3:-} profile_sha256=${4:-}
+    local action=${1:-} generation=${2:-} network_id=${3:-} profile_sha256=${4:-} target=${5:-}
     case "$action" in mapping-ready|mapping-snapshot|mapping-release) ;; *) return 65 ;; esac
     [[ -n $generation && -n $network_id && $profile_sha256 =~ ^[0-9a-f]{64}$ ]] || return 65
-    network_control "$action $generation $network_id $profile_sha256" || return $?
+    if [[ $action == mapping-snapshot ]]; then
+        mapping_witness_key_valid "$target" || return 65
+        network_control "$action $generation $network_id $profile_sha256 $target" || return $?
+    else
+        [[ $# == 4 ]] || return 65
+        network_control "$action $generation $network_id $profile_sha256" || return $?
+    fi
     [[ ${MAPPING_ACK_GENERATION:-} == "$generation" ]] || return 65
     return 0
 }

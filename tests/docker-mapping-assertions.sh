@@ -1579,16 +1579,16 @@ mapping_full_accept() {
     return 0
 }
 mapping_isolation_snapshot_receipt_accept() {
-    local sub=$1 stage=$2 generation=$3 network_id=$4 profile_sha256=$5 expected_seq=$6 receipt=$1/$2.receipt
+    local sub=$1 stage=$2 generation=$3 network_id=$4 profile_sha256=$5 expected_seq=$6 target=$7 receipt=$1/$2.receipt
     local seq rules_sha witness_sha root=${IT_CONTROL_DIR%/control}
     [[ -f $receipt && ! -L $receipt && -r $receipt && -s $receipt ]] || return 80
-    [[ $(wc -l < "$receipt") == 6 ]] || return 80
+    [[ $(wc -l < "$receipt") == 7 ]] || return 80
     seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$receipt")
     rules_sha=$(awk -F '\t' '$1 == "rules_sha256" {print $2}' "$receipt")
     witness_sha=$(awk -F '\t' '$1 == "witness_sha256" {print $2}' "$receipt")
     [[ $seq =~ ^[1-9][0-9]*$ && $rules_sha =~ ^[0-9a-f]{64}$ && $witness_sha =~ ^[0-9a-f]{64}$ ]] || return 80
-    [[ $(cat "$receipt") == "$(printf 'seq\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s' \
-        "$seq" "$generation" "$network_id" "$profile_sha256" "$rules_sha" "$witness_sha")" ]] || return 1
+    [[ $(cat "$receipt") == "$(printf 'target\t%s\nseq\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s' \
+        "$target" "$seq" "$generation" "$network_id" "$profile_sha256" "$rules_sha" "$witness_sha")" ]] || return 1
     [[ $seq == "$expected_seq" ]] || return 1
     [[ -n ${IT_CONTROL_DIR:-} && $root != "$IT_CONTROL_DIR" && -f $root/mapping-snapshot-$seq.receipt && ! -L $root/mapping-snapshot-$seq.receipt && -r $root/mapping-snapshot-$seq.receipt ]] || return 80
     cmp -s "$receipt" "$root/mapping-snapshot-$seq.receipt" || return 1
@@ -1632,7 +1632,7 @@ mapping_negative_case_evidence_accept() {
                 if [[ -z $request ]]; then
                     request=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/$name.receipt")
                 fi
-                mapping_isolation_snapshot_receipt_accept "$sub" "$name" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256" "$request" || return $?
+                mapping_isolation_snapshot_receipt_accept "$sub" "$name" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256" "$request" "$key" || return $?
             done
             local calibration_before_seq calibration_after_seq negative_seq
             calibration_before_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/calibration.before.receipt")
