@@ -1598,6 +1598,42 @@ mapping_isolation_snapshot_receipt_accept() {
 }
 
 
+mapping_isolation_probe_command_accept() {
+    local sub=$1 kind=$2 key=$3 generation=$4 network=$5 before=$6 after=$7 product=${8:-} file=$1/$2/command.tsv
+    local spec proto port dest token command status raw_sha
+    local -a argv
+    [[ -f $file && ! -L $file && -s $file ]] || return 80
+    status=$(mapping_assert_uint_file "$sub/$kind/raw.exit") || return 80
+    raw_sha=$(sha256sum "$sub/$kind/raw.log") || return 80
+    raw_sha=${raw_sha%% *}
+    spec=$(mapping_witness_spec "$key") || return 80
+    IFS=$'\t' read -r proto port dest <<< "$spec"
+    token="$MPA_RUN_ID-$generation-$key"
+    if [[ $kind == negative ]]; then
+        case $key in
+            dns-*) [[ $key != dns-udp ]] || proto=+notcp; [[ $key != dns-tcp ]] || proto=+tcp
+                argv=(exec "gm-$MPA_RUN_ID-witness" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A) ;;
+            *) [[ $key != host-input ]] || port=49383
+                argv=(exec "gm-$MPA_RUN_ID-witness" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'") ;;
+        esac
+    else
+        case $key in
+            dns-udp) argv=(exec "$product" timeout 4 busybox nslookup "$MPA_RUN_ID-$generation.invalid" "$dest") ;;
+            dns-tcp) argv=(exec "$(sed -n '8s/^arg\t//p' "$file")" dig +time=1 +tries=1 +tcp "@$dest" "$MPA_RUN_ID-$generation.invalid" A)
+                [[ ${argv[1]} =~ ^[0-9a-f]{64}$ ]] || return 1
+                [[ $(cat "$sub/probe.log") == *"TCP_DNS_SHARED_NETNS_TOOL=${argv[1]} PRODUCT=$product NOT_PRODUCT_DIRECT_TCP=1"* ]] || return 1 ;;
+            *) argv=(exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/") ;;
+        esac
+    fi
+    command=$(printf 'generation\t%s\nnetwork_id\t%s\ntarget\t%s\nseq_before\t%s\nexit\t%s\nraw_sha256\t%s\n' "$generation" "$network" "$key" "$before" "$status" "$raw_sha")
+    command+=$'\n'"$(printf 'arg\t%s\n' "${argv[@]}")"
+    command+=$'\n'"$(printf 'seq_after\t%s' "$after")"
+    [[ $(cat "$file") == "$command" ]] || return 1
+    [[ $before == "$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/$([[ $kind == negative ]] && printf calibration.after || printf before).receipt")" ]] || return 1
+    [[ $after == "$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/$([[ $kind == negative ]] && printf negative || printf after).receipt")" ]] || return 1
+}
+
+
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
     local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name dial_baseline_before dial_baseline dial_recovered key sub wb wa cb ca seq_before seq_after
@@ -1611,12 +1647,14 @@ mapping_negative_case_evidence_accept() {
             mapping_witness_key_valid "$key" || return 80
             sub=$dir/isolation/$key
             [[ -d $sub && ! -L $sub ]] || return 80
-            for name in binding.tsv calibration.before.rules calibration.before.witness calibration.before.receipt calibration.after.rules calibration.after.witness calibration.after.receipt negative.tsv negative.exit negative.log negative.rules negative.witness negative.receipt listener.pid listener.restored.pid listener.stopped.state listener.restored.state negative.target.tsv probe.target.tsv negative/raw.exit negative/raw.log probe/raw.exit probe/raw.log seq.before seq.after before.rules after.rules before.witness after.witness before.receipt after.receipt probe.log reject.layer; do
+            for name in binding.tsv calibration.before.rules calibration.before.witness calibration.before.receipt calibration.after.rules calibration.after.witness calibration.after.receipt negative.tsv negative.exit negative.log negative.rules negative.witness negative.receipt listener.pid listener.restored.pid listener.stopped.state listener.restored.state negative.target.tsv probe.target.tsv negative/raw.exit negative/raw.log negative/command.tsv probe/raw.exit probe/raw.log probe/command.tsv seq.before seq.after before.rules after.rules before.witness after.witness before.receipt after.receipt probe.log reject.layer; do
                 [[ -f $sub/$name && ! -L $sub/$name && -r $sub/$name && -s $sub/$name ]] || return 80
             done
             mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
             [[ $MP_RUN_ID == "$run" && $MP_PROFILE_SHA256 == "$MPA_PROFILE_SHA256" ]] || return 1
-            [[ $(cat "$sub/binding.tsv") == "$(printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s' "$key" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256")" ]] || return 1
+            product_id=$(awk -F '\t' '$1 == "product_id" {print $2}' "$sub/binding.tsv")
+            [[ $product_id =~ ^[0-9a-f]{64}$ ]] || return 80
+            [[ $(cat "$sub/binding.tsv") == "$(printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nproduct_id\t%s' "$key" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256" "$product_id")" ]] || return 1
             spec=$(mapping_witness_spec "$key") || return 80
             IFS=$'\t' read -r proto port dest <<< "$spec"
             for name in negative probe; do
@@ -1648,6 +1686,7 @@ mapping_negative_case_evidence_accept() {
             [[ $(cat "$sub/listener.pid") =~ ^[0-9]+$ && $(cat "$sub/listener.pid") == "$(cat "$sub/listener.restored.pid")" ]] || return 1
             seq_before=$(mapping_assert_uint_file "$sub/seq.before") || return 80
             seq_after=$(mapping_assert_uint_file "$sub/seq.after") || return 80
+            (( seq_after > seq_before )) || return 1
             for name in calibration.before calibration.after negative before after; do
                 case $name in
                     before) request=$seq_before ;;
@@ -1664,7 +1703,8 @@ mapping_negative_case_evidence_accept() {
             calibration_after_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/calibration.after.receipt")
             negative_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/negative.receipt")
             (( calibration_before_seq < calibration_after_seq && calibration_after_seq < negative_seq && negative_seq < seq_before )) || return 1
-            (( seq_after > seq_before )) || return 1
+            mapping_isolation_probe_command_accept "$sub" negative "$key" "$generation" "$MPA_NETWORK_ID" "$calibration_after_seq" "$negative_seq" || return $?
+            mapping_isolation_probe_command_accept "$sub" probe "$key" "$generation" "$MPA_NETWORK_ID" "$seq_before" "$seq_after" "$product_id" || return $?
             wb=$(mapping_witness "$sub/calibration.before.witness") || return 80
             wa=$(mapping_witness "$sub/calibration.after.witness") || return 80
             mapping_witness_growth "$wb" "$wa" "$key" || return 1

@@ -9,6 +9,22 @@ IT_EVIDENCE_DIR=$TEST_ROOT/evidence
 mkdir -p "$IT_EVIDENCE_DIR/control"
 IT_CONTROL_DIR=$IT_EVIDENCE_DIR/control
 
+# 为旧快照用例提供与真实产品相同的完整 ID 和账本外部边界。
+isolation_snapshot_boundaries() {
+    MP_RUN_ID=recheck MPF_SCENARIO=mapping-fallback-isolation MAPPING_ASSERT_TARGET=''
+    mapping_fixture_docker() { [[ $1 == inspect && $4 == product ]] || return 80; printf '%064d\n' 3; }
+    resource_ledger_dir() { printf '%s\n' "$IT_CONTROL_DIR/resources"; }
+    resource_crosscheck() { return 0; }
+    resource_verify_object() { [[ $1 == container && $2 == "$(printf '%064d' 3)" && $3 == mapping-fallback-isolation && $4 == product ]]; }
+    mapping_receiver_probe() { return 0; }
+    mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
+    mapping_witness() { cat "$1"; }
+    mapping_receiver_listener_control() { [[ $2 != CONT || $3 == 123 ]] || return 80; printf '123\n'; }
+    mapping_receiver_listener_observed_state() { if [[ -s $IT_EVIDENCE_DIR/isolation/$1/listener.restored.pid ]]; then printf 'R\n'; else printf 'T\n'; fi; }
+    mapping_receiver_listener_running() { return 0; }
+    mapping_receiver_negative_probe() { return 0; }
+}
+
 isolation_evidence_calibrates_before_product() (
     local key mode rc count calls=$TEST_ROOT/evidence-calls
     MAPPING_PROFILE=profile
@@ -117,16 +133,19 @@ isolation_calibration_requires_each_shared_port_probe() (
 )
 
 isolation_requires_per_target_snapshots() (
-    local dir=$TEST_ROOT/snapshots count=0 rc=0 cross=0 input=0 udp=0 tcp=0
-    mkdir -p "$dir/control"
-    IT_CONTROL_DIR=$dir/control MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
+    local snapshot_root=$TEST_ROOT/snapshots count=0 rc=0 cross=0 input=0 udp=0 tcp=0 probes=0
+    mkdir -p "$snapshot_root/control"
+    IT_CONTROL_DIR=$snapshot_root/control IT_EVIDENCE_DIR=$snapshot_root/evidence MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
     MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=netid-abc MP_PROFILE_SHA256=hash
+    isolation_snapshot_boundaries
     mapping_profile_load() { MP_RUN_ID=recheck MP_P=140.82.112.10 MP_BRIDGE=mrecheck; return 0; }
     mapping_control_request() {
+        [[ $1 == mapping-snapshot && $2 == gen1 && $3 == netid-abc && $5 == "$MAPPING_ASSERT_TARGET" ]] || return 80
         count=$((count + 1))
         CONTROL_SEQ=$count
-        printf '0\n0\n0\n0\n' > "$dir/mapping-snapshot-$count.witness"
-        printf '%s\n%s\n%s\n%s\n' "$cross" "$input" "$udp" "$tcp" > "$dir/mapping-snapshot-$count.rules"
+        printf '%s\n0\n0\n0\n' "$((count % 5 == 2))" > "$snapshot_root/mapping-snapshot-$count.witness"
+        printf '%s\n%s\n%s\n%s\n' "$cross" "$input" "$udp" "$tcp" > "$snapshot_root/mapping-snapshot-$count.rules"
+        printf 'target\t%s\nseq\t%s\n' "$5" "$count" > "$snapshot_root/mapping-snapshot-$count.receipt"
     }
     mapping_witness() { cat "$1"; }
     mapping_count() {
@@ -138,6 +157,8 @@ isolation_requires_per_target_snapshots() (
         esac
     }
     mapping_probe_egress() {
+        [[ $1 == "$(printf '%064d' 3)" && $2 == gen1 ]] || return 80
+        probes=$((probes + 1))
         case "${3:-}" in
             cross-network) cross=$((cross + 1)) ;;
             host-published) : ;;
@@ -147,31 +168,48 @@ isolation_requires_per_target_snapshots() (
             *) cross=1 input=1 udp=1 tcp=1 ;;
         esac
     }
+    MAPPING_ASSERT_TARGET=cross-network
     mapping_isolation_check product gen1 profile || rc=$?
-    [[ $rc == 1 && $count == 4 ]]
+    [[ $rc == 0 && $count == 5 && $probes == 1 ]]
+    cross=0 count=0 probes=0 rc=0
+    MAPPING_ASSERT_TARGET=host-published
+    mapping_isolation_check product gen1 profile || rc=$?
+    [[ $rc == 1 && $count == 5 && $probes == 1 ]]
 )
 
 isolation_snapshots_each_of_five_targets() (
-    local dir=$TEST_ROOT/five-snapshots count=0 probe=0 key
+    local snapshot_root=$TEST_ROOT/five-snapshots count=0 probe=0 witness_slot n
     local -a keys=(cross-network host-published host-input dns-udp dns-tcp)
-    mkdir -p "$dir/control"
-    IT_CONTROL_DIR=$dir/control MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
+    mkdir -p "$snapshot_root/control"
+    IT_CONTROL_DIR=$snapshot_root/control IT_EVIDENCE_DIR=$snapshot_root/evidence MAPPING_ASSERT_GENERATION=gen1 MAPPING_ASSERT_CALIBRATED_GENERATION=gen1
     MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=netid-abc MP_PROFILE_SHA256=hash
+    isolation_snapshot_boundaries
     mapping_profile_load() { return 0; }
     mapping_control_request() {
+        [[ $1 == mapping-snapshot && $2 == gen1 && $3 == netid-abc && $5 == "${keys[$((count / 5))]}" ]] || return 80
         count=$((count + 1))
         CONTROL_SEQ=$count
-        printf '0\n0\n0\n0\n' > "$dir/mapping-snapshot-$count.witness"
-        printf '%s\n' "$(( count / 2 ))" > "$dir/mapping-snapshot-$count.rules"
+        case "$5" in
+            cross-network|host-published) witness_slot=1 ;;
+            host-input) witness_slot=2 ;;
+            dns-udp) witness_slot=3 ;;
+            dns-tcp) witness_slot=4 ;;
+        esac
+        for n in 1 2 3 4; do
+            if [[ $n == "$witness_slot" ]]; then printf '%s\n' "$((count % 5 == 2))"; else printf '0\n'; fi
+        done > "$snapshot_root/mapping-snapshot-$count.witness"
+        printf '%s\n' "$(( count / 5 ))" > "$snapshot_root/mapping-snapshot-$count.rules"
+        printf 'target\t%s\nseq\t%s\n' "$5" "$count" > "$snapshot_root/mapping-snapshot-$count.receipt"
     }
     mapping_witness() { cat "$1"; }
     mapping_count() { cat "$1"; }
     mapping_probe_egress() {
+        [[ $1 == "$(printf '%064d' 3)" && $2 == gen1 ]] || return 80
         [[ $3 == "${keys[$probe]}" ]] || return 80
         probe=$((probe + 1))
     }
     mapping_isolation_check product gen1 profile || return 1
-    [[ $count == 10 && $probe == 5 ]]
+    [[ $count == 25 && $probe == 5 ]]
 )
 
 failed=0

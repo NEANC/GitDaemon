@@ -615,26 +615,38 @@ mapping_receiver_listener_state() {
     ' sh "$pid" "$expected_state" >/dev/null 2>&1 || return 80
 }
 
+mapping_probe_record() {
+    local file=$1 generation=$2 network=$3 target=$4 before=$5 status=$6 output=$7
+    shift 7
+    [[ -n $file ]] || return 0
+    printf 'generation\t%s\nnetwork_id\t%s\ntarget\t%s\nseq_before\t%s\nexit\t%s\nraw_sha256\t%s\n' "$generation" "$network" "$target" "$before" "$status" "$(printf '%s\n' "$output" | sha256sum | cut -d' ' -f1)" > "$file" || return 80
+    printf 'arg\t%s\n' "$@" >> "$file" || return 80
+    printf '%s\n' "$status" > "${file%/*}/raw.exit" || return 80
+    printf '%s\n' "$output" > "${file%/*}/raw.log" || return 80
+}
+
 mapping_receiver_negative_probe() {
-    local key=${1:-} dir=${2:-} spec proto port dest output status=0 token
+    local key=${1:-} dir=${2:-} spec proto port dest output status=0 token before=${CONTROL_SEQ:-0}
+    local -a argv
     spec=$(mapping_witness_spec "$key") || return 80
     IFS=$'\t' read -r proto port dest <<< "$spec"
     token="$MP_RUN_ID-${MAPPING_ASSERT_GENERATION:-}-${key}"
     case "$key" in
         cross-network|host-published|host-input)
             [[ $key != host-input ]] || port=49383
-            output=$(mapping_fixture_docker exec "gm-$MP_RUN_ID-witness" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'" 2>&1) || status=$?
+            argv=(exec "gm-$MP_RUN_ID-witness" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'")
+            output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
             ;;
         dns-udp|dns-tcp)
             [[ $key != dns-udp ]] || proto=+notcp
             [[ $key != dns-tcp ]] || proto=+tcp
-            output=$(mapping_fixture_docker exec "gm-$MP_RUN_ID-witness" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A 2>&1) || status=$?
+            argv=(exec "gm-$MP_RUN_ID-witness" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A)
+            output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
             ;;
     esac
     if [[ -n $dir ]]; then
         mkdir -p "$dir/negative" || return 80
-        printf '%s\n' "$status" > "$dir/negative/raw.exit" || return 80
-        printf '%s\n' "$output" > "$dir/negative/raw.log" || return 80
+        mapping_probe_record "$dir/negative/command.tsv" "${MAPPING_ASSERT_GENERATION:-}" "$MP_NETWORK_ID" "$key" "$before" "$status" "$output" "${argv[@]}" || return 80
     fi
     case "$key" in
         dns-*) [[ $status == 9 && $output == *'no servers could be reached'* && $output != *'Error response from daemon:'* ]] || return 80 ;;
@@ -665,6 +677,7 @@ mapping_calibrate_witness() {
 # 从产品 netns 发起五类目标探测；TCP DNS 由登记工具共享 netns 发起。
 mapping_probe_egress() {
     local product=$1 generation=$2 target=${3:-} dir=${4:-} key spec proto port dest tool facts ledger output status probe_rc remove_rc product_id write_rc
+    local -a argv
     [[ -n $product && -n $generation ]] || return 80
     for key in $MAPPING_WITNESS_KEYS; do
         [[ -z $target || $target == "$key" ]] || continue
@@ -673,11 +686,11 @@ mapping_probe_egress() {
         case "$key" in
             dns-udp)
                 status=0
-                output=$(mapping_fixture_docker exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest" 2>&1) || status=$?
+                argv=(exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest")
+                output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
                 printf '%s\n' "$output"
                 if [[ -n $dir ]]; then
-                    printf '%s\n' "$status" > "$dir/probe/raw.exit" || return 80
-                    printf '%s\n' "$output" > "$dir/probe/raw.log" || return 80
+                    mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" "$output" "${argv[@]}" || return 80
                 fi
                 if [[ $status == 0 ]]; then return 1; fi
                 [[ $output != *'Error response from daemon:'* && ( $status == 124 || ( $status == 1 && $output == *'connection timed out'* ) ) ]] || return 80
@@ -707,12 +720,12 @@ mapping_probe_egress() {
                         if [[ $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE|true|[\"ALL\"]|[\"no-new-privileges\"]" || $facts == "container:$product_id|10001:10001|true|$MPF_TOOLS_IMAGE|true|[\"ALL\"]|[\"no-new-privileges:true\"]" ]]; then
                             printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product_id"
                             status=0
-                            output=$(mapping_fixture_docker exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A 2>&1) || status=$?
+                            argv=(exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A)
+                            output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
                             printf '%s\n' "$output"
                             write_rc=0
                             if [[ -n $dir ]]; then
-                                printf '%s\n' "$status" > "$dir/probe/raw.exit" || write_rc=80
-                                printf '%s\n' "$output" > "$dir/probe/raw.log" || write_rc=80
+                                mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" "$output" "${argv[@]}" || write_rc=80
                             fi
                             if [[ $write_rc == 0 && $status == 0 && $output == *"SERVER: $dest#53("* && $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), ]]; then
                                 probe_rc=1
@@ -735,11 +748,11 @@ mapping_probe_egress() {
                 ;;
             *)
                 status=0
-                output=$(mapping_fixture_docker exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/" 2>&1) || status=$?
+                argv=(exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/")
+                output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
                 printf '%s\n' "$output"
                 if [[ -n $dir ]]; then
-                    printf '%s\n' "$status" > "$dir/probe/raw.exit" || return 80
-                    printf '%s\n' "$output" > "$dir/probe/raw.log" || return 80
+                    mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" "$output" "${argv[@]}" || return 80
                 fi
                 if [[ $status == 0 ]]; then return 1; fi
                 [[ $output != *'Error response from daemon:'* && $status == 28 && ( $output == *'Connection timed out'* || $output == *'Operation timed out'* || $output == *'Timeout was reached'* ) ]] || return 80
@@ -804,11 +817,17 @@ mapping_isolation_stop_failure() {
 # 隔离判定：五类 DROP 计数均增长、接收端计数零变化；未完成正校准不得通过。
 mapping_isolation_check() {
     local product=${1:-} generation=${2:-} profile=${3:-}
-    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name stage original_rc pid spec proto port dest
+    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name stage original_rc pid spec proto port dest product_id ledger
     [[ -n $product && -n $generation && -n $profile ]] || return 1
     [[ $MP_WITNESS_CALIBRATED == 1 && ${MAPPING_ASSERT_CALIBRATED_GENERATION:-} == "$generation" ]] || return 1
     [[ $generation == "${MAPPING_ASSERT_GENERATION:-}" ]] || return 1
     mapping_profile_load "$profile" || return 80
+    product_id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$product") || return 80
+    [[ $product_id =~ ^[0-9a-f]{64}$ ]] || return 80
+    ledger=$(resource_ledger_dir) || return 80
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    resource_crosscheck "$ledger" || return 80
+    resource_verify_object container "$product_id" "${MPF_SCENARIO:-}" product '' || return 80
     if [[ -z $MP_NETWORK_ID ]]; then MP_NETWORK_ID=$(mapping_network_id_load) || return 80; fi
     [[ -n ${IT_CONTROL_DIR:-} ]] || return 80
     base=${IT_CONTROL_DIR%/control}
@@ -860,6 +879,7 @@ mapping_isolation_check() {
             for name in rules witness receipt; do
                 cp -- "$base/mapping-snapshot-$CONTROL_SEQ.$name" "$dir/negative.$name" || { original_rc=$?; stage=snapshot-copy; break; }
             done
+            [[ $stage != none ]] || printf 'seq_after\t%s\n' "$CONTROL_SEQ" >> "$dir/negative/command.tsv" || { original_rc=80; stage=snapshot-copy; }
         fi
         mapping_isolation_resume "$key" "$dir" "$stage" "$original_rc" "$pid" || return 80
         [[ $stage == none ]] || return 80
@@ -868,10 +888,11 @@ mapping_isolation_check() {
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         seq_before=${CONTROL_SEQ:-0}
         printf '%s\n' "$seq_before" > "$dir/seq.before" || return 80
-        mapping_probe_egress "$product" "$generation" "$key" "$dir" > "$dir/probe.log" 2>&1 || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
+        mapping_probe_egress "$product_id" "$generation" "$key" "$dir" > "$dir/probe.log" 2>&1 || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
         seq_after=${CONTROL_SEQ:-0}
         printf '%s\n' "$seq_after" > "$dir/seq.after" || return 80
+        printf 'seq_after\t%s\n' "$seq_after" >> "$dir/probe/command.tsv" || return 80
         before=$base/mapping-snapshot-$seq_before.rules
         after=$base/mapping-snapshot-$seq_after.rules
         for name in rules witness receipt; do
@@ -884,7 +905,7 @@ mapping_isolation_check() {
         cb=$(mapping_count "$before" "$profile" "$key") || return 1
         ca=$(mapping_count "$after" "$profile" "$key") || return 1
         [[ $ca -gt $cb ]] || return 1
-        printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\n' "$key" "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" > "$dir/binding.tsv" || return 80
+        printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nproduct_id\t%s\n' "$key" "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$product_id" > "$dir/binding.tsv" || return 80
         printf 'policy\n' > "$dir/reject.layer" || return 80
     done
     return 0

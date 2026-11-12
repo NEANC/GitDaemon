@@ -36,12 +36,18 @@ identity_write() {
 }
 
 isolation_produces_and_consumes_five_bound_cases() (
-    local root=$WORK/run dir=$WORK/case key count=0 rc received=0 paused=0
+    local root=$WORK/run dir=$WORK/case key count=0 rc received=0 paused=0 product_id other_id
+    product_id=$(printf '%064d' 3)
+    other_id=$(printf '%064d' 4)
     mkdir -p "$root/control" "$dir"
     IT_CONTROL_DIR=$root/control IT_EVIDENCE_DIR=$dir MAPPING_PROFILE=$WORK/profile.tsv
-    MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_CALIBRATED_GENERATION=g1 MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=net-one
+    MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_CALIBRATED_GENERATION=g1 MAPPING_ASSERT_PRODUCT=$product_id MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=net-one MPF_SCENARIO=mapping-fallback-isolation
     mapping_profile_load "$MAPPING_PROFILE"
     identity_write "$dir"
+    mapping_fixture_docker() { [[ $1 == inspect && $4 == product ]] || return 80; printf '%064d\n' 3; }
+    resource_ledger_dir() { printf '%s\n' "$root/control/resources"; }
+    resource_crosscheck() { return 0; }
+    resource_verify_object() { [[ $1 == container && $2 == "$product_id" && $3 == mapping-fallback-isolation && $4 == product ]]; }
     mapping_control_request() {
         [[ $1 == mapping-snapshot && $2 == g1 && $3 == net-one && $4 == "$MP_PROFILE_SHA256" && ${5:-} == "$MAPPING_ASSERT_TARGET" ]] || return 65
         count=$((count + 1)); CONTROL_SEQ=$count
@@ -59,34 +65,40 @@ isolation_produces_and_consumes_five_bound_cases() (
     }
     mapping_receiver_negative_probe() {
         [[ $paused == 1 ]] || return 80
+        local spec proto port dest token output status
+        spec=$(mapping_witness_spec "$1"); IFS=$'\t' read -r proto port dest <<< "$spec"
+        token="mtest-g1-$1"
         if [[ $1 == dns-* ]]; then
-            printf 'no servers could be reached\n'
-            printf '9\n' > "$2/negative/raw.exit"
-            printf 'no servers could be reached\n' > "$2/negative/raw.log"
+            output='no servers could be reached'; status=9
+            [[ $1 != dns-udp ]] || proto=+notcp
+            [[ $1 != dns-tcp ]] || proto=+tcp
+            mapping_probe_record "$2/negative/command.tsv" g1 net-one "$1" "$count" "$status" "$output" exec gm-mtest-witness dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A
         else
-            printf 'connection refused\n'
-            printf '7\n' > "$2/negative/raw.exit"
-            printf 'connection refused\n' > "$2/negative/raw.log"
+            output='connection refused'; status=7
+            [[ $1 != host-input ]] || port=49383
+            mapping_probe_record "$2/negative/command.tsv" g1 net-one "$1" "$count" "$status" "$output" exec gm-mtest-witness sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'"
         fi
+        printf '%s\n' "$output"
     }
     mapping_receiver_listener_running() { [[ $paused == 0 ]]; }
     mapping_receiver_listener_observed_state() { if [[ $paused == 1 ]]; then printf 'T\n'; else printf 'R\n'; fi; }
     mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
     mapping_receiver_probe() { [[ $paused == 0 ]] || return 1; received=$((received + 1)); }
     mapping_probe_egress() {
+        local spec proto port dest output status
+        spec=$(mapping_witness_spec "$3"); IFS=$'\t' read -r proto port dest <<< "$spec"
         if [[ $3 == dns-tcp ]]; then
-            printf 'no servers could be reached\n'
-            printf '9\n' > "$4/probe/raw.exit"
-            printf 'no servers could be reached\n' > "$4/probe/raw.log"
+            output='no servers could be reached'; status=9
+            printf 'TCP_DNS_SHARED_NETNS_TOOL=%064d PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' 2 "$product_id"
+            mapping_probe_record "$4/probe/command.tsv" g1 net-one "$3" "$count" "$status" "$output" exec "$(printf '%064d' 2)" dig +time=1 +tries=1 +tcp "@$dest" mtest-g1.invalid A
         elif [[ $3 == dns-udp ]]; then
-            printf 'connection timed out\n'
-            printf '124\n' > "$4/probe/raw.exit"
-            printf 'connection timed out\n' > "$4/probe/raw.log"
+            output='connection timed out'; status=124
+            mapping_probe_record "$4/probe/command.tsv" g1 net-one "$3" "$count" "$status" "$output" exec "$1" timeout 4 busybox nslookup mtest-g1.invalid "$dest"
         else
-            printf 'connection timed out\n'
-            printf '28\n' > "$4/probe/raw.exit"
-            printf 'connection timed out\n' > "$4/probe/raw.log"
+            output='connection timed out'; status=28
+            mapping_probe_record "$4/probe/command.tsv" g1 net-one "$3" "$count" "$status" "$output" exec "$1" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/"
         fi
+        printf '%s\n' "$output"
     }
     for key in $MAPPING_WITNESS_KEYS; do
         MAPPING_ASSERT_TARGET=$key
@@ -100,6 +112,52 @@ isolation_produces_and_consumes_five_bound_cases() (
         [[ -s $sub/probe/raw.log && -s $sub/negative/raw.log && -s $sub/probe/raw.exit && -s $sub/negative/raw.exit ]] || return 1
         mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     done
+    MAPPING_ASSERT_GENERATION=g2 MAPPING_ASSERT_PRODUCT=$other_id
+    mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
+    MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_PRODUCT=$product_id
+    cp "$dir/isolation/host-input/binding.tsv" "$WORK/binding"
+    sed -i "s/$product_id/$other_id/" "$dir/isolation/host-input/binding.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/binding" "$dir/isolation/host-input/binding.tsv"
+    local sub=$dir/isolation/dns-udp
+    cp "$sub/probe/raw.exit" "$WORK/udp-exit"
+    printf '1\n' > "$sub/probe/raw.exit"
+    rc=0; mapping_negative_case_evidence_accept isolation/dns-udp mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/udp-exit" "$sub/probe/raw.exit"
+    cp "$sub/probe/command.tsv" "$WORK/udp-command"
+    sed -i 's/^exit\t124$/exit\t1/' "$sub/probe/command.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/dns-udp mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/udp-command" "$sub/probe/command.tsv"
+    sub=$dir/isolation/host-input
+    cp "$sub/probe/raw.log" "$WORK/probe-raw"
+    printf 'Operation timed out\n' > "$sub/probe/raw.log"
+    printf 'Operation timed out\n' >> "$sub/probe.log"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/probe-raw" "$sub/probe/raw.log"
+    local sub=$dir/isolation/host-input
+    [[ -s $sub/probe/command.tsv && -s $sub/negative/command.tsv ]] || return 1
+    cp "$sub/probe/command.tsv" "$WORK/probe-command.tsv"
+    cp "$dir/isolation/cross-network/probe/command.tsv" "$sub/probe/command.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/probe-command.tsv" "$sub/probe/command.tsv"
+    sed -i 's/generation\tg1/generation\tg2/' "$sub/probe/command.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/probe-command.tsv" "$sub/probe/command.tsv"
+    sed -i 's/seq_before\t14/seq_before\t4/' "$sub/probe/command.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/probe-command.tsv" "$sub/probe/command.tsv"
+    cp "$sub/negative/command.tsv" "$WORK/negative-command.tsv"
+    sed -i 's/seq_after\t13/seq_after\t8/' "$sub/negative/command.tsv"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/negative-command.tsv" "$sub/negative/command.tsv"
     [[ $count == 25 ]] || return 1
     local sub=$dir/isolation/cross-network
     for name in probe/raw.exit negative/raw.exit probe.target.tsv negative.target.tsv listener.stopped.state listener.restored.state; do
@@ -209,7 +267,7 @@ isolation_produces_and_consumes_five_bound_cases() (
     [[ $rc == 1 ]] || return 1
     printf '20\n' > "$dir/isolation/$key/seq.after"
     key=dns-udp
-    printf 'target\tother\n' > "$dir/isolation/$key/binding.tsv"
+    printf 'target\tother\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nproduct_id\t%s\n' "$MP_PROFILE_SHA256" "$product_id" > "$dir/isolation/$key/binding.tsv"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
     key=host-published
@@ -244,6 +302,29 @@ isolation_produces_and_consumes_five_bound_cases() (
     return 0
 )
 
+probe_execution_records_actual_argv() (
+    local dir=$WORK/actual-command output status=0
+    mkdir -p "$dir/probe" "$dir/negative"
+    MP_RUN_ID=mtest MP_NETWORK_ID=net-one MAPPING_ASSERT_GENERATION=g1 CONTROL_SEQ=9
+    mapping_fixture_docker() {
+        printf '%s\n' "$*" > "$dir/observed"
+        printf 'Connection timed out\n'
+        return 28
+    }
+    mapping_probe_egress product g1 host-input "$dir" > /dev/null || status=$?
+    [[ $status == 0 && $(cat "$dir/observed") == 'exec product curl --noproxy * --connect-timeout 2 --max-time 3 http://172.30.243.1:49383/' ]] || return 1
+    [[ $(cat "$dir/probe/raw.exit") == 28 && $(cat "$dir/probe/raw.log") == 'Connection timed out' ]] || return 1
+    [[ $(tail -n 1 "$dir/probe/command.tsv") == $'arg\thttp://172.30.243.1:49383/' ]] || return 1
+    mapping_fixture_docker() {
+        printf '%s\n' "$*" > "$dir/observed"
+        printf 'no servers could be reached\n'
+        return 9
+    }
+    mapping_receiver_negative_probe dns-tcp "$dir" > /dev/null || return 1
+    [[ $(cat "$dir/observed") == 'exec gm-mtest-witness dig +time=1 +tries=1 +tcp @172.30.244.53 mtest-g1-dns-tcp.invalid A' ]] || return 1
+    [[ $(cat "$dir/negative/raw.exit") == 9 && $(cat "$dir/negative/raw.log") == 'no servers could be reached' ]] || return 1
+)
+
 isolation_stop_failure_restores_or_blocks() (
     local mode=$1 root dir rc=0 paused=0 resumes=0 probes=0
     root=$WORK/$mode dir=$WORK/$mode/evidence
@@ -251,6 +332,10 @@ isolation_stop_failure_restores_or_blocks() (
     IT_CONTROL_DIR=$root/control IT_EVIDENCE_DIR=$dir MAPPING_PROFILE=$WORK/profile.tsv
     MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_CALIBRATED_GENERATION=g1 MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=net-one
     mapping_profile_load "$MAPPING_PROFILE"
+    mapping_fixture_docker() { [[ $1 == inspect && $4 == product ]] || return 80; printf '%064d\n' 3; }
+    resource_ledger_dir() { printf '%s\n' "$root/control/resources"; }
+    resource_crosscheck() { return 0; }
+    resource_verify_object() { [[ $1 == container && $2 == "$(printf '%064d' 3)" && $4 == product ]]; }
     mapping_receiver_probe() { probes=$((probes + 1)); [[ $paused == 0 ]] || return 80; }
     mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
     mapping_control_request() {
@@ -317,6 +402,7 @@ isolation_stop_failure_restores_or_blocks() (
 )
 
 profile_write "$WORK/profile.tsv"
+probe_execution_records_actual_argv
 isolation_produces_and_consumes_five_bound_cases
 for failure in negative_failure snapshot_failure snapshot_copy_failure cont_failure running_failure; do
     isolation_stop_failure_restores_or_blocks "$failure"
