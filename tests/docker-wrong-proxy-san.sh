@@ -76,7 +76,7 @@ mapping_proxy_san_leaf() {
         mapping_fixture_docker exec "$(mapping_proxy_container)" openssl verify \
             -CAfile "$MAPPING_ASSET_ROOT/proxy/tls/ca.crt" \
             "$MAPPING_ASSET_ROOT/proxy/tls/srv.crt" >/dev/null || return 80
-    else
+    elif [[ $phase == restored ]]; then
         mapping_fixture_docker exec "$(mapping_proxy_container)" cmp -s \
             "$MAPPING_ASSET_ROOT/proxy/tls/srv.crt" "$MAPPING_ASSET_ROOT/proxy/tls/srv.original.crt" || return 80
         mapping_fixture_docker exec "$(mapping_proxy_container)" cmp -s \
@@ -194,7 +194,11 @@ mapping_proxy_san_case() {
         mapping_proxy_san_leaf "$dir" restored || return 80
         mapping_proxy_san_pair "$dir" restored || return 80
         cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 80
+        mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.health.before" || return 80
         mapping_proxy_san_health "$dir" recovered || return 80
+        mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.health.after" || return 80
+        tail -n "+$(( $(wc -l < "$dir/connect.health.before") + 1 ))" "$dir/connect.health.after" > "$dir/connect.health.new" || return 80
+        mapping_assert_connect_legal "$dir/connect.health.new" "$MP_U" || rc=1
         recovered=$(mapping_tls_product_request "$dir" "$scenario") || return 80
         [[ $recovered == 0 ]] || return 80
         grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
@@ -202,7 +206,9 @@ mapping_proxy_san_case() {
         [[ $recovered =~ ^[0-9]+$ && $recovered -gt $before ]] || return 80
         printf '%s\n' "$recovered" > "$dir/proxy.recovered" || return 80
         mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.recovered" || return 80
-        tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
+        if [[ -f $dir/connect.log ]]; then
+            tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
+        fi
         mapping_proxy_san_recovery_git "$dir" "$kind" "$scenario" || return 80
     fi
     return "$rc"

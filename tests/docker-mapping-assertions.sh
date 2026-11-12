@@ -1664,7 +1664,7 @@ mapping_negative_case_evidence_accept() {
         wrong_proxy_san)
             [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == "$case_id" ]] || return 80
             [[ -f $dir/control/unique-commit && ! -L $dir/control/unique-commit ]] || return 80
-            for name in tls-layer.tsv request.exit baseline.before proxy.before proxy.after proxy.recovered connect.baseline connect.before connect.log connect.recovered connect.recovered.new leaf.original leaf.wrong leaf.restored cert.original cert.wrong cert.restored key.original key.wrong key.restored health.baseline health.recovered hostname.log request.failed.log request.log refs.expected refs.actual head.expected head.actual fsck.exit; do
+            for name in tls-layer.tsv request.exit baseline.before proxy.before proxy.after proxy.recovered connect.baseline connect.before connect.log connect.recovered connect.recovered.new connect.health.before connect.health.after connect.health.new leaf.original leaf.wrong leaf.restored cert.original cert.wrong cert.restored key.original key.wrong key.restored health.baseline health.recovered hostname.log request.failed.log request.log refs.expected refs.actual head.expected head.actual fsck.exit; do
                 [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name ]] || return 80
             done
             baseline_before=$(mapping_assert_uint_file "$dir/baseline.before") || return 80
@@ -1681,6 +1681,9 @@ mapping_negative_case_evidence_accept() {
             [[ -s $dir/connect.baseline ]] || return 1
             mapping_assert_connect_legal "$dir/connect.baseline" "$MP_U" || return 1
             [[ $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.log") ]] || return 1
+            head -n "$(wc -l < "$dir/connect.health.before")" "$dir/connect.recovered" | cmp -s - "$dir/connect.health.before" || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.health.before") + 1 ))" "$dir/connect.health.after" | cmp -s - "$dir/connect.health.new" || return 1
+            mapping_assert_connect_legal "$dir/connect.health.new" "$MP_U" || return 1
             tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" | cmp -s - "$dir/connect.recovered.new" || return 1
             mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
             [[ $(cat "$dir/leaf.original") != "$(cat "$dir/leaf.wrong")" ]] || return 1
@@ -1691,7 +1694,17 @@ mapping_negative_case_evidence_accept() {
             [[ -s $dir/health.baseline && -s $dir/health.recovered ]] || return 1
             grep -Eqi 'hostname|subject alternative|certificate.*(match|name)' "$dir/hostname.log" || return 1
             grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
-            [[ $(awk -v host="${MAPPING_PROXY_HOST:-gm-proxy}" '$0 ~ /fatal: unable to access/ && index($0, "SSL: no alternative certificate subject name matches target host name '\''" host "'\''") { n++ } END { print n+0 }' "$dir/request.failed.log") == 1 ]] || return 1
+            [[ $(awk -v url="https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" -v host="$MAPPING_PROXY_HOST" '
+                /fatal: / {
+                    rest = $0
+                    while (index(rest, "fatal: ")) {
+                        fatal++
+                        rest = substr(rest, index(rest, "fatal: ") + 7)
+                    }
+                    if (index($0, "fatal: unable to access '\''" url "'\'': SSL: no alternative certificate subject name matches target host name '\''" host "'\''")) valid++
+                }
+                END { print fatal == 1 && valid == 1 ? 1 : 0 }
+            ' "$dir/request.failed.log") == 1 ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") && -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
             grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 1
             mapping_assert_refs_match "$dir" || return 1

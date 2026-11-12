@@ -63,6 +63,28 @@ SH
     cmp -s "$d/srv.crt" "$WORK/original.crt" && cmp -s "$d/srv.key" "$WORK/original.key"
 }
 
+leaf_original_reads_live_pair() (
+    local dir=$WORK/leaf-live rc=0
+    mkdir -p "$dir"
+    MAPPING_ASSERT_PRODUCT=product
+    mapping_proxy_container() { printf 'proxy\n'; }
+    mapping_fixture_docker() {
+        if [[ $1 == exec && $2 == proxy && $3 == cmp ]]; then return 1; fi
+        if [[ $1 == exec && $2 == proxy && $3 == openssl ]]; then
+            openssl x509 -in "$WORK/original.crt" -noout -fingerprint -sha256
+        elif [[ $1 == exec && $2 == product ]]; then
+            cat "$WORK/original.crt"
+        else
+            return 1
+        fi
+    }
+    mapping_proxy_san_leaf "$dir" original || rc=$?
+    [[ $rc == 0 && -s $dir/leaf.original ]] || return 1
+    rc=0
+    mapping_proxy_san_leaf "$dir" restored || rc=$?
+    [[ $rc == 80 ]]
+)
+
 hostname_probe_status() {
     local mode=$1 expected=$2 rc=0 dir=$WORK/probe-$1
     mkdir -p "$dir"
@@ -98,7 +120,19 @@ run_case() {
         mapping_proxy_count_read_remote() {
             if [[ -f $dir/recovered.marker ]]; then printf '4\n'; else printf '3\n'; fi
         }
-        mapping_scenario_connect_evidence() { printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'; }
+        mapping_scenario_connect_evidence() {
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+            if [[ -f $dir/recovered.marker ]]; then
+                printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+            fi
+            if [[ -f $dir/health.new && $MODE != stale-connect ]]; then
+                if [[ $MODE == foreign-connect ]]; then
+                    printf 'authority=elsewhere.invalid:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+                else
+                    printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+                fi
+            fi
+        }
         mapping_scenario_upstream_count() { printf '2\n'; }
         mapping_scenario_upstream_refs() { printf 'abc\trefs/heads/main\n'; }
         mapping_scenario_upstream_head() { printf 'abc\n'; }
@@ -107,6 +141,7 @@ run_case() {
         mapping_scenario_local_fsck() { printf '0\n'; }
         mapping_proxy_san_health() {
             printf 'health:%s\n' "$2" >> "$EVENTS"
+            if [[ $2 == recovered ]]; then : > "$dir/health.new"; fi
             [[ $MODE != health-fail ]]
         }
         mapping_proxy_san_replace() { printf 'replace\n' >> "$EVENTS"; [[ $MODE != replace-fail ]]; }
@@ -120,6 +155,9 @@ run_case() {
             printf 'leaf:%s\n' "$2" >> "$EVENTS"
             [[ $MODE != leaf-fail || $2 != wrong ]] || return 80
             if [[ $2 == wrong ]]; then printf 'wrong\n' > "$dir/leaf.wrong"; else printf 'original\n' > "$dir/leaf.$2"; fi
+        }
+        mapping_proxy_san_pair() {
+            printf 'pair:%s\n' "$2" >> "$EVENTS"
         }
         mapping_proxy_san_hostname_probe() {
             printf 'hostname\n' >> "$EVENTS"
@@ -164,12 +202,14 @@ volume_pair_roundtrip || failed=1
 printf 'volume_pair_roundtrip EXIT=%s\n' "$failed"
 volume_sign_failure_restores_pair || failed=1
 printf 'volume_sign_failure_restores_pair EXIT=%s\n' "$failed"
+leaf_original_reads_live_pair || failed=1
+printf 'leaf_original_reads_live_pair EXIT=%s\n' "$failed"
 for spec in hostname:0 other-certificate:1 timeout:80 exec-timeout:80 exec-error:80 curl-error:1 completed-error:1; do
     mode=${spec%:*} expected=${spec#*:}
     hostname_probe_status "$mode" "$expected" || failed=1
     printf 'hostname_probe_%s EXIT=%s\n' "$mode" "$failed"
 done
-for spec in ok:0 health-fail:80 replace-fail:80 restart-fail:80 leaf-fail:80 probe-infrastructure:80 git-infrastructure:80 unexpected-success:1 restore-fail:80 git-fail:80 git-other-error:1; do
+for spec in ok:0 stale-connect:1 foreign-connect:1 health-fail:80 replace-fail:80 restart-fail:80 leaf-fail:80 probe-infrastructure:80 git-infrastructure:80 unexpected-success:1 restore-fail:80 git-fail:80 git-other-error:1; do
     mode=${spec%:*} expected=${spec#*:}
     run_case "$mode" "$expected" || failed=1
     printf '%s EXIT=%s\n' "$mode" "$failed"

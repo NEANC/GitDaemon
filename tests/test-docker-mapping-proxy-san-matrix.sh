@@ -26,6 +26,10 @@ proxy_san_matrix_proof() {
     cp "$dir/connect.baseline" "$dir/connect.recovered"
     cat "$dir/connect.baseline" >> "$dir/connect.recovered"
     cp "$dir/connect.baseline" "$dir/connect.recovered.new"
+    cp "$dir/connect.recovered" "$dir/connect.health.before"
+    cp "$dir/connect.health.before" "$dir/connect.health.after"
+    cat "$dir/connect.baseline" >> "$dir/connect.health.after"
+    cp "$dir/connect.baseline" "$dir/connect.health.new"
     printf 'aabbcc\n' > "$dir/leaf.original"
     printf 'ddeeff\n' > "$dir/leaf.wrong"
     cp "$dir/leaf.original" "$dir/leaf.restored"
@@ -38,7 +42,7 @@ proxy_san_matrix_proof() {
     printf 'healthy\n' > "$dir/health.baseline"
     cp "$dir/health.baseline" "$dir/health.recovered"
     printf 'SSL: no alternative certificate subject name matches target host name\n' > "$dir/hostname.log"
-    printf '传输失败：配置的 HTTPS 代理；fatal: unable to access '\''https://github.com/'\'': SSL: no alternative certificate subject name matches target host name '\''gm-proxy'\''\n' > "$dir/request.failed.log"
+    printf '传输失败：配置的 HTTPS 代理；fatal: unable to access '\''https://github.com/gitdaemon/fixture.git/'\'': SSL: no alternative certificate subject name matches target host name '\''gm-proxy'\''\n' > "$dir/request.failed.log"
     printf '同步传输路径：配置的 HTTPS 代理\n' > "$dir/request.log"
     printf 'abc123\trefs/heads/main\n' > "$dir/refs.expected"
     cp "$dir/refs.expected" "$dir/refs.actual"
@@ -46,12 +50,26 @@ proxy_san_matrix_proof() {
     cp "$dir/head.expected" "$dir/head.actual"
     printf '0\n' > "$dir/fsck.exit"
     mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || { printf 'valid case rejected\n'; return 1; }
-    for name in control/unique-commit case.tsv tls-layer.tsv request.exit baseline.before proxy.before proxy.after proxy.recovered connect.baseline connect.before connect.log connect.recovered connect.recovered.new leaf.original leaf.wrong leaf.restored cert.original cert.wrong cert.restored key.original key.wrong key.restored health.baseline health.recovered hostname.log request.failed.log request.log refs.expected refs.actual head.expected head.actual fsck.exit; do
+    for name in control/unique-commit case.tsv tls-layer.tsv request.exit baseline.before proxy.before proxy.after proxy.recovered connect.baseline connect.before connect.log connect.recovered connect.recovered.new connect.health.before connect.health.after connect.health.new leaf.original leaf.wrong leaf.restored cert.original cert.wrong cert.restored key.original key.wrong key.restored health.baseline health.recovered hostname.log request.failed.log request.log refs.expected refs.actual head.expected head.actual fsck.exit; do
         mv "$dir/$name" "$dir/$name.saved"
         rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
         [[ $rc == 80 ]] || { printf 'missing %s: %s\n' "$name" "$rc"; failed=1; }
         mv "$dir/$name.saved" "$dir/$name"
     done
+    for name in connect.health.before connect.health.after connect.health.new; do
+        cp "$dir/$name" "$dir/$name.saved"
+        printf 'authority=elsewhere.invalid:443\tmode=accept\tdial_target=140.82.112.11:443\n' > "$dir/$name"
+        rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+        [[ $rc == 1 ]] || { printf 'bad health CONNECT %s: %s\n' "$name" "$rc"; failed=1; }
+        mv "$dir/$name.saved" "$dir/$name"
+    done
+    cp "$dir/connect.health.after" "$dir/connect.health.after.saved"
+    printf 'authority=elsewhere.invalid:443\tmode=accept\tdial_target=140.82.112.11:443\n' > "$dir/connect.health.after"
+    cat "$dir/connect.health.before" >> "$dir/connect.health.after"
+    cat "$dir/connect.health.new" >> "$dir/connect.health.after"
+    rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || { printf 'changed health prefix: %s\n' "$rc"; failed=1; }
+    mv "$dir/connect.health.after.saved" "$dir/connect.health.after"
     for spec in 'leaf.wrong:aabbcc' 'leaf.restored:ddeeff' 'cert.wrong:original-cert' 'cert.restored:wrong-cert' 'key.wrong:original-key' 'key.restored:wrong-key' 'proxy.after:5' 'proxy.recovered:4' 'connect.log:changed' 'connect.recovered:changed' 'connect.recovered.new:changed' 'request.failed.log:SSL certificate problem' 'request.exit:0' 'refs.actual:old' 'head.actual:old' 'fsck.exit:1' 'control/unique-commit:old'; do
         name=${spec%%:*}; saved=${spec#*:}
         cp "$dir/$name" "$dir/$name.saved"
@@ -60,6 +78,24 @@ proxy_san_matrix_proof() {
         [[ $rc == 1 ]] || { printf 'bad %s: %s\n' "$name" "$rc"; failed=1; }
         mv "$dir/$name.saved" "$dir/$name"
     done
+    cp "$dir/request.failed.log" "$dir/request.failed.log.saved"
+    for saved in \
+        "fatal: unable to access 'https://elsewhere.invalid/repo.git/': SSL: no alternative certificate subject name matches target host name 'gm-proxy'" \
+        "fatal: unable to access 'https://github.com/': SSL: no alternative certificate subject name matches target host name 'gm-proxy'"; do
+        printf '传输失败：配置的 HTTPS 代理；%s\n' "$saved" > "$dir/request.failed.log"
+        rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+        [[ $rc == 1 ]] || { printf 'wrong fatal source: %s\n' "$rc"; failed=1; }
+    done
+    printf '传输失败：配置的 HTTPS 代理；%s\n%s\n' "fatal: unable to access 'https://github.com/gitdaemon/fixture.git/': SSL: no alternative certificate subject name matches target host name 'gm-proxy'" "fatal: unable to access 'https://elsewhere.invalid/': SSL: no alternative certificate subject name matches target host name 'gm-proxy'" > "$dir/request.failed.log"
+    rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || { printf 'double fatal: %s\n' "$rc"; failed=1; }
+    printf '传输失败：配置的 HTTPS 代理；fatal: unable to access '\''https://elsewhere.invalid/'\'': SSL: no alternative certificate subject name matches target host name '\''gm-proxy'\''; fatal: unable to access '\''https://github.com/gitdaemon/fixture.git/'\'': unrelated\n' > "$dir/request.failed.log"
+    rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || { printf 'mixed fatal line: %s\n' "$rc"; failed=1; }
+    printf '传输失败：配置的 HTTPS 代理；fatal: unable to access '\''https://github.com/gitdaemon/fixture.git/'\'': SSL: no alternative certificate subject name matches target host name '\''gm-proxy'\''; fatal: unable to access '\''https://elsewhere.invalid/'\'': unrelated\n' > "$dir/request.failed.log"
+    rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || { printf 'second fatal on same line: %s\n' "$rc"; failed=1; }
+    mv "$dir/request.failed.log.saved" "$dir/request.failed.log"
     cp "$dir/identity.tsv" "$dir/identity.tsv.original"
     printf 'input_sha256\tother\n' >> "$dir/identity.tsv"
     rc=0; mapping_negative_case_evidence_accept wrong_proxy_san run scenario generation manifest input "$dir" || rc=$?
@@ -89,8 +125,14 @@ proxy_san_dedicated_production() {
         if [[ -f $dir/recovered.marker ]]; then
             printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
         fi
+        if [[ -f $dir/health.new ]]; then
+            printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'
+        fi
     }
-    mapping_proxy_san_health() { printf 'healthy\n' > "$1/health.$2"; }
+    mapping_proxy_san_health() {
+        printf 'healthy\n' > "$1/health.$2"
+        if [[ $2 == recovered ]]; then : > "$1/health.new"; fi
+    }
     mapping_proxy_san_pair() {
         if [[ $2 == wrong ]]; then
             printf 'wrong-cert\n' > "$1/cert.wrong"; printf 'wrong-key\n' > "$1/key.wrong"
@@ -110,7 +152,7 @@ proxy_san_dedicated_production() {
             printf '同步传输路径：配置的 HTTPS 代理\n' > "$3/sync.log"
             printf '0\n' > "$3/sync.exit"
         else
-            printf '传输失败：配置的 HTTPS 代理；fatal: unable to access '\''https://github.com/'\'': SSL: no alternative certificate subject name matches target host name '\''gm-proxy'\''\n' > "$3/sync.log"
+            printf '传输失败：配置的 HTTPS 代理；fatal: unable to access '\''https://github.com/gitdaemon/fixture.git/'\'': SSL: no alternative certificate subject name matches target host name '\''gm-proxy'\''\n' > "$3/sync.log"
             printf '1\n' > "$3/sync.exit"
         fi
     }
