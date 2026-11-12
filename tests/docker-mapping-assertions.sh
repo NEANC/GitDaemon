@@ -765,6 +765,7 @@ mapping_tls_negative_run() {
     printf '%s\n' "$recovery_rc" > "$dir/baseline.exit"
     [[ $recovery_rc == 0 ]] || return 80
     grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
+    cp "$dir/request.log" "$dir/request.baseline.log" || return 80
     after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     printf '%s\n' "$after" > "$dir/baseline.after"
     (( after > before )) || return 80
@@ -784,6 +785,7 @@ mapping_tls_negative_run() {
     printf '%s\n' "$recovery_rc" > "$dir/recovery.exit"
     [[ $recovery_rc == 0 ]] || return 80
     grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
+    cp "$dir/request.log" "$dir/request.recovery.log" || return 80
     recovered=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     printf '%s\n' "$recovered" > "$dir/proxy.recovered"
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.recovered" || return 80
@@ -1515,7 +1517,7 @@ mapping_full_accept() {
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
-    local request baseline recovery before after recovered name
+    local request baseline recovery baseline_before baseline_after before after recovered name
     [[ -d $dir && ! -L $dir ]] || return 80
     mapping_assert_identity_load "$dir" || return 80
     [[ $MPA_RUN_ID == "$run" && $MPA_SCENARIO == "$scenario" && $MPA_GENERATION == "$generation" \
@@ -1523,21 +1525,36 @@ mapping_negative_case_evidence_accept() {
     case $case_id in
         wrong_proxy_ca)
             [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == "$case_id" ]] || return 80
-            for name in tls-layer.tsv baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered connect.before connect.log request.failed.log; do
+            for name in tls-layer.tsv baseline.exit recovery.exit request.exit baseline.before baseline.after proxy.before proxy.after proxy.recovered connect.before connect.baseline connect.baseline.new connect.log connect.recovered connect.recovered.new request.baseline.log request.recovery.log request.failed.log upstream.before upstream.after; do
                 [[ -f $dir/$name && ! -L $dir/$name ]] || return 80
             done
             baseline=$(mapping_assert_uint_file "$dir/baseline.exit") || return 80
             recovery=$(mapping_assert_uint_file "$dir/recovery.exit") || return 80
             request=$(mapping_assert_uint_file "$dir/request.exit") || return 80
+            baseline_before=$(mapping_assert_uint_file "$dir/baseline.before") || return 80
+            baseline_after=$(mapping_assert_uint_file "$dir/baseline.after") || return 80
             before=$(mapping_assert_uint_file "$dir/proxy.before") || return 80
             after=$(mapping_assert_uint_file "$dir/proxy.after") || return 80
             recovered=$(mapping_assert_uint_file "$dir/proxy.recovered") || return 80
             [[ $baseline == 0 && $recovery == 0 ]] || return 80
-            (( request > 0 && recovered > after )) || return 1
+            (( baseline_after > baseline_before && before == baseline_after && request > 0 && recovered > after )) || return 1
+            mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.baseline.log" || return 1
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.recovery.log" || return 1
+            mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 1
+            mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
+            [[ $(wc -l < "$dir/connect.baseline") -gt $(wc -l < "$dir/connect.before") ]] || return 1
+            [[ $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.log") ]] || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.before") + 1 ))" "$dir/connect.baseline" | cmp -s - "$dir/connect.baseline.new" || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" | cmp -s - "$dir/connect.recovered.new" || return 1
             mapping_tls_layer_accept "$case_id" "$dir/tls-layer.tsv" || return 1
             [[ $(awk -F '\t' '$1 == "request_exit" {print $2}' "$dir/tls-layer.tsv") == "$request" ]] || return 1
             (( before == after )) || return 1
             cmp -s "$dir/connect.before" "$dir/connect.log" || return 1
+            [[ $(mapping_assert_uint_file "$dir/upstream.before") == $(mapping_assert_uint_file "$dir/upstream.after") ]] || return 1
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY_FAIL" "$dir/request.failed.log" || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
             grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || return 1
             return 0
             ;;

@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 HERE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$HERE/docker-mapping-assertions.sh"
+source "$HERE/../scripts/git-mirror-sync.sh"
+source "$HERE/docker-mapping-fixture.sh"
 
 matrix_write() {
     local file=$1 drop=${2:-} case_id dir
@@ -41,9 +43,21 @@ single_raw_case_is_independently_verified() {
     printf '3\n' > "$evidence/proxy.before"
     printf '3\n' > "$evidence/proxy.after"
     printf '4\n' > "$evidence/proxy.recovered"
-    printf 'CONNECT github.com:443\n' > "$evidence/connect.before"
+    : > "$evidence/connect.before"
     cp "$evidence/connect.before" "$evidence/connect.log"
-    printf 'SSL certificate problem\n' > "$evidence/request.failed.log"
+    printf '传输失败：配置的 HTTPS 代理 SSL certificate problem\n' > "$evidence/request.failed.log"
+    printf '同步传输路径：配置的 HTTPS 代理\n' > "$evidence/request.baseline.log"
+    cp "$evidence/request.baseline.log" "$evidence/request.recovery.log"
+    printf '2\n' > "$evidence/baseline.before"
+    printf '3\n' > "$evidence/baseline.after"
+    printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n' > "$evidence/connect.baseline.new"
+    cp "$evidence/connect.baseline.new" "$evidence/connect.recovered.new"
+    cp "$evidence/connect.baseline.new" "$evidence/connect.baseline"
+    cp "$evidence/connect.recovered.new" "$evidence/connect.recovered"
+    printf '0\n' > "$evidence/upstream.before"
+    printf '0\n' > "$evidence/upstream.after"
+    MAPPING_PROFILE=$dir/profile.tsv
+    printf 'schema_version\t1\nrun_id\tmtest\ncidr\t140.82.112.0/24\ngateway\t140.82.112.1\nP\t140.82.112.10\nU\t140.82.112.11\nX\t140.82.112.12\nD\t140.82.112.13\nN\t140.82.112.14\nnetwork_name\tgm-mtest-m-net\nbridge\tmmtest\n' > "$MAPPING_PROFILE"
     mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || rc=1
     printf '2\n' > "$evidence/request.exit"
     mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" && rc=1
