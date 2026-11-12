@@ -136,36 +136,57 @@ isolation_produces_and_consumes_five_bound_cases() (
             fi
             printf '%s\tmtest\tmapping-fallback-isolation\tg1\tmanifest\tinput\t%s\t0\tPASS\n' "$case_id" "$evidence" >> "$matrix"
         done
-        status=0
-        mapping_negative_matrix_accept "$matrix" mtest manifest input || status=$?
-        [[ $status == 1 ]] || { printf 'same-generation matrix: %s\n' "$status" >&2; return 1; }
-        local index=0 sub receipt name offset file seq
+        local index=0 sub receipt name offset file seq first_key second_key first_seq
         for key in $MAPPING_WITNESS_KEYS; do
-            generation=${generations[index]}
             offset=$((index * 25))
             index=$((index + 1))
             evidence=$dir/raw-isolation-$key
             sub=$evidence/isolation/$key
-            sed -i "s/generation\tg1/generation\t$generation/" "$sub/binding.tsv" "$sub/negative/command.tsv" "$sub/probe/command.tsv" "$evidence/identity.tsv"
-            sed -i "s/mtest-g1/mtest-$generation/g" "$sub/negative/command.tsv" "$sub/probe/command.tsv"
             for file in "$sub/negative/command.tsv" "$sub/probe/command.tsv" "$sub/seq.before" "$sub/seq.after"; do
                 awk -F '\t' -v OFS='\t' -v offset="$offset" '$1 == "seq_before" || $1 == "seq_after" || NF == 1 {$NF += offset} {print}' "$file" > "$file.next"
                 mv "$file.next" "$file"
             done
             for name in calibration.before calibration.after negative before after; do
                 receipt=$sub/$name.receipt
-                sed -i "s/generation\tg1/generation\t$generation/" "$receipt"
                 awk -F '\t' -v OFS='\t' -v offset="$offset" '$1 == "seq" {$2 += offset} {print}' "$receipt" > "$receipt.next"
                 mv "$receipt.next" "$receipt"
                 seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$receipt")
                 [[ ! -e $matrix_root/mapping-snapshot-$seq.receipt ]] || [[ $offset == 0 ]] || return 1
                 [[ $offset == 0 ]] || cp "$receipt" "$matrix_root/mapping-snapshot-$seq.receipt"
             done
+            mapping_original_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$evidence" || return 1
+        done
+        status=0
+        mapping_negative_matrix_accept "$matrix" mtest manifest input || status=$?
+        [[ $status == 1 ]] || { printf 'same-generation matrix with distinct seq: %s\n' "$status" >&2; return 1; }
+        index=0
+        for key in $MAPPING_WITNESS_KEYS; do
+            generation=${generations[index]}
+            index=$((index + 1))
+            evidence=$dir/raw-isolation-$key
+            sub=$evidence/isolation/$key
+            sed -i "s/generation\tg1/generation\t$generation/" "$sub/binding.tsv" "$sub/negative/command.tsv" "$sub/probe/command.tsv" "$evidence/identity.tsv" "$sub/"*.receipt
+            sed -i "s/mtest-g1/mtest-$generation/g" "$sub/negative/command.tsv" "$sub/probe/command.tsv"
+            for name in calibration.before calibration.after negative before after; do
+                receipt=$sub/$name.receipt
+                seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$receipt")
+                [[ $index == 1 ]] || cp "$receipt" "$matrix_root/mapping-snapshot-$seq.receipt"
+            done
             awk -F '\t' -v OFS='\t' -v k="isolation/$key" -v g="$generation" '$1 == k {$4=g} {print}' "$matrix" > "$matrix.next"
             mv "$matrix.next" "$matrix"
             mapping_original_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation "$generation" manifest input "$evidence" || return 1
         done
         mapping_negative_matrix_accept "$matrix" mtest manifest input || return 1
+        read -r first_key second_key _ <<< "$MAPPING_WITNESS_KEYS"
+        first_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$dir/raw-isolation-$first_key/isolation/$first_key/before.receipt")
+        receipt=$matrix_root/mapping-snapshot-$first_seq.receipt
+        cp "$receipt" "$WORK/first-root-receipt"
+        cp "$dir/raw-isolation-$second_key/isolation/$second_key/before.receipt" "$receipt"
+        status=0
+        mapping_original_case_evidence_accept "isolation/$first_key" mtest mapping-fallback-isolation g1 manifest input "$dir/raw-isolation-$first_key" || status=$?
+        [[ $status == 1 ]] || { printf 'cross-case root receipt: %s\n' "$status" >&2; return 1; }
+        cp "$WORK/first-root-receipt" "$receipt"
+        mapping_original_case_evidence_accept "isolation/$first_key" mtest mapping-fallback-isolation g1 manifest input "$dir/raw-isolation-$first_key" || return 1
     ) || return 1
     for key in $MAPPING_WITNESS_KEYS; do
         sub=$dir/isolation/$key
