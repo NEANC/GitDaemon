@@ -479,6 +479,7 @@ mapping_witness_pause_detected() {
     mkdir -p "$IT_CONTROL_DIR"
     mapping_control_request() {
         local n
+        mapping_witness_key_valid "${5:-}" || return 65
         [[ $1 == mapping-snapshot && $2 == gen1 && $3 == netid-abc ]] || return 65
         n=$(cat "$counter")
         CONTROL_SEQ=$((CONTROL_SEQ + 1))

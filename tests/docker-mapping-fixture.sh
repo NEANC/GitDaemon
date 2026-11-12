@@ -435,12 +435,13 @@ mapping_witness_growth() {
 
 # 接收端见证链计数：使用 guard 的只读 netns 快照，普通 runner 不进入特权命名空间。
 mapping_receiver_witness_counts() {
-    local root generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
+    local root key=${1:-} generation=${MAPPING_ASSERT_GENERATION:-${MAPPING_GENERATION:-}}
+    mapping_witness_key_valid "$key" || return 80
     [[ -n ${IT_CONTROL_DIR:-} && -n $generation ]] || return 80
     root=${IT_CONTROL_DIR%/control}
     [[ $root != "$IT_CONTROL_DIR" ]] || return 80
     if [[ -z $MP_NETWORK_ID ]]; then MP_NETWORK_ID=$(mapping_network_id_load) || return 80; fi
-    mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
+    mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" "$key" || return 80
     mapping_witness "$root/mapping-snapshot-$CONTROL_SEQ.witness" || return 80
 }
 
@@ -642,11 +643,11 @@ mapping_calibrate_witness() {
     MP_WITNESS_CALIBRATED=0
     mapping_profile_load "$profile" || return $?
     for key in $MAPPING_WITNESS_KEYS; do
-        before=$(mapping_receiver_witness_counts) || return 80
+        before=$(mapping_receiver_witness_counts "$key") || return 80
         spec=$(mapping_witness_spec "$key") || return 1
         IFS=$'\t' read -r proto port _ <<< "$spec"
         mapping_receiver_probe "$key" || { case $? in 1) return 1 ;; *) return 80 ;; esac; }
-        after=$(mapping_receiver_witness_counts) || return 80
+        after=$(mapping_receiver_witness_counts "$key") || return 80
         mapping_witness_growth "$before" "$after" "$key" || return 1
         printf 'WITNESS_PROBE=%s PROTOCOL=%s PORT=%s\n' "$key" "$proto" "$port"
     done

@@ -37,7 +37,7 @@ iptables() {
     if [[ ${FAIL_RULE:-} == 1 && $* == *'-A MSmtest'*'--dport 53'* ]]; then return 1; fi
     if [[ ${MISSING_CHAIN:-} == 1 && $* == *'-nvxL MSmtest'* ]]; then return 1; fi
     if [[ ${EMPTY_CHAIN:-} == 1 && $* == *'-nvxL MSmtest'* ]]; then return 0; fi
-    if [[ $* == *'-nvxL MSmtest'* ]]; then printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n'; fi
+    if [[ $* == *'-nvxL MSmtest'* ]]; then printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19420\n0 0 RETURN udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:53\n0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:53\n'; fi
     return 0
 }
 
@@ -60,11 +60,11 @@ ready_snapshot_installs_owned_rules_before_ack() (
     setup_guard
     guard_mapping_request_handle mapping-ready g1 net-one "$MP_PROFILE_SHA256" nonce1 || return 1
     [[ ${#OWN_RULES[@]} == 17 ]] || return 1
-    [[ ${#OWN_NS_RULES[@]} == 4 && ${OWN_NS_CHAINS[0]} == 'raw|MSmtest' ]] || return 1
-    [[ $(awk '$1=="nsenter" && /-A MSmtest/ { n++ } END { print n+0 }' "$WORK/calls") == 3 ]] || return 1
+    [[ ${#OWN_NS_RULES[@]} == 5 && ${OWN_NS_CHAINS[0]} == 'raw|MSmtest' ]] || return 1
+    [[ $(awk '$1=="nsenter" && /-A MSmtest/ { n++ } END { print n+0 }' "$WORK/calls") == 4 ]] || return 1
     [[ $(awk '$1=="nsenter" && /-I PREROUTING -j MSmtest/ { n++ } END { print n+0 }' "$WORK/calls") == 1 ]] || return 1
     [[ $(awk '$1=="ack" { n++ } END { print n+0 }' "$WORK/calls") == 1 ]] || return 1
-    guard_mapping_request_handle mapping-snapshot g1 net-one "$MP_PROFILE_SHA256" nonce2 || return 1
+    guard_mapping_request_handle mapping-snapshot g1 net-one "$MP_PROFILE_SHA256" nonce2 host-input || return 1
     [[ -s $E/mapping-snapshot-2.witness && $(awk '$1=="ack" { n++ } END { print n+0 }' "$WORK/calls") == 2 ]] || return 1
     grep -Fq 'raw|-A MSmtest -p tcp --dport 19419 -j RETURN' "$E/witness-rules.owned" || return 1
     grep -Fq 'raw|-I PREROUTING -j MSmtest' "$E/witness-rules.owned"
@@ -75,7 +75,7 @@ missing_chain_rejects_snapshot_without_ack() (
     guard_mapping_request_handle mapping-ready g1 net-one "$MP_PROFILE_SHA256" nonce1 || return 1
     MISSING_CHAIN=1
     local rc=0
-    guard_mapping_request_handle mapping-snapshot g1 net-one "$MP_PROFILE_SHA256" nonce2 || rc=$?
+    guard_mapping_request_handle mapping-snapshot g1 net-one "$MP_PROFILE_SHA256" nonce2 host-input || rc=$?
     [[ $rc == 80 && $(awk '$1=="ack" { n++ } END { print n+0 }' "$WORK/calls") == 1 ]]
 )
 
@@ -84,7 +84,7 @@ empty_chain_rejects_snapshot_without_ack() (
     guard_mapping_request_handle mapping-ready g1 net-one "$MP_PROFILE_SHA256" nonce1 || return 1
     EMPTY_CHAIN=1
     local rc=0
-    guard_mapping_request_handle mapping-snapshot g1 net-one "$MP_PROFILE_SHA256" nonce2 || rc=$?
+    guard_mapping_request_handle mapping-snapshot g1 net-one "$MP_PROFILE_SHA256" nonce2 host-input || rc=$?
     [[ $rc == 80 && $(awk '$1=="ack" { n++ } END { print n+0 }' "$WORK/calls") == 1 ]]
 )
 

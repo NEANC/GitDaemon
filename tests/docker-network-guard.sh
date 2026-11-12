@@ -557,7 +557,13 @@ guard_mapping_request_handle() {
 
 # full 控制循环只通过统一处理器分派 mapping 请求。
 guard_full_mapping_request() {
-    guard_mapping_request_handle "$@"
+    local request generation network_id profile_sha256 target nonce
+    read -r request generation network_id profile_sha256 target nonce <<< "$1"
+    if [[ $request == mapping-snapshot ]]; then
+        guard_mapping_request_handle "$request" "$generation" "$network_id" "$profile_sha256" "$nonce" "$target"
+    else
+        guard_mapping_request_handle "$request" "$generation" "$network_id" "$profile_sha256" "$target"
+    fi
 }
 # 映射模式专属生命周期：冻结档案、建立拒绝基线、READY 绑定档案哈希与 network ID 后才放行业务。
 guard_mapping_main() {
@@ -813,8 +819,7 @@ guard_main() {
             read -r request token netid sha nonce < "$E/control/request-$seq"
             case "$request" in
                 mapping-ready|mapping-snapshot|mapping-release)
-                    generation=$token
-                    guard_full_mapping_request "$request" "$generation" "$netid" "$sha" "$nonce" || exit $?
+                    guard_full_mapping_request "$(cat "$E/control/request-$seq")" || exit $?
                     ;;
                 witness)
                     [[ -n $token ]] || exit 65
