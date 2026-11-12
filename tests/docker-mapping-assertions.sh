@@ -208,7 +208,7 @@ mapping_upstream_ca_git_diagnostic() {
         /^fatal: / {
             if (index($0, target) != 1) { invalid = 1; next }
             detail = substr($0, length(target) + 1)
-            if (detail ~ /^SSL certificate problem: / && detail ~ /(issuer|certificate)/) found++
+            if (detail ~ /^(SSL certificate problem: )?(unable to get (local )?issuer certificate|self-signed certificate in certificate chain|unable to verify the first certificate)$/) found++
             else invalid = 1
         }
         END { exit invalid || found != 1 }
