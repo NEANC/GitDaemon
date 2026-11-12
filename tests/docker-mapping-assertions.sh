@@ -1768,7 +1768,7 @@ mapping_negative_case_evidence_accept() {
             [[ $(cat "$dir/leaf.original") != "$(cat "$dir/leaf.wrong")" ]] || return 1
             cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 1
             for name in cert key; do
-                [[ $(cat "$dir/$name.original") =~ ^[0-9a-f]{64}$ && $(cat "$dir/$name.wrong") =~ ^[0-9a-f]{64}$ && $(cat "$dir/$name.restored") =~ ^[0-9a-f]{64}$ ]] || return 80
+                [[ $(cat "$dir/$name.original") =~ ^[0-9a-f]{64}$ && $(cat "$dir/$name.wrong") =~ ^[0-9a-f]{64}$ && $(cat "$dir/$name.restored") =~ ^[0-9a-f]{64}$ ]] || return 1
                 [[ $(cat "$dir/$name.original") != "$(cat "$dir/$name.wrong")" ]] || return 1
                 cmp -s "$dir/$name.original" "$dir/$name.restored" || return 1
             done
