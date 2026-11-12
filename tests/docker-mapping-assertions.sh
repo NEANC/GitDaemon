@@ -1578,6 +1578,25 @@ mapping_full_accept() {
     mapping_negative_matrix_accept "$dir/mapping-negative-matrix.tsv" "$run" "$manifest" "$input" || return 1
     return 0
 }
+mapping_isolation_snapshot_receipt_accept() {
+    local sub=$1 stage=$2 generation=$3 network_id=$4 profile_sha256=$5 expected_seq=$6 receipt=$1/$2.receipt
+    local seq rules_sha witness_sha root=${IT_CONTROL_DIR%/control}
+    [[ -f $receipt && ! -L $receipt && -r $receipt && -s $receipt ]] || return 80
+    [[ $(wc -l < "$receipt") == 6 ]] || return 80
+    seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$receipt")
+    rules_sha=$(awk -F '\t' '$1 == "rules_sha256" {print $2}' "$receipt")
+    witness_sha=$(awk -F '\t' '$1 == "witness_sha256" {print $2}' "$receipt")
+    [[ $seq =~ ^[1-9][0-9]*$ && $rules_sha =~ ^[0-9a-f]{64}$ && $witness_sha =~ ^[0-9a-f]{64}$ ]] || return 80
+    [[ $(cat "$receipt") == "$(printf 'seq\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s' \
+        "$seq" "$generation" "$network_id" "$profile_sha256" "$rules_sha" "$witness_sha")" ]] || return 1
+    [[ $seq == "$expected_seq" ]] || return 1
+    [[ -n ${IT_CONTROL_DIR:-} && $root != "$IT_CONTROL_DIR" && -f $root/mapping-snapshot-$seq.receipt && ! -L $root/mapping-snapshot-$seq.receipt && -r $root/mapping-snapshot-$seq.receipt ]] || return 80
+    cmp -s "$receipt" "$root/mapping-snapshot-$seq.receipt" || return 1
+    [[ $(sha256sum "$sub/$stage.rules" | cut -d' ' -f1) == "$rules_sha" && \
+        $(sha256sum "$sub/$stage.witness" | cut -d' ' -f1) == "$witness_sha" ]] || return 1
+    return 0
+}
+
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
@@ -1592,7 +1611,7 @@ mapping_negative_case_evidence_accept() {
             mapping_witness_key_valid "$key" || return 80
             sub=$dir/isolation/$key
             [[ -d $sub && ! -L $sub ]] || return 80
-            for name in binding.tsv calibration.before.witness calibration.after.witness negative.tsv negative.exit negative.log negative.witness listener.pid listener.restored.pid seq.before seq.after before.rules after.rules before.witness after.witness probe.log reject.layer; do
+            for name in binding.tsv calibration.before.rules calibration.before.witness calibration.before.receipt calibration.after.rules calibration.after.witness calibration.after.receipt negative.tsv negative.exit negative.log negative.rules negative.witness negative.receipt listener.pid listener.restored.pid seq.before seq.after before.rules after.rules before.witness after.witness before.receipt after.receipt probe.log reject.layer; do
                 [[ -f $sub/$name && ! -L $sub/$name && -r $sub/$name && -s $sub/$name ]] || return 80
             done
             mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
@@ -1604,6 +1623,22 @@ mapping_negative_case_evidence_accept() {
             [[ $(cat "$sub/listener.pid") =~ ^[0-9]+$ && $(cat "$sub/listener.pid") == "$(cat "$sub/listener.restored.pid")" ]] || return 1
             seq_before=$(mapping_assert_uint_file "$sub/seq.before") || return 80
             seq_after=$(mapping_assert_uint_file "$sub/seq.after") || return 80
+            for name in calibration.before calibration.after negative before after; do
+                case $name in
+                    before) request=$seq_before ;;
+                    after) request=$seq_after ;;
+                    *) request='' ;;
+                esac
+                if [[ -z $request ]]; then
+                    request=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/$name.receipt")
+                fi
+                mapping_isolation_snapshot_receipt_accept "$sub" "$name" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256" "$request" || return $?
+            done
+            local calibration_before_seq calibration_after_seq negative_seq
+            calibration_before_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/calibration.before.receipt")
+            calibration_after_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/calibration.after.receipt")
+            negative_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$sub/negative.receipt")
+            (( calibration_before_seq < calibration_after_seq && calibration_after_seq < negative_seq && negative_seq < seq_before )) || return 1
             (( seq_after > seq_before )) || return 1
             wb=$(mapping_witness "$sub/calibration.before.witness") || return 80
             wa=$(mapping_witness "$sub/calibration.after.witness") || return 80

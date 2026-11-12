@@ -418,13 +418,24 @@ guard_mapping_rules() {
 }
 # 保存映射两端原始计数：发起端 iptables-save -c 与接收端见证链。
 guard_mapping_snapshot() {
-    local seq=$1 pid counts
+    local seq=$1 generation=$2 network_id=$3 profile_sha256=$4 pid counts receipt temporary
     iptables-save -c > "$E/mapping-snapshot-$seq.rules" || return 80
     pid=$(guard_mapping_witness_identity) || return 80
     nsenter -t "$pid" -n iptables -t raw -nvxL "MS$RUN" > "$E/mapping-snapshot-$seq.witness" || return 80
     counts=$(mapping_witness "$E/mapping-snapshot-$seq.witness") || return 80
     [[ -n $counts ]] || return 80
     chmod a+r "$E/mapping-snapshot-$seq.rules" "$E/mapping-snapshot-$seq.witness" || return 80
+    receipt="$E/mapping-snapshot-$seq.receipt"
+    [[ ! -e $receipt && ! -L $receipt ]] || return 80
+    temporary=$(mktemp "$E/.mapping-snapshot-$seq.XXXXXXXX") || return 80
+    if ! printf 'seq\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' \
+        "$seq" "$generation" "$network_id" "$profile_sha256" \
+        "$(sha256sum "$E/mapping-snapshot-$seq.rules" | cut -d' ' -f1)" \
+        "$(sha256sum "$E/mapping-snapshot-$seq.witness" | cut -d' ' -f1)" > "$temporary" || \
+        ! chmod 644 "$temporary" || ! mv -T -- "$temporary" "$receipt"; then
+        rm -f -- "$temporary"
+        return 80
+    fi
     return 0
 }
 
@@ -527,7 +538,7 @@ guard_mapping_request_handle() {
         mapping-ready) guard_mapping_ready_activate "$generation" "$network_id" "$profile_sha256" || return $? ;;
         mapping-snapshot)
             guard_mapping_generation "$request" "$generation" "$network_id" "$profile_sha256" || return $?
-            guard_mapping_snapshot "$seq" || return $?
+            guard_mapping_snapshot "$seq" "$generation" "$network_id" "$profile_sha256" || return $?
             ;;
         mapping-release) guard_mapping_release "$generation" "$network_id" "$profile_sha256" "$rules_start" || return $? ;;
         *) return 65 ;;

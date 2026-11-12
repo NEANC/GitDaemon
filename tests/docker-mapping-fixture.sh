@@ -785,10 +785,14 @@ mapping_isolation_check() {
         mkdir -p "$dir" || return 80
         mapping_receiver_probe "$key" || return 80
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
-        cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/calibration.before.witness" || return 80
+        for name in rules witness receipt; do
+            cp -- "$base/mapping-snapshot-$CONTROL_SEQ.$name" "$dir/calibration.before.$name" || return 80
+        done
         mapping_receiver_probe "$key" || return 80
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
-        cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/calibration.after.witness" || return 80
+        for name in rules witness receipt; do
+            cp -- "$base/mapping-snapshot-$CONTROL_SEQ.$name" "$dir/calibration.after.$name" || return 80
+        done
         wb=$(mapping_witness "$dir/calibration.before.witness") || return 80
         wa=$(mapping_witness "$dir/calibration.after.witness") || return 80
         mapping_witness_growth "$wb" "$wa" "$key" || return 1
@@ -811,7 +815,9 @@ mapping_isolation_check() {
             mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || { original_rc=$?; stage=snapshot; }
         fi
         if [[ $stage == none ]]; then
-            cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/negative.witness" || { original_rc=$?; stage=snapshot-copy; }
+            for name in rules witness receipt; do
+                cp -- "$base/mapping-snapshot-$CONTROL_SEQ.$name" "$dir/negative.$name" || { original_rc=$?; stage=snapshot-copy; break; }
+            done
         fi
         mapping_isolation_resume "$key" "$dir" "$stage" "$original_rc" "$pid" || return 80
         [[ $stage == none ]] || return 80
@@ -826,7 +832,7 @@ mapping_isolation_check() {
         printf '%s\n' "$seq_after" > "$dir/seq.after" || return 80
         before=$base/mapping-snapshot-$seq_before.rules
         after=$base/mapping-snapshot-$seq_after.rules
-        for name in rules witness; do
+        for name in rules witness receipt; do
             cp -- "$base/mapping-snapshot-$seq_before.$name" "$dir/before.$name" || return 80
             cp -- "$base/mapping-snapshot-$seq_after.$name" "$dir/after.$name" || return 80
         done

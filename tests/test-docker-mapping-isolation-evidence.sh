@@ -47,6 +47,9 @@ isolation_produces_and_consumes_five_bound_cases() (
         count=$((count + 1)); CONTROL_SEQ=$count
         snapshot_write "$root/mapping-snapshot-$count.rules" "$((count % 5 == 0 ? 20 : 10))"
         witness_write "$received" "$root/mapping-snapshot-$count.witness" "$MAPPING_ASSERT_TARGET"
+        printf 'seq\t%s\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' "$count" "$MP_PROFILE_SHA256" \
+            "$(sha256sum "$root/mapping-snapshot-$count.rules" | cut -d' ' -f1)" \
+            "$(sha256sum "$root/mapping-snapshot-$count.witness" | cut -d' ' -f1)" > "$root/mapping-snapshot-$count.receipt"
     }
     mapping_receiver_listener_control() {
         [[ $2 != STOP ]] || paused=1
@@ -66,6 +69,35 @@ isolation_produces_and_consumes_five_bound_cases() (
         mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     done
     [[ $count == 25 ]] || return 1
+    for key in $MAPPING_WITNESS_KEYS; do
+        [[ -s $dir/isolation/$key/calibration.before.receipt && -s $dir/isolation/$key/calibration.after.receipt \
+            && -s $dir/isolation/$key/negative.receipt && -s $dir/isolation/$key/before.receipt \
+            && -s $dir/isolation/$key/after.receipt ]] || return 1
+    done
+    cp "$dir/isolation/host-input/before.rules" "$WORK/original.rules"
+    cp "$dir/isolation/dns-udp/after.rules" "$dir/isolation/host-input/before.rules"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/original.rules" "$dir/isolation/host-input/before.rules"
+    cp "$dir/isolation/dns-udp/before.receipt" "$dir/isolation/host-input/before.receipt"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$root/mapping-snapshot-19.receipt" "$dir/isolation/host-input/before.receipt"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$root/mapping-snapshot-19.receipt" "$WORK/receipt"
+    rm "$dir/isolation/host-input/before.receipt"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 80 ]] || return 1
+    cp "$WORK/receipt" "$dir/isolation/host-input/before.receipt"
+    sed -i 's/generation\tg1/generation\tg2/' "$dir/isolation/host-input/before.receipt"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$WORK/receipt" "$dir/isolation/host-input/before.receipt"
+    sed -i 's/network_id\tnet-one/network_id\tnet-two/' "$dir/isolation/host-input/before.receipt"
+    rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    cp "$root/mapping-snapshot-14.receipt" "$dir/isolation/host-input/before.receipt"
     for key in before.rules negative.exit; do
         cp "$dir/isolation/host-input/$key" "$WORK/$key"
         rm "$dir/isolation/host-input/$key"
@@ -76,21 +108,26 @@ isolation_produces_and_consumes_five_bound_cases() (
         [[ $rc == 80 ]] || { printf '%s empty: %s\n' "$key" "$rc" >&2; return 1; }
         printf 'invalid\n' > "$dir/isolation/host-input/$key"
         rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
-        [[ $rc == 80 ]] || { printf '%s invalid: %s\n' "$key" "$rc" >&2; return 1; }
+        if [[ $key == before.rules ]]; then
+            [[ $rc == 1 ]] || { printf '%s invalid: %s\n' "$key" "$rc" >&2; return 1; }
+        else
+            [[ $rc == 80 ]] || { printf '%s invalid: %s\n' "$key" "$rc" >&2; return 1; }
+        fi
         cp "$WORK/$key" "$dir/isolation/host-input/$key"
     done
     key=host-input
+    cp "$dir/isolation/$key/after.rules" "$WORK/after.rules"
     printf 'not a drop rule\n' > "$dir/isolation/$key/after.rules"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
-    [[ $rc == 80 ]] || return 1
+    [[ $rc == 1 ]] || return 1
     snapshot_write "$dir/isolation/$key/after.rules" 10
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
-    snapshot_write "$dir/isolation/$key/after.rules" 20
+    cp "$WORK/after.rules" "$dir/isolation/$key/after.rules"
     printf '0\n' > "$dir/isolation/$key/seq.after"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
-    printf '15\n' > "$dir/isolation/$key/seq.after"
+    printf '20\n' > "$dir/isolation/$key/seq.after"
     key=dns-udp
     printf 'target\tother\n' > "$dir/isolation/$key/binding.tsv"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
@@ -98,7 +135,7 @@ isolation_produces_and_consumes_five_bound_cases() (
     key=host-published
     printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n' > "$dir/isolation/$key/after.witness"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
-    [[ $rc == 80 ]] || return 1
+    [[ $rc == 1 ]] || return 1
     key=cross-network
     printf 'wrong\n' > "$dir/isolation/$key/reject.layer"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
@@ -141,6 +178,9 @@ isolation_stop_failure_restores_or_blocks() (
         CONTROL_SEQ=$(( ${CONTROL_SEQ:-0} + 1 ))
         snapshot_write "$root/mapping-snapshot-$CONTROL_SEQ.rules" 10
         witness_write "$probes" "$root/mapping-snapshot-$CONTROL_SEQ.witness" cross-network
+        printf 'seq\t%s\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nrules_sha256\t%s\nwitness_sha256\t%s\n' "$CONTROL_SEQ" "$MP_PROFILE_SHA256" \
+            "$(sha256sum "$root/mapping-snapshot-$CONTROL_SEQ.rules" | cut -d' ' -f1)" \
+            "$(sha256sum "$root/mapping-snapshot-$CONTROL_SEQ.witness" | cut -d' ' -f1)" > "$root/mapping-snapshot-$CONTROL_SEQ.receipt"
         if [[ $mode == snapshot_copy_failure && $paused == 1 ]]; then
             rm "$root/mapping-snapshot-$CONTROL_SEQ.witness"
         fi
