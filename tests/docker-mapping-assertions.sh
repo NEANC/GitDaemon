@@ -727,6 +727,13 @@ mapping_negative_upstream_ca_restore() {
         "$MAPPING_ASSET_ROOT/upstream/tls/ca.crt" "$MAPPING_CLIENT_UPSTREAM_CA"
 }
 
+mapping_tls_client_upstream_ca_hash() {
+    local image=${MAPPING_PRODUCT_IMAGE:-} name
+    [[ -n $image && -n ${MAPPING_ASSERT_GENERATION:-} ]] || return 1
+    name=$(mapping_scenario_product_container "$MAPPING_ASSERT_GENERATION") || return 1
+    mapping_fixture_docker exec "$name" sha256sum "$MAPPING_CLIENT_UPSTREAM_CA" | awk '{print $1}'
+}
+
 mapping_tls_injected_evidence() {
     local dir=${1:-} kind=${2:-} scenario=${3:-} before after request_rc dial_before dial_after
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
@@ -802,9 +809,12 @@ mapping_tls_negative_run() {
 }
 
 mapping_tls_upstream_ca_run() {
-    local dir=${1:-} kind=${2:-} scenario=${3:-} before after recovered rc evidence_rc=0 dial_before dial_after baseline_dial
+    local dir=${1:-} kind=${2:-} scenario=${3:-} before after recovered rc evidence_rc=0 dial_before dial_after baseline_dial ca_before ca_after ca_recovered
     mapping_scenario_valid "$scenario" || return 80
     mapping_profile_load "$MAPPING_PROFILE" || return 80
+    ca_before=$(mapping_tls_client_upstream_ca_hash) || return 80
+    [[ $ca_before =~ ^[0-9a-f]{64}$ ]] || return 80
+    printf '%s\n' "$ca_before" > "$dir/ca.before.sha256" || return 80
     dial_before=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || return 80
     mapping_assert_uint "$dial_before" > "$dir/upstream.baseline.before" || return 80
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
@@ -829,6 +839,12 @@ mapping_tls_upstream_ca_run() {
     if ! mapping_negative_wrong_ca upstream-ca.crt; then
         mapping_negative_upstream_ca_restore || return 80
         return 80
+    fi
+    ca_after=$(mapping_tls_client_upstream_ca_hash) || evidence_rc=80
+    if (( evidence_rc == 0 )); then
+        [[ $ca_after =~ ^[0-9a-f]{64}$ ]] || evidence_rc=80
+        printf '%s\n' "$ca_after" > "$dir/ca.after.sha256" || evidence_rc=80
+        [[ $ca_after != "$ca_before" ]] || evidence_rc=1
     fi
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || evidence_rc=80
     if (( evidence_rc == 0 )); then mapping_assert_uint "$before" >/dev/null || evidence_rc=80; fi
@@ -862,9 +878,14 @@ mapping_tls_upstream_ca_run() {
         [[ $rc != 0 && $after -gt $before && $dial_after -gt $dial_before ]] || evidence_rc=1
         tail -n "+$(( $(wc -l < "$dir/connect.baseline") + 1 ))" "$dir/connect.log" > "$dir/connect.failed.new" || evidence_rc=80
         mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || evidence_rc=1
-        grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || evidence_rc=1
+        grep -Fqi "unable to access https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" "$dir/request.failed.log" || evidence_rc=1
+        grep -Eqi 'SSL certificate problem:.*(issuer|certificate)' "$dir/request.failed.log" || evidence_rc=1
     fi
     mapping_negative_upstream_ca_restore || return 80
+    ca_recovered=$(mapping_tls_client_upstream_ca_hash) || return 80
+    [[ $ca_recovered =~ ^[0-9a-f]{64}$ ]] || return 80
+    printf '%s\n' "$ca_recovered" > "$dir/ca.recovered.sha256" || return 80
+    [[ $ca_recovered == "$ca_before" ]] || return 1
     (( evidence_rc == 0 )) || return "$evidence_rc"
     rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
     printf '%s\n' "$rc" > "$dir/recovery.exit" || return 80
@@ -878,7 +899,7 @@ mapping_tls_upstream_ca_run() {
     tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
     mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
     dial_after=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || return 80
-    mapping_assert_uint "$dial_after" >/dev/null || return 80
+    mapping_assert_uint "$dial_after" > "$dir/upstream.recovered" || return 80
     before=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
     (( dial_after > before )) || return 1
     [[ -f $dir/refs.expected && -f $dir/head.expected && -f $dir/control/unique-commit && ! -L $dir/refs.expected && ! -L $dir/head.expected && ! -L $dir/control/unique-commit ]] || return 80
@@ -1168,7 +1189,7 @@ mapping_negative_rejected() {
             local baseline_exit recovery_exit request_exit proxy_before proxy_after proxy_recovered upstream_before upstream_after
             [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == wrong_upstream_ca ]] || return 80
             [[ -f $dir/tls-layer.tsv && ! -L $dir/tls-layer.tsv ]] || return 80
-            for snapshot in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
+            for snapshot in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after upstream.recovered ca.before.sha256 ca.after.sha256 ca.recovered.sha256 connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
                 [[ -f $dir/$snapshot && ! -L $dir/$snapshot ]] || return 80
             done
             mapping_tls_layer_accept "$case_name" "$dir/tls-layer.tsv" || return 1
@@ -1180,18 +1201,26 @@ mapping_negative_rejected() {
             proxy_recovered=$(mapping_assert_uint_file "$dir/proxy.recovered") || return 80
             upstream_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 80
             upstream_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
+            local upstream_recovered ca_before ca_after ca_recovered
+            upstream_recovered=$(mapping_assert_uint_file "$dir/upstream.recovered") || return 80
+            ca_before=$(cat "$dir/ca.before.sha256") || return 80
+            ca_after=$(cat "$dir/ca.after.sha256") || return 80
+            ca_recovered=$(cat "$dir/ca.recovered.sha256") || return 80
+            [[ $ca_before =~ ^[0-9a-f]{64}$ && $ca_after =~ ^[0-9a-f]{64}$ && $ca_recovered =~ ^[0-9a-f]{64}$ ]] || return 80
             [[ $baseline_exit == 0 && $recovery_exit == 0 ]] || return 80
             (( request_exit > 0 )) || return 1
             mapping_profile_load "$MAPPING_PROFILE" || return 80
             mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 1
             mapping_assert_connect_legal "$dir/connect.failed.new" "$MP_U" || return 1
             mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 1
-            (( proxy_after > proxy_before && upstream_after > upstream_before && proxy_recovered > proxy_after )) || return 1
+            (( proxy_after > proxy_before && upstream_after > upstream_before && proxy_recovered > proxy_after && upstream_recovered > upstream_after )) || return 1
+            [[ $ca_before != "$ca_after" && $ca_before == "$ca_recovered" ]] || return 1
             [[ -f $dir/refs.expected && -f $dir/refs.actual ]] || return 80
             cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
-            grep -Eqi 'certificate|issuer|SSL' "$dir/request.failed.log" || return 1
+            grep -Fqi "unable to access https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" "$dir/request.failed.log" || return 1
+            grep -Eqi 'SSL certificate problem:.*(issuer|certificate)' "$dir/request.failed.log" || return 1
             MAPPING_ASSERT_REJECT_LAYER=tls-upstream
             return 0
             ;;
@@ -1573,7 +1602,7 @@ mapping_negative_case_evidence_accept() {
         wrong_upstream_ca)
             [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == "$case_id" ]] || return 80
             [[ -f $dir/control/unique-commit && ! -L $dir/control/unique-commit && -r $dir/control/unique-commit ]] || return 80
-            for name in tls-layer.tsv baseline.exit recovery.exit request.exit baseline.before baseline.after proxy.before proxy.after proxy.recovered upstream.baseline.before upstream.baseline upstream.before upstream.after connect.before connect.baseline connect.baseline.new connect.log connect.failed.new connect.recovered connect.recovered.new request.baseline.log request.recovery.log request.failed.log refs.expected refs.actual head.expected head.actual fsck.exit; do
+            for name in tls-layer.tsv baseline.exit recovery.exit request.exit baseline.before baseline.after proxy.before proxy.after proxy.recovered upstream.baseline.before upstream.baseline upstream.before upstream.after upstream.recovered ca.before.sha256 ca.after.sha256 ca.recovered.sha256 connect.before connect.baseline connect.baseline.new connect.log connect.failed.new connect.recovered connect.recovered.new request.baseline.log request.recovery.log request.failed.log refs.expected refs.actual head.expected head.actual fsck.exit; do
                 [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name ]] || return 80
             done
             baseline=$(mapping_assert_uint_file "$dir/baseline.exit") || return 80
@@ -1588,9 +1617,16 @@ mapping_negative_case_evidence_accept() {
             dial_baseline=$(mapping_assert_uint_file "$dir/upstream.baseline") || return 80
             upstream_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 80
             upstream_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
+            dial_recovered=$(mapping_assert_uint_file "$dir/upstream.recovered") || return 80
+            local ca_before ca_after ca_recovered
+            ca_before=$(cat "$dir/ca.before.sha256") || return 80
+            ca_after=$(cat "$dir/ca.after.sha256") || return 80
+            ca_recovered=$(cat "$dir/ca.recovered.sha256") || return 80
+            [[ $ca_before =~ ^[0-9a-f]{64}$ && $ca_after =~ ^[0-9a-f]{64}$ && $ca_recovered =~ ^[0-9a-f]{64}$ ]] || return 80
             [[ $baseline == 0 && $recovery == 0 ]] || return 80
             [[ $(cat "$dir/control/unique-commit") == "$MPA_UNIQUE_COMMIT" ]] || return 1
-            (( baseline_after > baseline_before && before == baseline_after && dial_baseline > dial_baseline_before && upstream_before >= dial_baseline && request > 0 && after > before && upstream_after > upstream_before && recovered > after )) || return 1
+            (( baseline_after > baseline_before && before == baseline_after && dial_baseline > dial_baseline_before && upstream_before >= dial_baseline && request > 0 && after > before && upstream_after > upstream_before && recovered > after && dial_recovered > upstream_after )) || return 1
+            [[ $ca_before != "$ca_after" && $ca_before == "$ca_recovered" ]] || return 1
             mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
             grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.baseline.log" || return 1
             grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.recovery.log" || return 1
@@ -1604,7 +1640,8 @@ mapping_negative_case_evidence_accept() {
             mapping_tls_layer_accept "$case_id" "$dir/tls-layer.tsv" || return 1
             [[ $(awk -F '\t' '$1 == "request_exit" {print $2}' "$dir/tls-layer.tsv") == "$request" && $(awk -F '\t' '$1 == "connect_delta" {print $2}' "$dir/tls-layer.tsv") == "$((after - before))" ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") && -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
-            grep -Eqi '^fatal: .*SSL certificate problem' "$dir/request.failed.log" || return 1
+            grep -Fqi "unable to access https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" "$dir/request.failed.log" || return 1
+            grep -Eqi 'SSL certificate problem:.*(issuer|certificate)' "$dir/request.failed.log" || return 1
             mapping_assert_refs_match "$dir" || return 1
             mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 1
             mapping_assert_refs_contain "$dir/refs.actual" "$MPA_UNIQUE_COMMIT" || return 1

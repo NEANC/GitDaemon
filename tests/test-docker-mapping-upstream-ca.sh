@@ -25,6 +25,9 @@ upstream_ca_git_8443_restores_refs() {
     }
     mapping_negative_wrong_ca() { [[ $1 == upstream-ca.crt ]] && : > "$dir/injected"; }
     mapping_negative_upstream_ca_restore() { : > "$dir/restored"; }
+    mapping_tls_client_upstream_ca_hash() {
+        if [[ -f $dir/injected && ! -f $dir/restored ]]; then printf 'wrong-ca' | sha256sum | awk '{print $1}'; else printf 'original-ca' | sha256sum | awk '{print $1}'; fi
+    }
     mapping_fixture_docker() {
         printf '%s\n' "$*" >> "$dir/calls"
         local n
@@ -49,13 +52,18 @@ upstream_ca_git_8443_restores_refs() {
     mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
     [[ $rc == 0 && $(cat "$dir/baseline.exit") == 0 && $(cat "$dir/request.exit") == 128 && $(cat "$dir/recovery.exit") == 0 ]] || return 1
     [[ $(cat "$dir/proxy.before") == 1 && $(cat "$dir/proxy.after") == 2 && $(cat "$dir/proxy.recovered") == 3 ]] || return 1
-    [[ $(cat "$dir/upstream.before") == 1 && $(cat "$dir/upstream.after") == 2 ]] || return 1
+    [[ $(cat "$dir/upstream.before") == 1 && $(cat "$dir/upstream.after") == 2 && $(cat "$dir/upstream.recovered") == 3 ]] || return 1
+    [[ $(cat "$dir/ca.before.sha256") == "$(printf 'original-ca' | sha256sum | awk '{print $1}')" && $(cat "$dir/ca.after.sha256") == "$(printf 'wrong-ca' | sha256sum | awk '{print $1}')" && $(cat "$dir/ca.recovered.sha256") == "$(cat "$dir/ca.before.sha256")" ]] || return 1
     [[ $(cat "$dir/tls-layer.tsv") == *$'layer\tinner-failure'* ]] || return 1
     cmp -s "$dir/refs.expected" "$dir/refs.actual" || return 1
     cmp -s "$dir/head.expected" "$dir/head.actual" || return 1
     [[ $(cat "$dir/fsck.exit") == 0 ]] || return 1
     mapping_negative_rejected wrong_upstream_ca fallback "$dir" || return 1
     [[ $MAPPING_ASSERT_REJECT_LAYER == tls-upstream ]] || return 1
+    printf 'fatal: unable to access https://elsewhere.invalid/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/request.failed.log"
+    rc=0; mapping_negative_rejected wrong_upstream_ca fallback "$dir" || rc=$?
+    [[ $rc == 1 ]] || return 1
+    printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n' > "$dir/request.failed.log"
     mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || return 1
     local matrix="${dir}-matrix.tsv"
     printf 'wrong_upstream_ca\tr1\tmapping-fallback\tg1\tm1\ta1\t%s\t0\tPASS\n' "$dir" > "$matrix"
@@ -71,10 +79,22 @@ upstream_ca_git_8443_restores_refs() {
     [[ $rc == 1 ]] || return 1
     printf 'abc\n' > "$dir/head.actual"
     rm -f "$matrix"
-    for n in baseline.before baseline.after upstream.baseline.before upstream.baseline request.baseline.log request.recovery.log connect.failed.new; do
+    for n in baseline.before baseline.after upstream.baseline.before upstream.baseline upstream.recovered ca.before.sha256 ca.after.sha256 ca.recovered.sha256 request.baseline.log request.recovery.log connect.failed.new; do
         mv "$dir/$n" "$dir/$n.saved"
         rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
         [[ $rc == 80 ]] || return 1
+        mv "$dir/$n.saved" "$dir/$n"
+    done
+    for n in upstream.recovered ca.before.sha256 ca.after.sha256 ca.recovered.sha256; do
+        cp "$dir/$n" "$dir/$n.saved"
+        case $n in
+            upstream.recovered) printf '2\n' > "$dir/$n" ;;
+            ca.before.sha256) cp "$dir/ca.after.sha256" "$dir/$n" ;;
+            ca.after.sha256) cp "$dir/ca.before.sha256" "$dir/$n" ;;
+            ca.recovered.sha256) cp "$dir/ca.after.sha256" "$dir/$n" ;;
+        esac
+        rc=0; mapping_negative_case_evidence_accept wrong_upstream_ca r1 mapping-fallback g1 m1 a1 "$dir" || rc=$?
+        [[ $rc == 1 ]] || return 1
         mv "$dir/$n.saved" "$dir/$n"
     done
     printf 'fatal: unrelated error\n' > "$dir/request.failed.log"
@@ -102,7 +122,7 @@ upstream_ca_git_8443_restores_refs() {
 
 upstream_ca_recovery_requires_complete_positive_evidence() {
     local mode dir rc n
-    for mode in stale-ref equal-stale-refs bad-head missing-object missing-refs missing-head missing-fsck invalid-fsck failed-head absent-unique absent-identity mismatched-identity; do
+    for mode in stale-ref equal-stale-refs bad-head missing-object missing-refs missing-head missing-fsck invalid-fsck failed-head absent-unique absent-identity mismatched-identity ca-unchanged ca-not-restored unrelated-ssl recovery-flat-dial; do
         dir=$(mktemp -d)
         printf '0\n' > "$dir/proxy-count"
         printf '0\n' > "$dir/dial-count"
@@ -126,11 +146,16 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
         }
         mapping_negative_wrong_ca() { : > "$dir/injected"; }
         mapping_negative_upstream_ca_restore() { : > "$dir/restored"; }
+        mapping_tls_client_upstream_ca_hash() {
+            if [[ $mode == ca-unchanged ]]; then printf 'original-ca'; elif [[ $mode == ca-not-restored && -f $dir/injected ]]; then printf 'wrong-ca'; elif [[ -f $dir/injected && ! -f $dir/restored ]]; then printf 'wrong-ca'; else printf 'original-ca'; fi | sha256sum | awk '{print $1}'
+        }
         mapping_fixture_docker() {
             n=$(cat "$dir/proxy-count"); printf '%s\n' "$((n+1))" > "$dir/proxy-count"
-            n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
+            if [[ $mode != recovery-flat-dial || ! -f $dir/restored ]]; then
+                n=$(cat "$dir/dial-count"); printf '%s\n' "$((n+1))" > "$dir/dial-count"
+            fi
             if [[ -f $dir/injected && ! -f $dir/restored ]]; then
-                printf 'fatal: SSL certificate problem\n'
+                if [[ $mode == unrelated-ssl ]]; then printf 'fatal: unable to access https://elsewhere.invalid/: SSL certificate problem\n'; else printf 'fatal: unable to access https://github.com/acme/demo.git/: SSL certificate problem: unable to get local issuer certificate\n'; fi
                 return 128
             fi
             printf '同步传输路径：配置的 HTTPS 代理\n'
@@ -161,8 +186,12 @@ upstream_ca_recovery_requires_complete_positive_evidence() {
         else
             [[ $rc == 1 ]] || { printf '%s: expected 1, got %s\n' "$mode" "$rc" >&2; return 1; }
         fi
-        [[ -f $dir/restored && $(cat "$dir/baseline.exit") == 0 && $(cat "$dir/request.exit") == 128 && $(cat "$dir/recovery.exit") == 0 ]] || { printf '%s: missing recovery evidence\n' "$mode" >&2; return 1; }
-        grep -Fq 'SSL certificate problem' "$dir/request.failed.log" || { printf '%s: missing failure log\n' "$mode" >&2; return 1; }
+        [[ -f $dir/restored && $(cat "$dir/baseline.exit") == 0 ]] || { printf '%s: missing failure evidence\n' "$mode" >&2; return 1; }
+        if [[ $mode != ca-unchanged ]]; then [[ $(cat "$dir/request.exit") == 128 ]] || return 1; fi
+        if [[ $mode != ca-unchanged && $mode != ca-not-restored && $mode != unrelated-ssl ]]; then
+            [[ $(cat "$dir/recovery.exit") == 0 ]] || return 1
+        fi
+        if [[ $mode != ca-unchanged ]]; then grep -Fq 'SSL certificate problem' "$dir/request.failed.log" || { printf '%s: missing failure log\n' "$mode" >&2; return 1; }; fi
     done
 }
 
@@ -170,9 +199,10 @@ upstream_ca_wrong_layer_is_assertion_not_fixture() {
     local dir rc=0
     dir=$(mktemp -d)
     printf 'wrong_upstream_ca\n' > "$dir/case.tsv"
-    for name in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
+    for name in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after upstream.recovered connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
         printf '0\n' > "$dir/$name"
     done
+    for name in ca.before.sha256 ca.after.sha256 ca.recovered.sha256; do printf '%064d\n' 0 > "$dir/$name"; done
     printf 'case\twrong_upstream_ca\nlayer\touter-failure\nconnect_delta\t0\nrequest_exit\t128\n' > "$dir/tls-layer.tsv"
     mapping_negative_rejected wrong_upstream_ca fallback "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
@@ -234,6 +264,9 @@ upstream_ca_missing_dial_is_not_inner_failure() {
     }
     mapping_negative_wrong_ca() { : > "$dir/injected"; }
     mapping_negative_upstream_ca_restore() { : > "$dir/restored"; }
+    mapping_tls_client_upstream_ca_hash() {
+        if [[ -f $dir/injected && ! -f $dir/restored ]]; then printf 'wrong-ca'; else printf 'original-ca'; fi | sha256sum | awk '{print $1}'
+    }
     mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
     [[ $rc == 1 && -f $dir/restored ]]
 }
@@ -278,9 +311,12 @@ upstream_ca_missing_count_restores_and_returns_fixture() {
         }
         mapping_negative_wrong_ca() { : > "$dir/injected"; }
         mapping_negative_upstream_ca_restore() { : > "$dir/restored"; }
+        mapping_tls_client_upstream_ca_hash() {
+            if [[ -f $dir/injected && ! -f $dir/restored ]]; then printf 'wrong-ca'; else printf 'original-ca'; fi | sha256sum | awk '{print $1}'
+        }
         rc=0
         mapping_tls_negative_run wrong_upstream_ca "$dir" fallback mapping-fallback-wrong-upstream-ca || rc=$?
-        [[ $rc == 80 && -f $dir/restored ]] || return 1
+        [[ $rc == 80 && -f $dir/restored ]] || { printf '%s: expected fixture, got %s\n' "$missing" "$rc" >&2; return 1; }
     done
 }
 
@@ -288,7 +324,7 @@ upstream_ca_missing_verdict_count_is_fixture() {
     local dir rc=0
     dir=$(mktemp -d)
     printf 'wrong_upstream_ca\n' > "$dir/case.tsv"
-    for name in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
+    for name in baseline.exit recovery.exit request.exit proxy.before proxy.after proxy.recovered upstream.before upstream.after upstream.recovered ca.before.sha256 ca.after.sha256 ca.recovered.sha256 connect.baseline.new connect.failed.new connect.recovered.new request.failed.log refs.expected refs.actual; do
         printf '1\n' > "$dir/$name"
     done
     printf '0\n' > "$dir/baseline.exit" "$dir/recovery.exit"
@@ -345,6 +381,9 @@ upstream_ca_entry_rejects_invalid_git_evidence() {
         }
         mapping_negative_wrong_ca() { : > "$test_root/injected"; }
         mapping_negative_upstream_ca_restore() { : > "$test_root/restored"; }
+        mapping_tls_client_upstream_ca_hash() {
+            if [[ -f $test_root/injected && ! -f $test_root/restored ]]; then printf 'wrong-ca'; else printf 'original-ca'; fi | sha256sum | awk '{print $1}'
+        }
         mapping_fixture_docker() {
             n=$(cat "$test_root/proxy-count"); printf '%s\n' "$((n+1))" > "$test_root/proxy-count"
             if [[ $mode != flat-dial || ! -f $test_root/injected || -f $test_root/restored ]]; then
