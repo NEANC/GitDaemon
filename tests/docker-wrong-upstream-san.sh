@@ -82,22 +82,37 @@ mapping_upstream_san_leaf() {
     fi
 }
 
+mapping_upstream_san_pair() {
+    local dir=$1 phase=$2 container name extension digest
+    container=$(mapping_upstream_container) || return 80
+    for name in cert key; do
+        extension=crt
+        [[ $name == key ]] && extension=key
+        digest=$(mapping_fixture_docker exec "$container" sha256sum \
+            "$MAPPING_ASSET_ROOT/upstream/tls/srv.$extension") || return 80
+        [[ $digest =~ ^[0-9a-f]{64}[[:space:]] ]] || return 80
+        printf '%s\n' "${digest:0:64}" > "$dir/$name.$phase" || return 80
+    done
+}
+
 mapping_upstream_san_baseline() {
     local dir=$1 kind=$2 scenario=$3 before after rc dial_before dial_after
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     mapping_assert_uint "$before" > "$dir/baseline.before" || return 80
     dial_before=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || return 80
-    mapping_assert_uint "$dial_before" >/dev/null || return 80
+    mapping_assert_uint "$dial_before" > "$dir/upstream.baseline.before" || return 80
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.before" || return 80
     rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
     printf '%s\n' "$rc" > "$dir/baseline.exit" || return 80
     [[ $rc == 0 ]] && grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
+    cp "$dir/request.log" "$dir/request.baseline.log" || return 80
     after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     mapping_assert_uint "$after" > "$dir/baseline.after" || return 80
     (( after > before )) || return 80
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.baseline" || return 80
     tail -n "+$(( $(wc -l < "$dir/connect.before") + 1 ))" "$dir/connect.baseline" > "$dir/connect.baseline.new" || return 80
     mapping_assert_connect_legal "$dir/connect.baseline.new" "$MP_U" || return 80
+    mapping_assert_connect_all_legal "$dir/connect.baseline.new" "$MP_U" || return 80
     dial_after=$(mapping_scenario_upstream_count "$kind" "$scenario" "$dir") || return 80
     mapping_assert_uint "$dial_after" > "$dir/upstream.baseline" || return 80
     (( dial_after > dial_before )) || return 80
@@ -159,6 +174,7 @@ mapping_upstream_san_recovery() {
     rc=$(mapping_tls_product_request "$dir" "$scenario") || return 80
     printf '%s\n' "$rc" > "$dir/recovery.exit" || return 80
     [[ $rc == 0 ]] && grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.log" || return 80
+    cp "$dir/request.log" "$dir/request.recovery.log" || return 80
     before=$(mapping_assert_uint_file "$dir/proxy.after") || return 80
     after=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     mapping_assert_uint "$after" > "$dir/proxy.recovered" || return 80
@@ -168,6 +184,7 @@ mapping_upstream_san_recovery() {
     mapping_assert_connect_legal "$dir/connect.recovered.new" "$MP_U" || return 80
     before=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
     after=$(mapping_upstream_san_count_after "$kind" "$scenario" "$dir" "$before") || return 80
+    mapping_assert_uint "$after" > "$dir/upstream.recovered" || return 80
     (( after > before )) || return 80
     [[ -f $dir/refs.expected && -f $dir/head.expected && -f $dir/control/unique-commit ]] || return 80
     mapping_assert_identity_load "$dir" || return 80
@@ -188,14 +205,17 @@ mapping_upstream_san_case() {
     mapping_profile_load "$MAPPING_PROFILE" || return 80
     mapping_upstream_san_baseline "$dir" "$kind" "$scenario" || return 80
     mapping_upstream_san_leaf "$dir" original || return 80
+    mapping_upstream_san_pair "$dir" original || return 80
     printf 'wrong_upstream_san\n' > "$dir/case.tsv" || return 80
     mapping_upstream_san_replace || rc=80
     if (( rc == 0 )); then mapping_upstream_san_restart || rc=80; fi
     if (( rc == 0 )); then mapping_upstream_san_leaf "$dir" wrong || rc=80; fi
+    if (( rc == 0 )); then mapping_upstream_san_pair "$dir" wrong || rc=80; fi
     if (( rc == 0 )); then mapping_upstream_san_failure "$dir" "$kind" "$scenario" || rc=$?; fi
     mapping_upstream_san_restore || return 80
     mapping_upstream_san_restart || return 80
     mapping_upstream_san_leaf "$dir" restored || return 80
+    mapping_upstream_san_pair "$dir" restored || return 80
     cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 80
     if (( rc == 0 )); then mapping_upstream_san_recovery "$dir" "$kind" "$scenario" || return 80; fi
     return "$rc"

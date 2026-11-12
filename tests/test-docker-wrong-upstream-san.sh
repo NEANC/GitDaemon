@@ -122,6 +122,12 @@ run_case() {
             [[ $MODE != leaf-fail || $2 != wrong ]] || return 80
             if [[ $2 == wrong ]]; then printf 'wrong\n' > "$dir/leaf.wrong"; else printf 'original\n' > "$dir/leaf.$2"; fi
         }
+        mapping_upstream_san_pair() {
+            local name
+            for name in cert key; do
+                if [[ $2 == wrong ]]; then printf 'changed-%s' "$name" | sha256sum | awk '{print $1}' > "$dir/$name.$2"; else printf 'original-%s' "$name" | sha256sum | awk '{print $1}' > "$dir/$name.$2"; fi
+            done
+        }
         mapping_upstream_san_replace() { printf 'replace\n' >> "$EVENTS"; [[ $MODE != replace-fail ]] || return 80; : > "$dir/replaced"; }
         mapping_upstream_san_restore() { printf 'restore\n' >> "$EVENTS"; [[ $MODE != restore-fail ]] || return 80; : > "$dir/restored"; }
         mapping_upstream_san_restart() { printf 'restart\n' >> "$EVENTS"; [[ $MODE != restart-fail ]]; }

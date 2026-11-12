@@ -1730,6 +1730,57 @@ mapping_negative_case_evidence_accept() {
             [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 1
             return 0
             ;;
+        wrong_upstream_san)
+            [[ -f $dir/case.tsv && ! -L $dir/case.tsv && $(cat "$dir/case.tsv") == "$case_id" ]] || return 80
+            [[ -f $dir/control/unique-commit && ! -L $dir/control/unique-commit && -r $dir/control/unique-commit ]] || return 80
+            for name in tls-layer.tsv baseline.exit recovery.exit request.exit baseline.before baseline.after proxy.before proxy.after proxy.recovered upstream.baseline.before upstream.baseline upstream.before upstream.after upstream.recovered connect.before connect.baseline connect.baseline.new connect.log connect.failed.new connect.recovered connect.recovered.new request.baseline.log request.recovery.log request.failed.log leaf.original leaf.wrong leaf.restored cert.original cert.wrong cert.restored key.original key.wrong key.restored refs.expected refs.actual head.expected head.actual fsck.exit; do
+                [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name ]] || return 80
+            done
+            baseline=$(mapping_assert_uint_file "$dir/baseline.exit") || return 80
+            recovery=$(mapping_assert_uint_file "$dir/recovery.exit") || return 80
+            request=$(mapping_assert_uint_file "$dir/request.exit") || return 80
+            baseline_before=$(mapping_assert_uint_file "$dir/baseline.before") || return 80
+            baseline_after=$(mapping_assert_uint_file "$dir/baseline.after") || return 80
+            before=$(mapping_assert_uint_file "$dir/proxy.before") || return 80
+            after=$(mapping_assert_uint_file "$dir/proxy.after") || return 80
+            recovered=$(mapping_assert_uint_file "$dir/proxy.recovered") || return 80
+            dial_baseline_before=$(mapping_assert_uint_file "$dir/upstream.baseline.before") || return 80
+            dial_baseline=$(mapping_assert_uint_file "$dir/upstream.baseline") || return 80
+            upstream_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 80
+            upstream_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
+            dial_recovered=$(mapping_assert_uint_file "$dir/upstream.recovered") || return 80
+            [[ $baseline == 0 && $recovery == 0 ]] || return 80
+            [[ $(cat "$dir/control/unique-commit") == "$MPA_UNIQUE_COMMIT" ]] || return 1
+            (( baseline_after > baseline_before && before == baseline_after && dial_baseline > dial_baseline_before && upstream_before >= dial_baseline && request == 1 && after > before && upstream_after > upstream_before && recovered > after && dial_recovered > upstream_after )) || return 1
+            mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.baseline.log" || return 1
+            grep -Fq "$MAPPING_ASSERT_MARK_PROXY" "$dir/request.recovery.log" || return 1
+            mapping_tls_layer_accept "$case_id" "$dir/tls-layer.tsv" || return 1
+            [[ $(awk -F '\t' '$1 == "request_exit" {print $2}' "$dir/tls-layer.tsv") == "$request" && $(awk -F '\t' '$1 == "connect_delta" {print $2}' "$dir/tls-layer.tsv") == "$((after - before))" ]] || return 1
+            for name in connect.baseline.new connect.failed.new connect.recovered.new; do
+                mapping_assert_connect_legal "$dir/$name" "$MP_U" || return 1
+                mapping_assert_connect_all_legal "$dir/$name" "$MP_U" || return 1
+            done
+            [[ $(wc -l < "$dir/connect.baseline") -gt $(wc -l < "$dir/connect.before") && $(wc -l < "$dir/connect.log") -gt $(wc -l < "$dir/connect.baseline") && $(wc -l < "$dir/connect.recovered") -gt $(wc -l < "$dir/connect.log") ]] || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.before") + 1 ))" "$dir/connect.baseline" | cmp -s - "$dir/connect.baseline.new" || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.baseline") + 1 ))" "$dir/connect.log" | cmp -s - "$dir/connect.failed.new" || return 1
+            tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" | cmp -s - "$dir/connect.recovered.new" || return 1
+            [[ $(cat "$dir/leaf.original") != "$(cat "$dir/leaf.wrong")" ]] || return 1
+            cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 1
+            for name in cert key; do
+                [[ $(cat "$dir/$name.original") =~ ^[0-9a-f]{64}$ && $(cat "$dir/$name.wrong") =~ ^[0-9a-f]{64}$ && $(cat "$dir/$name.restored") =~ ^[0-9a-f]{64}$ ]] || return 80
+                [[ $(cat "$dir/$name.original") != "$(cat "$dir/$name.wrong")" ]] || return 1
+                cmp -s "$dir/$name.original" "$dir/$name.restored" || return 1
+            done
+            mapping_upstream_san_git_failure "$dir/request.failed.log" || return 1
+            [[ -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_MAPPING") && -z $(mapping_assert_log_line "$dir/request.failed.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
+            mapping_assert_refs_match "$dir" || return 1
+            mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 1
+            mapping_assert_refs_contain "$dir/refs.actual" "$MPA_UNIQUE_COMMIT" || return 1
+            mapping_assert_head_match "$dir" || return 1
+            [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 1
+            return 0
+            ;;
         *) return 80 ;;
     esac
 }
