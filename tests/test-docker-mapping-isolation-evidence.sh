@@ -130,23 +130,47 @@ isolation_stop_failure_restores_or_blocks() (
         fi
     }
     mapping_receiver_listener_control() {
-        if [[ $2 == STOP ]]; then paused=1; printf '123\n'; return 0; fi
+        if [[ $2 == STOP ]]; then
+            paused=1
+            [[ $mode != stop_output_failure ]] || return 0
+            [[ $mode != stop_error && $mode != stop_unknown && $mode != stop_resume_failure ]] || return 77
+            printf '123\n'
+            return 0
+        fi
         resumes=$((resumes + 1))
+        [[ $mode != cont_failure && $mode != stop_resume_failure ]] || return 77
         paused=0
-        [[ $mode != cont_failure ]] || return 77
+        printf '123\n'
+    }
+    mapping_receiver_listener_pid() {
+        printf 'lookup\n' >> "$root/lookups"
+        [[ $mode != stop_unknown ]] || return 80
         printf '123\n'
     }
     mapping_receiver_listener_running() { [[ $paused == 0 && $mode != running_failure ]]; }
     mapping_receiver_negative_probe() { [[ $mode != negative_failure ]] || return 77; printf 'connection refused\n'; }
     mapping_isolation_check product g1 "$MAPPING_PROFILE" || rc=$?
-    [[ $rc == 80 && $resumes == 1 && $probes == 2 ]] || return 1
+    [[ $rc == 80 && $probes == 2 ]] || return 1
     [[ -f $dir/isolation/cross-network/stop.outcome.tsv ]] || return 1
     [[ ! -e $dir/isolation/host-published ]] || return 1
     case "$mode" in
+        stop_error|stop_unknown|stop_output_failure|stop_resume_failure)
+            [[ $(wc -l < "$root/lookups") == 1 && $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tstop'* ]] || return 1
+            if [[ $mode == stop_unknown || $mode == stop_resume_failure ]]; then
+                [[ $paused == 1 ]] || return 1
+                [[ $mode != stop_unknown || $resumes == 0 ]] || return 1
+                [[ $mode != stop_resume_failure || ( $resumes == 1 && $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'restore_exit\t77'*$'running_exit\t1'* ) ]] || return 1
+                return 0
+            fi
+            [[ $resumes == 1 && $paused == 0 ]] || return 1
+            ;;
         negative_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tnegative-probe'*$'original_exit\t77'* ]] || return 1 ;;
         snapshot_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tsnapshot'*$'original_exit\t77'* ]] || return 1 ;;
         snapshot_copy_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tsnapshot-copy'*$'original_exit\t1'* ]] || return 1 ;;
-        cont_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tnone'*$'restore_exit\t77'* ]] || return 1 ;;
+        cont_failure)
+            [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tnone'*$'restore_exit\t77'*$'running_exit\t1'* && $paused == 1 && $resumes == 1 ]] || return 1
+            return 0
+            ;;
         running_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'running_exit\t1'* ]] || return 1 ;;
     esac
     [[ $paused == 0 ]] || return 1
@@ -157,5 +181,8 @@ isolation_stop_failure_restores_or_blocks() (
 profile_write "$WORK/profile.tsv"
 isolation_produces_and_consumes_five_bound_cases
 for failure in negative_failure snapshot_failure snapshot_copy_failure cont_failure running_failure; do
+    isolation_stop_failure_restores_or_blocks "$failure"
+done
+for failure in stop_error stop_output_failure stop_unknown stop_resume_failure; do
     isolation_stop_failure_restores_or_blocks "$failure"
 done

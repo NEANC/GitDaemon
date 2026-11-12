@@ -480,21 +480,21 @@ mapping_receiver_probe() {
     return 0
 }
 
-mapping_receiver_listener_control() {
-    local key=${1:-} signal=${2:-} expected=${3:-} receiver="gm-$MP_RUN_ID-witness" port process pids
+# 按账本登记容器与监听进程特征获取唯一 PID，拒绝猜测信号目标。
+mapping_receiver_listener_pid() {
+    local key=${1:-} receiver="gm-$MP_RUN_ID-witness" port process pids id ledger
     mapping_witness_key_valid "$key" || return 80
     case "$key" in
         cross-network|host-published) port=19419; process=nc ;;
         host-input) port=19420; process=nc ;;
         dns-udp|dns-tcp) port=53; process=dnsmasq ;;
     esac
-    [[ $signal == STOP || $signal == CONT ]] || return 80
-    [[ $signal != CONT || $expected =~ ^[0-9]+$ ]] || return 80
-    if [[ $signal == CONT ]]; then
-        mapping_fixture_docker exec "$receiver" kill -CONT "$expected" >/dev/null || return 80
-        printf '%s\n' "$expected"
-        return 0
-    fi
+    ledger=$(resource_ledger_dir) || return 80
+    RESOURCE_LEDGER_DIR=$ledger RESOURCE_RUN=$MP_RUN_ID
+    resource_crosscheck "$ledger" || return 80
+    id=$(mapping_fixture_docker inspect -f '{{.Id}}' "$receiver") || return 80
+    [[ $id =~ ^[0-9a-f]{64}$ ]] || return 80
+    resource_verify_object container "$id" mapping witness '' || return 80
     pids=$(mapping_fixture_docker exec "$receiver" sh -c '
         for path in /proc/[0-9]*; do
             IFS= read -r comm < "$path/comm" 2>/dev/null || continue
@@ -507,8 +507,16 @@ mapping_receiver_listener_control() {
             esac
             printf "%s\n" "${path##*/}"
         done
-    ' sh "$process" "$port") || return 80
+    ' sh "$process" "$port" "$key") || return 80
     [[ $pids =~ ^[0-9]+$ ]] || return 80
+    printf '%s\n' "$pids"
+}
+
+mapping_receiver_listener_control() {
+    local key=${1:-} signal=${2:-} expected=${3:-} receiver="gm-$MP_RUN_ID-witness" pids
+    [[ $signal == STOP || $signal == CONT ]] || return 80
+    pids=$(mapping_receiver_listener_pid "$key") || return 80
+    [[ $signal != CONT || $expected == "$pids" ]] || return 80
     mapping_fixture_docker exec "$receiver" kill -"$signal" "$pids" >/dev/null || return 80
     printf '%s\n' "$pids"
 }
@@ -650,6 +658,19 @@ mapping_isolation_resume() {
     return 0
 }
 
+# STOP 结果不确定时仅恢复登记身份可确认的监听，并记录恢复结果。
+mapping_isolation_stop_failure() {
+    local key=$1 dir=$2 original_rc=$3 pid restore_rc=80 running_rc=80
+    pid=$(mapping_receiver_listener_pid "$key") || pid=''
+    if [[ $pid =~ ^[0-9]+$ ]]; then
+        mapping_isolation_resume "$key" "$dir" stop "$original_rc" "$pid"
+        return 80
+    fi
+    printf 'failure_stage\tstop\noriginal_exit\t%s\nrestore_exit\t%s\nrunning_exit\t%s\n' \
+        "$original_rc" "$restore_rc" "$running_rc" > "$dir/stop.outcome.tsv" || return 80
+    return 80
+}
+
 # 隔离判定：五类 DROP 计数均增长、接收端计数零变化；未完成正校准不得通过。
 mapping_isolation_check() {
     local product=${1:-} generation=${2:-} profile=${3:-}
@@ -676,8 +697,13 @@ mapping_isolation_check() {
         wb=$(mapping_witness "$dir/calibration.before.witness") || return 80
         wa=$(mapping_witness "$dir/calibration.after.witness") || return 80
         mapping_witness_growth "$wb" "$wa" "$key" || return 1
-        mapping_receiver_listener_control "$key" STOP > "$dir/listener.pid" || return 80
+        original_rc=0
+        mapping_receiver_listener_control "$key" STOP > "$dir/listener.pid" || original_rc=$?
         pid=$(cat "$dir/listener.pid")
+        if [[ $original_rc != 0 || ! $pid =~ ^[0-9]+$ ]]; then
+            mapping_isolation_stop_failure "$key" "$dir" "${original_rc:-80}"
+            return 80
+        fi
         stage=none original_rc=0
         negative_rc=0
         mapping_receiver_negative_probe "$key" > "$dir/negative.log" || negative_rc=$?
