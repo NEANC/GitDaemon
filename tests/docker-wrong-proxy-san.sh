@@ -88,6 +88,16 @@ mapping_proxy_san_leaf() {
     fi
 }
 
+mapping_proxy_san_pair() {
+    local dir=$1 phase=$2 item file digest
+    for item in cert key; do
+        if [[ $item == cert ]]; then file=srv.crt; else file=srv.key; fi
+        digest=$(mapping_fixture_docker exec "$(mapping_proxy_container)" sha256sum "$MAPPING_ASSET_ROOT/proxy/tls/$file") || return 80
+        [[ $digest =~ ^[0-9a-f]{64}[[:space:]] ]] || return 80
+        printf '%s\n' "${digest%% *}" > "$dir/$item.$phase" || return 80
+    done
+}
+
 # 从产品容器访问接受端口并验证上游健康内容。
 mapping_proxy_san_health() {
     local dir=$1 phase=$2 product=${MAPPING_ASSERT_PRODUCT:-} out
@@ -133,6 +143,7 @@ mapping_proxy_san_case() {
     local dir=$1 kind=$2 scenario=$3 before after recovered rc=0 request=0 mutated=0
     mapping_proxy_san_health "$dir" baseline || return 80
     mapping_proxy_san_leaf "$dir" original || return 80
+    mapping_proxy_san_pair "$dir" original || return 80
     before=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
     mapping_assert_uint "$before" > "$dir/baseline.before" || return 80
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.baseline" || return 80
@@ -145,6 +156,7 @@ mapping_proxy_san_case() {
     if ! mapping_proxy_san_replace "$dir"; then rc=80; fi
     if (( rc == 0 )); then mapping_proxy_san_restart "$dir" || rc=80; fi
     if (( rc == 0 )); then mapping_proxy_san_leaf "$dir" wrong || rc=80; fi
+    if (( rc == 0 )); then mapping_proxy_san_pair "$dir" wrong || rc=80; fi
     if (( rc == 0 )); then
         mapping_proxy_san_hostname_probe "$dir" || { rc=$?; [[ $rc == 80 ]] || rc=1; }
     fi
@@ -180,6 +192,7 @@ mapping_proxy_san_case() {
         mapping_proxy_san_restart "$dir" || restart_rc=80
         (( restore_rc == 0 && restart_rc == 0 )) || return 80
         mapping_proxy_san_leaf "$dir" restored || return 80
+        mapping_proxy_san_pair "$dir" restored || return 80
         cmp -s "$dir/leaf.original" "$dir/leaf.restored" || return 80
         mapping_proxy_san_health "$dir" recovered || return 80
         recovered=$(mapping_tls_product_request "$dir" "$scenario") || return 80
@@ -188,6 +201,8 @@ mapping_proxy_san_case() {
         recovered=$(mapping_proxy_count_read_remote "$MAPPING_PROXY_ACCEPT_PORT") || return 80
         [[ $recovered =~ ^[0-9]+$ && $recovered -gt $before ]] || return 80
         printf '%s\n' "$recovered" > "$dir/proxy.recovered" || return 80
+        mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.recovered" || return 80
+        tail -n "+$(( $(wc -l < "$dir/connect.log") + 1 ))" "$dir/connect.recovered" > "$dir/connect.recovered.new" || return 80
         mapping_proxy_san_recovery_git "$dir" "$kind" "$scenario" || return 80
     fi
     return "$rc"
