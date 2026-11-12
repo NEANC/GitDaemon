@@ -14,6 +14,7 @@ wrong_proxy_ca_uses_product_8443_and_recovers() {
     MAPPING_PROXY_AUTHORITY=github.com:443 MAPPING_UPSTREAM_PORT=443 MP_U=140.82.112.9
     MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_PRODUCT=product-1
     mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_scenario_upstream_count() { printf '0\n'; }
     mapping_proxy_count_read_remote() {
         [[ $1 == 8443 ]] || return 1
         if [[ -f $dir/recovered ]]; then printf '2\n'; elif [[ -f $dir/calls ]]; then printf '1\n'; else printf '0\n'; fi
@@ -219,6 +220,7 @@ wrong_proxy_ca_assertion_failure_still_restores() {
     dir=$(mktemp -d)
     MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
     mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_scenario_upstream_count() { printf '0\n'; }
     mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
     mapping_scenario_connect_evidence() {
         if [[ -f $dir/baseline.exit ]]; then
@@ -241,6 +243,7 @@ wrong_proxy_ca_assertion_and_restore_failure_returns_80() {
     dir=$(mktemp -d)
     MAPPING_PROXY_ACCEPT_PORT=8443 MAPPING_PRODUCT_IMAGE=product
     mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_scenario_upstream_count() { printf '0\n'; }
     mapping_proxy_count_read_remote() { if [[ -f $dir/baseline.exit ]]; then printf '1\n'; else printf '0\n'; fi; }
     mapping_scenario_connect_evidence() {
         if [[ -f $dir/baseline.exit ]]; then
@@ -338,8 +341,44 @@ wrong_proxy_ca_restore_executes_mounted_paths_and_rejects_mismatch() {
     [[ $rc != 0 ]] && ! cmp -s "$source" "$target"
 }
 
+wrong_proxy_ca_samples_real_upstream_boundary() {
+    local dir rc=0 dial=5 mode=stable
+    dir=$(mktemp -d)
+    MAPPING_PRODUCT_IMAGE=product MAPPING_PROXY_ACCEPT_PORT=8443
+    MAPPING_PROXY_AUTHORITY=github.com:443 MAPPING_UPSTREAM_PORT=443
+    mapping_profile_load() { MP_U=140.82.112.9; }
+    mapping_scenario_upstream_count() {
+        printf '%s\n' "$*" >> "$dir/upstream.calls"
+        [[ $mode != unavailable ]] || return 9
+        if [[ $mode == growth && -f $dir/request.failed.log ]]; then printf '6\n'; else printf '%s\n' "$dial"; fi
+    }
+    mapping_proxy_count_read_remote() {
+        if [[ -f $dir/recovered ]]; then printf '2\n'; elif [[ -f $dir/request.baseline.log ]]; then printf '1\n'; else printf '0\n'; fi
+    }
+    mapping_scenario_connect_evidence() {
+        if [[ -f $dir/request.baseline.log ]]; then printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'; fi
+        if [[ -f $dir/recovered ]]; then printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.9:443\n'; fi
+    }
+    mapping_negative_wrong_ca() { : > "$dir/injected"; }
+    mapping_negative_proxy_ca_restore() { : > "$dir/recovered"; dial=9; }
+    mapping_fixture_docker() {
+        if [[ -f $dir/injected && ! -f $dir/recovered ]]; then printf '传输失败：配置的 HTTPS 代理 SSL certificate problem\n'; return 128; fi
+        printf '同步传输路径：配置的 HTTPS 代理\n'
+    }
+    mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 0 && $(cat "$dir/upstream.before") == 5 && $(cat "$dir/upstream.after") == 5 ]] || return 1
+    [[ $(wc -l < "$dir/upstream.calls") == 2 ]] || return 1
+    [[ $(cat "$dir/upstream.calls") == $'fallback mapping-fallback-wrong-proxy-ca '"$dir"$'\nfallback mapping-fallback-wrong-proxy-ca '"$dir" ]] || return 1
+    mode=growth; dial=5; rm -f "$dir/recovered"; rm -rf "$dir"; dir=$(mktemp -d)
+    rc=0; mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 1 && -f $dir/recovered && $(cat "$dir/upstream.before") == 5 && $(cat "$dir/upstream.after") == 6 ]] || return 1
+    mode=unavailable; rm -rf "$dir"; dir=$(mktemp -d)
+    rc=0; mapping_tls_negative_run wrong_proxy_ca "$dir" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 80 && -f $dir/recovered ]]
+}
+
 failed=0
-for name in wrong_proxy_ca_uses_product_8443_and_recovers wrong_proxy_ca_rejects_unrelated_failure wrong_proxy_ca_dispatches_dedicated_path wrong_proxy_ca_rejects_unrelated_connect wrong_proxy_ca_accepts_dedicated_evidence wrong_proxy_ca_restore_uses_both_real_mounts_and_exact_bytes wrong_proxy_ca_restores_after_injected_evidence_failure wrong_proxy_ca_restore_failure_keeps_original_failure wrong_proxy_ca_assertion_failure_still_restores wrong_proxy_ca_assertion_and_restore_failure_returns_80 wrong_proxy_ca_partial_injection_failure_restores_and_preserves_evidence wrong_proxy_ca_partial_injection_failure_keeps_missing_evidence wrong_proxy_ca_restore_executes_mounted_paths_and_rejects_mismatch; do
+for name in wrong_proxy_ca_uses_product_8443_and_recovers wrong_proxy_ca_rejects_unrelated_failure wrong_proxy_ca_dispatches_dedicated_path wrong_proxy_ca_rejects_unrelated_connect wrong_proxy_ca_accepts_dedicated_evidence wrong_proxy_ca_restore_uses_both_real_mounts_and_exact_bytes wrong_proxy_ca_restores_after_injected_evidence_failure wrong_proxy_ca_restore_failure_keeps_original_failure wrong_proxy_ca_assertion_failure_still_restores wrong_proxy_ca_assertion_and_restore_failure_returns_80 wrong_proxy_ca_partial_injection_failure_restores_and_preserves_evidence wrong_proxy_ca_partial_injection_failure_keeps_missing_evidence wrong_proxy_ca_restore_executes_mounted_paths_and_rejects_mismatch wrong_proxy_ca_samples_real_upstream_boundary; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

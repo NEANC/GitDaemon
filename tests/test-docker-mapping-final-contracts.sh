@@ -43,6 +43,7 @@ single_raw_case_is_independently_verified() {
     printf '3\n' > "$evidence/proxy.before"
     printf '3\n' > "$evidence/proxy.after"
     printf '4\n' > "$evidence/proxy.recovered"
+    : > "$evidence/connect.initial"
     : > "$evidence/connect.before"
     cp "$evidence/connect.before" "$evidence/connect.log"
     printf '传输失败：配置的 HTTPS 代理 SSL certificate problem\n' > "$evidence/request.failed.log"

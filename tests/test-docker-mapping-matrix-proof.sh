@@ -36,6 +36,7 @@ matrix_tls_requires_bound_raw_layer() {
     printf '3\n' > "$evidence/proxy.before"
     printf '3\n' > "$evidence/proxy.after"
     printf '4\n' > "$evidence/proxy.recovered"
+    : > "$evidence/connect.initial"
     : > "$evidence/connect.before"
     cp "$evidence/connect.before" "$evidence/connect.log"
     printf '传输失败：配置的 HTTPS 代理 SSL certificate problem\n' > "$evidence/request.failed.log"
@@ -122,8 +123,55 @@ matrix_dns_unimplemented_is_fixture_failure() {
     [[ $rc == 80 ]]
 }
 
+matrix_proxy_ca_accepts_real_dedicated_run() {
+    local test_root evidence rc=0 result name dial=4
+    test_root=$(mktemp -d); evidence=$test_root/raw
+    mkdir -p "$evidence"
+    MAPPING_PRODUCT_IMAGE=product MAPPING_PROXY_ACCEPT_PORT=8443
+    MAPPING_PROXY_AUTHORITY=github.com:443 MAPPING_UPSTREAM_PORT=443
+    MAPPING_PROFILE=$test_root/profile.tsv
+    printf 'schema_version\t1\nrun_id\tmtest\ncidr\t140.82.112.0/24\ngateway\t140.82.112.1\nP\t140.82.112.10\nU\t140.82.112.11\nX\t140.82.112.12\nD\t140.82.112.13\nN\t140.82.112.14\nnetwork_name\tgm-mtest-m-net\nbridge\tmmtest\n' > "$MAPPING_PROFILE"
+    printf 'run_id\trun\nscenario\tscenario\ngeneration\tgeneration\nnetwork_id\tnet\nimage_id\timage\nprofile_sha256\tprofile\ninput_sha256\tinput\nmanifest_sha256\tmanifest\nunique_commit\tcommit\n' > "$evidence/identity.tsv"
+    mapping_scenario_upstream_count() {
+        printf '%s\n' "$*" >> "$test_root/upstream.calls"
+        printf '%s\n' "$dial"
+    }
+    mapping_proxy_count_read_remote() {
+        if [[ -f $evidence/recovered ]]; then printf '3\n'; elif [[ -f $evidence/request.baseline.log ]]; then printf '2\n'; else printf '1\n'; fi
+    }
+    mapping_scenario_connect_evidence() {
+        local calls
+        if [[ -f $test_root/connect.calls ]]; then calls=$(cat "$test_root/connect.calls"); else calls=0; fi
+        calls=$((calls + 1)); printf '%s\n' "$calls" > "$test_root/connect.calls"
+        if (( calls > 1 )); then printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'; fi
+        if (( calls > 4 )); then printf 'authority=github.com:443\tmode=accept\tdial_target=140.82.112.11:443\n'; fi
+        return 0
+    }
+    mapping_negative_wrong_ca() { : > "$evidence/injected"; }
+    mapping_negative_proxy_ca_restore() { : > "$evidence/recovered"; dial=8; }
+    mapping_fixture_docker() {
+        if [[ -f $evidence/injected && ! -f $evidence/recovered ]]; then printf '传输失败：配置的 HTTPS 代理 SSL certificate problem\n'; return 128; fi
+        printf '同步传输路径：配置的 HTTPS 代理\n'
+    }
+    mapping_tls_negative_run wrong_proxy_ca "$evidence" fallback mapping-fallback-wrong-proxy-ca || rc=$?
+    [[ $rc == 0 && $(cat "$evidence/upstream.before") == 4 && $(cat "$evidence/upstream.after") == 4 ]] || return 1
+    [[ $(wc -l < "$test_root/upstream.calls") == 2 ]] || return 1
+    mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || return 1
+    printf '5\n' > "$evidence/upstream.after"
+    result=0; mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || result=$?
+    [[ $result == 1 ]] || return 1
+    printf '4\n' > "$evidence/upstream.after"
+    for name in upstream.before upstream.after; do
+        mv "$evidence/$name" "$evidence/$name.saved"
+        result=0; mapping_negative_case_evidence_accept wrong_proxy_ca run scenario generation manifest input "$evidence" || result=$?
+        [[ $result == 80 ]] || return 1
+        mv "$evidence/$name.saved" "$evidence/$name"
+    done
+    rm -rf "$test_root"
+}
+
 failed=0
-for name in matrix_proof_rejects_claims matrix_tls_requires_bound_raw_layer matrix_dns_unimplemented_is_fixture_failure; do
+for name in matrix_proof_rejects_claims matrix_tls_requires_bound_raw_layer matrix_dns_unimplemented_is_fixture_failure matrix_proxy_ca_accepts_real_dedicated_run; do
     rc=0; ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"
     [[ $rc == 0 ]] || failed=1
