@@ -55,6 +55,7 @@ isolation_produces_and_consumes_five_bound_cases() (
         printf '123\n'
     }
     mapping_receiver_negative_probe() { [[ $paused == 1 ]] || return 80; printf 'connection refused\n'; }
+    mapping_receiver_listener_running() { [[ $paused == 0 ]]; }
     mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
     mapping_receiver_probe() { [[ $paused == 0 ]] || return 1; received=$((received + 1)); }
     mapping_probe_egress() { printf 'connection timed out\n'; }
@@ -110,5 +111,51 @@ isolation_produces_and_consumes_five_bound_cases() (
     return 0
 )
 
+isolation_stop_failure_restores_or_blocks() (
+    local mode=$1 root dir rc=0 paused=0 resumes=0 probes=0
+    root=$WORK/$mode dir=$WORK/$mode/evidence
+    mkdir -p "$root/control" "$dir"
+    IT_CONTROL_DIR=$root/control IT_EVIDENCE_DIR=$dir MAPPING_PROFILE=$WORK/profile.tsv
+    MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_CALIBRATED_GENERATION=g1 MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=net-one
+    mapping_profile_load "$MAPPING_PROFILE"
+    mapping_receiver_probe() { probes=$((probes + 1)); [[ $paused == 0 ]] || return 80; }
+    mapping_receiver_witness_counts() { printf '0\n0\n0\n0\n'; }
+    mapping_control_request() {
+        [[ $mode != snapshot_failure || $paused == 0 ]] || return 77
+        CONTROL_SEQ=$(( ${CONTROL_SEQ:-0} + 1 ))
+        snapshot_write "$root/mapping-snapshot-$CONTROL_SEQ.rules" 10
+        witness_write "$probes" "$root/mapping-snapshot-$CONTROL_SEQ.witness" cross-network
+        if [[ $mode == snapshot_copy_failure && $paused == 1 ]]; then
+            rm "$root/mapping-snapshot-$CONTROL_SEQ.witness"
+        fi
+    }
+    mapping_receiver_listener_control() {
+        if [[ $2 == STOP ]]; then paused=1; printf '123\n'; return 0; fi
+        resumes=$((resumes + 1))
+        paused=0
+        [[ $mode != cont_failure ]] || return 77
+        printf '123\n'
+    }
+    mapping_receiver_listener_running() { [[ $paused == 0 && $mode != running_failure ]]; }
+    mapping_receiver_negative_probe() { [[ $mode != negative_failure ]] || return 77; printf 'connection refused\n'; }
+    mapping_isolation_check product g1 "$MAPPING_PROFILE" || rc=$?
+    [[ $rc == 80 && $resumes == 1 && $probes == 2 ]] || return 1
+    [[ -f $dir/isolation/cross-network/stop.outcome.tsv ]] || return 1
+    [[ ! -e $dir/isolation/host-published ]] || return 1
+    case "$mode" in
+        negative_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tnegative-probe'*$'original_exit\t77'* ]] || return 1 ;;
+        snapshot_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tsnapshot'*$'original_exit\t77'* ]] || return 1 ;;
+        snapshot_copy_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tsnapshot-copy'*$'original_exit\t1'* ]] || return 1 ;;
+        cont_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'failure_stage\tnone'*$'restore_exit\t77'* ]] || return 1 ;;
+        running_failure) [[ $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'running_exit\t1'* ]] || return 1 ;;
+    esac
+    [[ $paused == 0 ]] || return 1
+    [[ $mode == running_failure || $(cat "$dir/isolation/cross-network/stop.outcome.tsv") == *$'running_exit\t0'* ]] || return 1
+    return 0
+)
+
 profile_write "$WORK/profile.tsv"
 isolation_produces_and_consumes_five_bound_cases
+for failure in negative_failure snapshot_failure snapshot_copy_failure cont_failure running_failure; do
+    isolation_stop_failure_restores_or_blocks "$failure"
+done

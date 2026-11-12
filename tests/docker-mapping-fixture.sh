@@ -627,10 +627,33 @@ mapping_probe_egress() {
     return 0
 }
 
+# 核验 CONT 后原监听 PID 仍存在且不处于停止态。
+mapping_receiver_listener_running() {
+    local key=$1 pid=$2 receiver="gm-$MP_RUN_ID-witness"
+    mapping_fixture_docker exec "$receiver" sh -c '
+        kill -0 "$1" 2>/dev/null || exit 1
+        IFS= read -r stat < "/proc/$1/stat" || exit 1
+        state=${stat##*) }
+        state=${state%% *}
+        [ "$state" != T ] && [ "$state" != t ] && [ "$state" != Z ]
+    ' sh "$pid" >/dev/null 2>&1
+}
+
+# 保留原失败阶段及恢复结果；恢复不可靠时拒绝继续下一例。
+mapping_isolation_resume() {
+    local key=$1 dir=$2 stage=$3 original_rc=$4 pid=$5 restore_rc=0 running_rc=0
+    mapping_receiver_listener_control "$key" CONT "$pid" > "$dir/listener.restored.pid" || restore_rc=$?
+    mapping_receiver_listener_running "$key" "$pid" || running_rc=$?
+    printf 'failure_stage\t%s\noriginal_exit\t%s\nrestore_exit\t%s\nrunning_exit\t%s\n' \
+        "$stage" "$original_rc" "$restore_rc" "$running_rc" > "$dir/stop.outcome.tsv" || return 80
+    [[ $restore_rc == 0 && $running_rc == 0 ]] || return 80
+    return 0
+}
+
 # 隔离判定：五类 DROP 计数均增长、接收端计数零变化；未完成正校准不得通过。
 mapping_isolation_check() {
     local product=${1:-} generation=${2:-} profile=${3:-}
-    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name
+    local before after wb wa key cb ca seq_before seq_after base dir negative_rc name stage original_rc pid
     [[ -n $product && -n $generation && -n $profile ]] || return 1
     [[ $MP_WITNESS_CALIBRATED == 1 && ${MAPPING_ASSERT_CALIBRATED_GENERATION:-} == "$generation" ]] || return 1
     [[ $generation == "${MAPPING_ASSERT_GENERATION:-}" ]] || return 1
@@ -654,17 +677,24 @@ mapping_isolation_check() {
         wa=$(mapping_witness "$dir/calibration.after.witness") || return 80
         mapping_witness_growth "$wb" "$wa" "$key" || return 1
         mapping_receiver_listener_control "$key" STOP > "$dir/listener.pid" || return 80
+        pid=$(cat "$dir/listener.pid")
+        stage=none original_rc=0
         negative_rc=0
         mapping_receiver_negative_probe "$key" > "$dir/negative.log" || negative_rc=$?
-        printf '%s\n' "$negative_rc" > "$dir/negative.exit" || return 80
-        if ! mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" ||
-            ! cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/negative.witness"; then
-            mapping_receiver_listener_control "$key" CONT "$(cat "$dir/listener.pid")" >/dev/null || :
-            return 80
+        if ! printf '%s\n' "$negative_rc" > "$dir/negative.exit"; then
+            stage=negative-exit original_rc=80
+        elif [[ $negative_rc != 0 ]]; then
+            stage=negative-probe original_rc=$negative_rc
         fi
-        mapping_receiver_listener_control "$key" CONT "$(cat "$dir/listener.pid")" > "$dir/listener.restored.pid" || return 80
+        if [[ $stage == none ]]; then
+            mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || { original_rc=$?; stage=snapshot; }
+        fi
+        if [[ $stage == none ]]; then
+            cp -- "$base/mapping-snapshot-$CONTROL_SEQ.witness" "$dir/negative.witness" || { original_rc=$?; stage=snapshot-copy; }
+        fi
+        mapping_isolation_resume "$key" "$dir" "$stage" "$original_rc" "$pid" || return 80
+        [[ $stage == none ]] || return 80
         printf 'probe_exit\t%s\n' "$negative_rc" > "$dir/negative.tsv" || return 80
-        [[ $negative_rc == 0 ]] || return 80
         mapping_receiver_probe "$key" || return 80
         mapping_control_request mapping-snapshot "$generation" "$MP_NETWORK_ID" "$MP_PROFILE_SHA256" || return 80
         seq_before=${CONTROL_SEQ:-0}
