@@ -6,6 +6,7 @@ MP_RUN_ID=contract
 CONTRACT_ID=$(printf '%064d' 0)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+IT_CONTROL_DIR=$work
 resource_ledger_dir() { printf '/tmp\n'; }
 resource_crosscheck() { return 0; }
 resource_verify_object() { [[ $1 == container && $2 == "$CONTRACT_ID" && $3 == mapping && $4 == witness ]]; }
@@ -15,7 +16,9 @@ mapping_fixture_docker() {
         'exec gm-contract-witness')
             shift 2
             if [[ $1 == sh ]]; then
-                if [[ $* == *'/proc/[0-9]*'* ]]; then
+                if [[ $* == *'start=$1'* ]]; then
+                    printf '1|111,|222,\n'
+                elif [[ $* == *'/proc/[0-9]*'* ]]; then
                     printf '123\n'
                 else
                     [[ $* != *'/proc/$1/stat'* ]] || [[ $(cat "$work/state") == "${@: -1}" ]]

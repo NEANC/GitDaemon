@@ -516,8 +516,8 @@ mapping_receiver_listener_pid() {
                         socket=$(readlink "$fd" 2>/dev/null) || continue
                         case "$socket" in socket:\[*\])
                             inode=${socket#socket:[}; inode=${inode%]}
-                            case " $udp " in *" $inode "*) found_udp=1 ;; esac
-                            case " $tcp " in *" $inode "*) found_tcp=1 ;; esac
+                            for item in $udp; do [ "$item" != "$inode" ] || found_udp=1; done
+                            for item in $tcp; do [ "$item" != "$inode" ] || found_tcp=1; done
                             ;;
                         esac
                     done
@@ -533,14 +533,60 @@ mapping_receiver_listener_pid() {
 }
 
 mapping_receiver_listener_control() {
-    local key=${1:-} signal=${2:-} expected=${3:-} receiver="gm-$MP_RUN_ID-witness" pids
+    local key=${1:-} signal=${2:-} expected=${3:-} receiver="gm-$MP_RUN_ID-witness" pids identity saved file
     [[ $signal == STOP || $signal == CONT ]] || return 80
     pids=$(mapping_receiver_listener_pid "$key") || return 80
     [[ $signal != CONT || $expected == "$pids" ]] || return 80
+    file=${IT_CONTROL_DIR:-}/listener-$([[ $key == dns-* ]] && printf dns || printf '%s' "$key").identity
+    [[ -n ${IT_CONTROL_DIR:-} && -d $IT_CONTROL_DIR && ! -L $file ]] || return 80
+    identity=$(mapping_receiver_listener_identity "$pids" "$key") || return 80
+    if [[ $signal == CONT ]]; then
+        [[ -f $file ]] || return 80
+        saved=$(cat -- "$file") || return 80
+        [[ $saved == "$identity" ]] || return 80
+    fi
     mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf R || printf T)" || return 80
+    if [[ $signal == STOP ]]; then
+        printf '%s\n' "$identity" > "$file" || return 80
+    fi
     mapping_fixture_docker exec "$receiver" kill -"$signal" "$pids" >/dev/null || return 80
     mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf T || printf R)" || return 80
+    if [[ $signal == CONT ]]; then rm -f -- "$file" || return 80; fi
     printf '%s\n' "$pids"
+}
+
+mapping_receiver_listener_identity() {
+    local pid=$1 key=$2 receiver="gm-$MP_RUN_ID-witness"
+    mapping_fixture_docker exec "$receiver" sh -c '
+        IFS= read -r stat < "/proc/$1/stat" || exit 80
+        pid=$1
+        key=$2
+        set -- ${stat##*) }
+        shift 19
+        start=$1
+        [ -n "$start" ] || exit 80
+        case "$key" in
+            dns-*) port=0035 ;;
+            host-input) port=4BDC ;;
+            *) port=4BDB ;;
+        esac
+        if [ "$port" = 0035 ]; then
+            udp=$(awk '\''$2 ~ /:0035$/ && $4 == "07" {print $10}'\'' /proc/net/udp /proc/net/udp6 2>/dev/null) || exit 80
+        else
+            udp=unused
+        fi
+        tcp=$(awk -v port=":$port" '\''index($2, port) == length($2) - length(port) + 1 && $4 == "0A" {print $10}'\'' /proc/net/tcp /proc/net/tcp6 2>/dev/null) || exit 80
+        found_udp= found_tcp=
+        for fd in "/proc/$pid/fd/"*; do
+            socket=$(readlink "$fd" 2>/dev/null) || continue
+            case "$socket" in socket:\[*\]) inode=${socket#socket:[}; inode=${inode%]} ;; *) continue ;; esac
+            for item in $udp; do [ "$item" != "$inode" ] || found_udp="$found_udp $inode"; done
+            for item in $tcp; do [ "$item" != "$inode" ] || found_tcp="$found_tcp $inode"; done
+        done
+        [ "$port" != 0035 ] || [ -n "$found_udp" ] || exit 80
+        [ -n "$found_tcp" ] || exit 80
+        printf "%s|%s|%s\n" "$start" "$(printf "%s\n" $found_udp | sort -u | tr "\n" ,)" "$(printf "%s\n" $found_tcp | sort -u | tr "\n" ,)"
+    ' sh "$pid" "$key"
 }
 
 mapping_receiver_listener_state() {
