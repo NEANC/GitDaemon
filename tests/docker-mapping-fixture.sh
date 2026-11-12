@@ -619,40 +619,48 @@ mapping_probe_record() {
     local file=$1 generation=$2 network=$3 target=$4 before=$5 status=$6 output=$7
     shift 7
     [[ -n $file ]] || return 0
-    printf 'generation\t%s\nnetwork_id\t%s\ntarget\t%s\nseq_before\t%s\nexit\t%s\nraw_sha256\t%s\n' "$generation" "$network" "$target" "$before" "$status" "$(printf '%s\n' "$output" | sha256sum | cut -d' ' -f1)" > "$file" || return 80
+    if [[ ! -f ${file%/*}/raw.log && -n $output ]]; then
+        printf '%s\n' "$output" > "${file%/*}/raw.log" || return 80
+    fi
+    printf 'generation\t%s\nnetwork_id\t%s\ntarget\t%s\nseq_before\t%s\nexit\t%s\nraw_sha256\t%s\n' "$generation" "$network" "$target" "$before" "$status" "$(sha256sum "${file%/*}/raw.log" | cut -d' ' -f1)" > "$file" || return 80
     printf 'arg\t%s\n' "$@" >> "$file" || return 80
     printf '%s\n' "$status" > "${file%/*}/raw.exit" || return 80
-    printf '%s\n' "$output" > "${file%/*}/raw.log" || return 80
 }
 
 mapping_receiver_negative_probe() {
-    local key=${1:-} dir=${2:-} spec proto port dest output status=0 token before=${CONTROL_SEQ:-0}
+    local key=${1:-} dir=${2:-} spec proto port dest raw status=0 token before=${CONTROL_SEQ:-0}
     local -a argv
     spec=$(mapping_witness_spec "$key") || return 80
     IFS=$'\t' read -r proto port dest <<< "$spec"
     token="$MP_RUN_ID-${MAPPING_ASSERT_GENERATION:-}-${key}"
+    if [[ -n $dir ]]; then
+        mkdir -p "$dir/negative" || return 80
+        raw=$dir/negative/raw.log
+    else
+        raw=$(mktemp) || return 80
+    fi
     case "$key" in
         cross-network|host-published|host-input)
             [[ $key != host-input ]] || port=49383
             argv=(exec "gm-$MP_RUN_ID-witness" sh -c "printf '%s' '$token' | busybox nc -w 2 '$dest' '$port'")
-            output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
+            mapping_fixture_docker "${argv[@]}" > "$raw" 2>&1 || status=$?
             ;;
         dns-udp|dns-tcp)
             [[ $key != dns-udp ]] || proto=+notcp
             [[ $key != dns-tcp ]] || proto=+tcp
             argv=(exec "gm-$MP_RUN_ID-witness" dig +time=1 +tries=1 "$proto" "@$dest" "$token.invalid" A)
-            output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
+            mapping_fixture_docker "${argv[@]}" > "$raw" 2>&1 || status=$?
             ;;
     esac
     if [[ -n $dir ]]; then
-        mkdir -p "$dir/negative" || return 80
-        mapping_probe_record "$dir/negative/command.tsv" "${MAPPING_ASSERT_GENERATION:-}" "$MP_NETWORK_ID" "$key" "$before" "$status" "$output" "${argv[@]}" || return 80
+        mapping_probe_record "$dir/negative/command.tsv" "${MAPPING_ASSERT_GENERATION:-}" "$MP_NETWORK_ID" "$key" "$before" "$status" '' "${argv[@]}" || return 80
     fi
     case "$key" in
-        dns-*) [[ $status == 9 && $output == *'no servers could be reached'* && $output != *'Error response from daemon:'* ]] || return 80 ;;
-        *) [[ $status != 0 && $output != *'Error response from daemon:'* && ( $output == *'refused'* || $output == *'timed out'* ) ]] || return 80 ;;
+        dns-*) [[ $status == 9 ]] && grep -aFq 'no servers could be reached' "$raw" && ! grep -aFq 'Error response from daemon:' "$raw" || { cat "$raw"; [[ -n $dir ]] || rm -f "$raw"; return 80; } ;;
+        *) [[ $status != 0 ]] && ! grep -aFq 'Error response from daemon:' "$raw" && { grep -aFq 'refused' "$raw" || grep -aFq 'timed out' "$raw"; } || { cat "$raw"; [[ -n $dir ]] || rm -f "$raw"; return 80; } ;;
     esac
-    printf '%s\n' "$output"
+    cat "$raw"
+    [[ -n $dir ]] || rm -f "$raw"
 }
 
 # 正校准接收端并覆盖 UDP/TCP：先取接收端基线，逐项探测后要求计数严格增长。
@@ -676,24 +684,29 @@ mapping_calibrate_witness() {
 
 # 从产品 netns 发起五类目标探测；TCP DNS 由登记工具共享 netns 发起。
 mapping_probe_egress() {
-    local product=$1 generation=$2 target=${3:-} dir=${4:-} key spec proto port dest tool facts ledger output status probe_rc remove_rc product_id write_rc
+    local product=$1 generation=$2 target=${3:-} dir=${4:-} key spec proto port dest tool facts ledger raw status probe_rc remove_rc product_id write_rc
     local -a argv
     [[ -n $product && -n $generation ]] || return 80
     for key in $MAPPING_WITNESS_KEYS; do
         [[ -z $target || $target == "$key" ]] || continue
         spec=$(mapping_witness_spec "$key") || return 80
         IFS=$'\t' read -r proto port dest <<< "$spec"
+        if [[ -n $dir ]]; then
+            raw=$dir/probe/raw.log
+        else
+            raw=$(mktemp) || return 80
+        fi
         case "$key" in
             dns-udp)
                 status=0
                 argv=(exec "$product" timeout 4 busybox nslookup "$MP_RUN_ID-$generation.invalid" "$dest")
-                output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
-                printf '%s\n' "$output"
+                mapping_fixture_docker "${argv[@]}" > "$raw" 2>&1 || status=$?
+                cat "$raw"
                 if [[ -n $dir ]]; then
-                    mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" "$output" "${argv[@]}" || return 80
+                    mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" '' "${argv[@]}" || return 80
                 fi
-                if [[ $status == 0 ]]; then return 1; fi
-                [[ $output != *'Error response from daemon:'* && ( $status == 124 || ( $status == 1 && $output == *'connection timed out'* ) ) ]] || return 80
+                if [[ $status == 0 ]]; then [[ -n $dir ]] || rm -f "$raw"; return 1; fi
+                [[ $status == 124 || $status == 1 ]] && ! grep -aFq 'Error response from daemon:' "$raw" && { [[ $status != 1 ]] || grep -aFq 'connection timed out' "$raw"; } || { [[ -n $dir ]] || rm -f "$raw"; return 80; }
                 ;;
             dns-tcp)
                 mapping_fixture_state_load || return 80
@@ -721,15 +734,15 @@ mapping_probe_egress() {
                             printf 'TCP_DNS_SHARED_NETNS_TOOL=%s PRODUCT=%s NOT_PRODUCT_DIRECT_TCP=1\n' "$tool" "$product_id"
                             status=0
                             argv=(exec "$tool" dig +time=1 +tries=1 +tcp "@$dest" "$MP_RUN_ID-$generation.invalid" A)
-                            output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
-                            printf '%s\n' "$output"
+                            mapping_fixture_docker "${argv[@]}" > "$raw" 2>&1 || status=$?
+                            cat "$raw"
                             write_rc=0
                             if [[ -n $dir ]]; then
-                                mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" "$output" "${argv[@]}" || write_rc=80
+                                mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" '' "${argv[@]}" || write_rc=80
                             fi
-                            if [[ $write_rc == 0 && $status == 0 && $output == *"SERVER: $dest#53("* && $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), ]]; then
+                            if [[ $write_rc == 0 && $status == 0 ]] && grep -aFq "SERVER: $dest#53(" "$raw" && grep -aEq 'status: (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP),' "$raw"; then
                                 probe_rc=1
-                            elif [[ $write_rc == 0 && $status == 9 && $output != *'Error response from daemon:'* && ! $output =~ status:\ (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP), && $output == *"communications error to $dest#53: timed out"* && $output == *'no servers could be reached'* ]]; then
+                            elif [[ $write_rc == 0 && $status == 9 ]] && ! grep -aFq 'Error response from daemon:' "$raw" && ! grep -aEq 'status: (NOERROR|NXDOMAIN|SERVFAIL|REFUSED|FORMERR|NOTIMP),' "$raw" && grep -aFq "communications error to $dest#53: timed out" "$raw" && grep -aFq 'no servers could be reached' "$raw"; then
                                 probe_rc=0
                             fi
                         fi
@@ -749,15 +762,16 @@ mapping_probe_egress() {
             *)
                 status=0
                 argv=(exec "$product" curl --noproxy '*' --connect-timeout 2 --max-time 3 "http://$dest:$port/")
-                output=$(mapping_fixture_docker "${argv[@]}" 2>&1) || status=$?
-                printf '%s\n' "$output"
+                mapping_fixture_docker "${argv[@]}" > "$raw" 2>&1 || status=$?
+                cat "$raw"
                 if [[ -n $dir ]]; then
-                    mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" "$output" "${argv[@]}" || return 80
+                    mapping_probe_record "$dir/probe/command.tsv" "$generation" "$MP_NETWORK_ID" "$key" "${CONTROL_SEQ:-0}" "$status" '' "${argv[@]}" || return 80
                 fi
-                if [[ $status == 0 ]]; then return 1; fi
-                [[ $output != *'Error response from daemon:'* && $status == 28 && ( $output == *'Connection timed out'* || $output == *'Operation timed out'* || $output == *'Timeout was reached'* ) ]] || return 80
+                if [[ $status == 0 ]]; then [[ -n $dir ]] || rm -f "$raw"; return 1; fi
+                [[ $status == 28 ]] && ! grep -aFq 'Error response from daemon:' "$raw" && { grep -aFq 'Connection timed out' "$raw" || grep -aFq 'Operation timed out' "$raw" || grep -aFq 'Timeout was reached' "$raw"; } || { [[ -n $dir ]] || rm -f "$raw"; return 80; }
                 ;;
         esac
+        [[ -n $dir ]] || rm -f "$raw"
     done
     return 0
 }
