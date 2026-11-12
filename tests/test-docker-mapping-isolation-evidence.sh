@@ -66,8 +66,24 @@ isolation_produces_and_consumes_five_bound_cases() (
         mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     done
     [[ $count == 25 ]] || return 1
+    for key in before.rules negative.exit; do
+        cp "$dir/isolation/host-input/$key" "$WORK/$key"
+        rm "$dir/isolation/host-input/$key"
+        rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+        [[ $rc == 80 ]] || { printf '%s missing: %s\n' "$key" "$rc" >&2; return 1; }
+        : > "$dir/isolation/host-input/$key"
+        rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+        [[ $rc == 80 ]] || { printf '%s empty: %s\n' "$key" "$rc" >&2; return 1; }
+        printf 'invalid\n' > "$dir/isolation/host-input/$key"
+        rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+        [[ $rc == 80 ]] || { printf '%s invalid: %s\n' "$key" "$rc" >&2; return 1; }
+        cp "$WORK/$key" "$dir/isolation/host-input/$key"
+    done
     key=host-input
     printf 'not a drop rule\n' > "$dir/isolation/$key/after.rules"
+    rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+    [[ $rc == 80 ]] || return 1
+    snapshot_write "$dir/isolation/$key/after.rules" 10
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
     snapshot_write "$dir/isolation/$key/after.rules" 20
@@ -82,7 +98,7 @@ isolation_produces_and_consumes_five_bound_cases() (
     key=host-published
     printf '0 0 RETURN tcp -- * * 0.0.0.0/0 0.0.0.0/0 tcp dpt:19419\n' > "$dir/isolation/$key/after.witness"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
-    [[ $rc == 1 ]] || return 1
+    [[ $rc == 80 ]] || return 1
     key=cross-network
     printf 'wrong\n' > "$dir/isolation/$key/reject.layer"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?

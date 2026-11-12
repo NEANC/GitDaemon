@@ -1593,27 +1593,28 @@ mapping_negative_case_evidence_accept() {
             sub=$dir/isolation/$key
             [[ -d $sub && ! -L $sub ]] || return 80
             for name in binding.tsv calibration.before.witness calibration.after.witness negative.tsv negative.exit negative.log negative.witness listener.pid listener.restored.pid seq.before seq.after before.rules after.rules before.witness after.witness probe.log reject.layer; do
-                [[ -f $sub/$name && ! -L $sub/$name && -r $sub/$name ]] || return 80
+                [[ -f $sub/$name && ! -L $sub/$name && -r $sub/$name && -s $sub/$name ]] || return 80
             done
             mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
             [[ $MP_RUN_ID == "$run" && $MP_PROFILE_SHA256 == "$MPA_PROFILE_SHA256" ]] || return 1
             [[ $(cat "$sub/binding.tsv") == "$(printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s' "$key" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256")" ]] || return 1
             [[ $(cat "$sub/negative.tsv") == $'probe_exit\t0' && $(cat "$sub/reject.layer") == policy && -s $sub/negative.log && -s $sub/probe.log ]] || return 1
-            [[ $(mapping_assert_uint_file "$sub/negative.exit") == 0 ]] || return 1
+            request=$(mapping_assert_uint_file "$sub/negative.exit") || return 80
+            [[ $request == 0 ]] || return 1
             [[ $(cat "$sub/listener.pid") =~ ^[0-9]+$ && $(cat "$sub/listener.pid") == "$(cat "$sub/listener.restored.pid")" ]] || return 1
             seq_before=$(mapping_assert_uint_file "$sub/seq.before") || return 80
             seq_after=$(mapping_assert_uint_file "$sub/seq.after") || return 80
             (( seq_after > seq_before )) || return 1
-            wb=$(mapping_witness "$sub/calibration.before.witness") || return 1
-            wa=$(mapping_witness "$sub/calibration.after.witness") || return 1
+            wb=$(mapping_witness "$sub/calibration.before.witness") || return 80
+            wa=$(mapping_witness "$sub/calibration.after.witness") || return 80
             mapping_witness_growth "$wb" "$wa" "$key" || return 1
-            wb=$(mapping_witness "$sub/negative.witness") || return 1
+            wb=$(mapping_witness "$sub/negative.witness") || return 80
             [[ $wb == "$wa" ]] || return 1
-            wb=$(mapping_witness "$sub/before.witness") || return 1
-            wa=$(mapping_witness "$sub/after.witness") || return 1
+            wb=$(mapping_witness "$sub/before.witness") || return 80
+            wa=$(mapping_witness "$sub/after.witness") || return 80
             [[ $wb == "$wa" ]] || return 1
-            cb=$(mapping_count "$sub/before.rules" "$MAPPING_PROFILE" "$key") || return 1
-            ca=$(mapping_count "$sub/after.rules" "$MAPPING_PROFILE" "$key") || return 1
+            cb=$(mapping_count "$sub/before.rules" "$MAPPING_PROFILE" "$key") || return 80
+            ca=$(mapping_count "$sub/after.rules" "$MAPPING_PROFILE" "$key") || return 80
             (( ca > cb )) || return 1
             return 0
             ;;
