@@ -112,6 +112,21 @@ isolation_produces_and_consumes_five_bound_cases() (
         [[ -s $sub/probe/raw.log && -s $sub/negative/raw.log && -s $sub/probe/raw.exit && -s $sub/negative/raw.exit ]] || return 1
         mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     done
+    for key in $MAPPING_WITNESS_KEYS; do
+        sub=$dir/isolation/$key
+        for name in negative probe; do
+            cp "$sub/$name/raw.log" "$WORK/$key-$name-raw.log"
+            printf '\0' >> "$sub/$name/raw.log"
+            rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+            [[ $rc == 1 ]] || { printf '%s %s NUL: %s\n' "$key" "$name" "$rc" >&2; return 1; }
+            cp "$WORK/$key-$name-raw.log" "$sub/$name/raw.log"
+            printf '\n' >> "$sub/$name/raw.log"
+            rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
+            [[ $rc == 1 ]] || { printf '%s %s newline: %s\n' "$key" "$name" "$rc" >&2; return 1; }
+            cp "$WORK/$key-$name-raw.log" "$sub/$name/raw.log"
+            mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
+        done
+    done
     MAPPING_ASSERT_GENERATION=g2 MAPPING_ASSERT_PRODUCT=$other_id
     mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_PRODUCT=$product_id
@@ -133,11 +148,13 @@ isolation_produces_and_consumes_five_bound_cases() (
     cp "$WORK/udp-command" "$sub/probe/command.tsv"
     sub=$dir/isolation/host-input
     cp "$sub/probe/raw.log" "$WORK/probe-raw"
+    cp "$sub/probe.log" "$WORK/probe-log"
     printf 'Operation timed out\n' > "$sub/probe/raw.log"
     printf 'Operation timed out\n' >> "$sub/probe.log"
     rc=0; mapping_negative_case_evidence_accept isolation/host-input mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
     cp "$WORK/probe-raw" "$sub/probe/raw.log"
+    cp "$WORK/probe-log" "$sub/probe.log"
     local sub=$dir/isolation/host-input
     [[ -s $sub/probe/command.tsv && -s $sub/negative/command.tsv ]] || return 1
     cp "$sub/probe/command.tsv" "$WORK/probe-command.tsv"
