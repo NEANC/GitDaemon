@@ -125,7 +125,7 @@ full_summary_producer_contract() {
     # 断言失败计数非零：判定器必须拒绝。
     FAILURES=1
     integration_full_summary_write "$file" || rc=1
-    if mapping_full_accept "$file"; then printf 'FAIL 非零断言汇总被接受\n'; rc=1; fi
+    if integration_business_accept "$file"; then printf 'FAIL 非零断言汇总被接受\n'; rc=1; fi
     FAILURES=0
     # 槽位缺席（单项 mode 或过滤运行）：判定器必须拒绝。
     IT_SLOT_DONE=() IT_SLOT_FAIL=()
@@ -135,13 +135,13 @@ full_summary_producer_contract() {
     for k in "${slots[@]}"; do integration_slot_pass "$k"; done
     integration_slot_fail tls_negatives
     integration_full_summary_write "$file" || rc=1
-    if mapping_full_accept "$file"; then printf 'FAIL 失败槽位汇总被接受\n'; rc=1; fi
+    if integration_business_accept "$file"; then printf 'FAIL 失败槽位汇总被接受\n'; rc=1; fi
     # 延期计数非零同样拒绝（该计数派生自必需映射分组是否真实执行）。
     IT_SLOT_DONE=() IT_SLOT_FAIL=()
     for k in "${slots[@]}"; do integration_slot_pass "$k"; done
     IT_DEFERRED=1
     integration_full_summary_write "$file" || rc=1
-    if mapping_full_accept "$file"; then printf 'FAIL 延期汇总被接受\n'; rc=1; fi
+    if integration_business_accept "$file"; then printf 'FAIL 延期汇总被接受\n'; rc=1; fi
     IT_DEFERRED=0
     return "$rc"
 }
