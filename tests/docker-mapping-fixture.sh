@@ -502,7 +502,27 @@ mapping_receiver_listener_pid() {
             args=$(tr "\000" " " < "$path/cmdline" 2>/dev/null) || continue
             case "$args" in
                 *"nc -lk -p $2 -e /bin/cat"*) [ "$1" = nc ] || continue ;;
-                dnsmasq\ *|*/dnsmasq\ *) [ "$1" = dnsmasq ] || continue ;;
+                dnsmasq\ *|*/dnsmasq\ *)
+                    [ "$1" = dnsmasq ] || continue
+                    case "$args" in
+                        "dnsmasq --keep-in-foreground --no-resolv --no-hosts --address=/#/ --log-queries --log-facility=- --pid-file= --user=git-daemon "|"/usr/sbin/dnsmasq --keep-in-foreground --no-resolv --no-hosts --address=/#/ --log-queries --log-facility=- --pid-file= --user=git-daemon ") ;;
+                        *) continue ;;
+                    esac
+                    udp=$(awk '\''$2 ~ /:0035$/ && $4 == "07" {print $10}'\'' /proc/net/udp /proc/net/udp6 2>/dev/null) || exit 80
+                    tcp=$(awk '\''$2 ~ /:0035$/ && $4 == "0A" {print $10}'\'' /proc/net/tcp /proc/net/tcp6 2>/dev/null) || exit 80
+                    [ -n "$udp" ] && [ -n "$tcp" ] || exit 80
+                    found_udp=0 found_tcp=0
+                    for fd in "$path"/fd/*; do
+                        socket=$(readlink "$fd" 2>/dev/null) || continue
+                        case "$socket" in socket:\[*\])
+                            inode=${socket#socket:[}; inode=${inode%]}
+                            case " $udp " in *" $inode "*) found_udp=1 ;; esac
+                            case " $tcp " in *" $inode "*) found_tcp=1 ;; esac
+                            ;;
+                        esac
+                    done
+                    [ "$found_udp" = 1 ] && [ "$found_tcp" = 1 ] || continue
+                    ;;
                 *) continue ;;
             esac
             printf "%s\n" "${path##*/}"
@@ -517,8 +537,20 @@ mapping_receiver_listener_control() {
     [[ $signal == STOP || $signal == CONT ]] || return 80
     pids=$(mapping_receiver_listener_pid "$key") || return 80
     [[ $signal != CONT || $expected == "$pids" ]] || return 80
+    mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf R || printf T)" || return 80
     mapping_fixture_docker exec "$receiver" kill -"$signal" "$pids" >/dev/null || return 80
+    mapping_receiver_listener_state "$pids" "$([[ $signal == STOP ]] && printf T || printf R)" || return 80
     printf '%s\n' "$pids"
+}
+
+mapping_receiver_listener_state() {
+    local pid=$1 expected_state=$2 receiver="gm-$MP_RUN_ID-witness"
+    [[ $pid =~ ^[0-9]+$ ]] || return 80
+    mapping_fixture_docker exec "$receiver" sh -c '
+        IFS= read -r stat < "/proc/$1/stat" || exit 80
+        state=${stat##*) }; state=${state%% *}
+        case "$2:$state" in T:T|R:R|R:S|R:D|R:I) exit 0 ;; *) exit 80 ;; esac
+    ' sh "$pid" "$expected_state" >/dev/null 2>&1 || return 80
 }
 
 mapping_receiver_negative_probe() {
