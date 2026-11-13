@@ -1792,6 +1792,7 @@ mapping_negative_case_evidence_accept() {
             [[ $(mapping_assert_uint_file "$dir/head.exit") == 128 ]] || return 1
             [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_MAPPING") && -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
+            [[ -z $(mapping_assert_log_line "$dir/sync.log" '传输失败：直连加动态地址映射') ]] || return 1
             mapping_assert_dns_file "$dir/dns.txt" || return 1
             return 0
             ;;

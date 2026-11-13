@@ -70,6 +70,9 @@ invalid_case() (
     printf '同步传输路径：直连系统 DNS\n' >> "$dir/sync.log"
     check "$category" "$kind" 1 || return 1
     write_evidence "$category" "$kind" "$address"
+    printf '传输失败：直连加动态地址映射\n' >> "$dir/sync.log"
+    check "$category" "$kind" 1 || return 1
+    write_evidence "$category" "$kind" "$address"
     MAPPING_ASSERT_GENERATION="gen-$category-$kind" MP_RUN_ID=run MAPPING_ASSERT_CASE="invalid-map/$category"
     mapping_negative_rejected "$MAPPING_ASSERT_CASE" "$kind" "$dir" || rc=$?
     [[ $rc == 0 && $MAPPING_ASSERT_JUDGE == 1 && $MAPPING_ASSERT_REJECT_LAYER == sync ]]
