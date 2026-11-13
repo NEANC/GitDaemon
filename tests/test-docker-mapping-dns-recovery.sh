@@ -122,7 +122,8 @@ dns_false_green_requires_refs_head_before_dns() {
     printf '传输失败：直连加动态地址映射\n%s\n' "$MAPPING_ASSERT_MARK_SYSTEM" > "$dir/sync.log"
     mkdir -p "$dir/control"
     : > "$dir/control/snapshot.content"
-    printf 'run_id\trun\nscenario\tmapping-fallback\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' > "$dir/identity.tsv"
+    printf 'abc\n' > "$dir/control/unique-commit"
+    printf 'run_id\trun\nscenario\tmapping-fallback-dns-false-green\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' > "$dir/identity.tsv"
     printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"
     printf 'wrong\trefs/heads/main\n' > "$dir/refs.actual"
     printf 'abc\n' > "$dir/head.expected"
@@ -133,6 +134,8 @@ dns_false_green_requires_refs_head_before_dns() {
     printf '1\n' > "$dir/upstream.after"
     : > "$dir/connect.log"
     printf 'github.com\tA\t%s\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t%s\n' "$MP_U" "$MP_X" > "$dir/dns.txt"
+    printf ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 1\ngithub.com. 0 IN A %s\n;; SERVER: %s#53\n' "$MP_U" "$MP_D" > "$dir/dig-github.com-A.txt"
+    printf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 0\n;; SERVER: %s#53\n' "$MP_D" > "$dir/dig-github.com-AAAA.txt"
     mapping_negative_rejected dns-false-green fallback "$dir" || rc=$?
     [[ $rc == 80 ]] || return 1
     printf 'abc\trefs/heads/main\n' > "$dir/refs.actual"
@@ -146,7 +149,7 @@ missing_invalid_and_unreachable_keep_distinct_causes() {
     local dir=$WORK/causes case_name rc
     mkdir -p "$dir"
     mapping_assert_require_files() { return 0; }
-    mapping_assert_identity_load() { MPA_UNIQUE_COMMIT=abc; MPA_SCENARIO=mapping-direct; return 0; }
+    printf 'run_id\trun\nscenario\tmapping-direct\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' > "$dir/identity.tsv"
     printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"
     cp "$dir/refs.expected" "$dir/refs.actual"
     printf 'abc\n' > "$dir/head.expected"
@@ -154,15 +157,22 @@ missing_invalid_and_unreachable_keep_distinct_causes() {
     printf '0\n' > "$dir/sync.exit"
     printf '0\n' > "$dir/fsck.exit"
     printf '传输失败：直连加动态地址映射\n%s\n' "$MAPPING_ASSERT_MARK_SYSTEM" > "$dir/sync.log"
-    printf 'github.com\tA\t%s\n' "$MP_U" > "$dir/dns.txt"
+    printf 'github.com\tA\t%s\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t%s\n' "$MP_U" "$MP_X" > "$dir/dns.txt"
+    printf ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 1\ngithub.com. 0 IN A %s\n;; SERVER: %s#53\n' "$MP_U" "$MP_D" > "$dir/dig-github.com-A.txt"
+    printf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 0\n;; SERVER: %s#53\n' "$MP_D" > "$dir/dig-github.com-AAAA.txt"
+    printf 'accept\t0\nreject\t0\ntotal\t0\n' > "$dir/proxy.before"
+    cp "$dir/proxy.before" "$dir/proxy.after"
     MAPPING_ASSERT_SNAPSHOT_MODE=unallocated MP_N=140.82.112.14
     mkdir -p "$dir/control"
+    printf 'run_id\trun\nscenario\tmapping-direct-unreachable-map-system\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' > "$dir/identity.tsv"
+    printf 'abc\n' > "$dir/control/unique-commit"
     printf '%s github.com\n' "$MP_N" > "$dir/control/snapshot.content"
     rc=0
     mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
     [[ $rc == 80 ]] || return 1
     printf '%s\n' "$MP_N" > "$dir/unreachable.txt"
     printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$dir/unreachable.log"
+    printf '7\n' > "$dir/unreachable.exit"
     rc=0
     mapping_negative_rejected unreachable-map-system direct "$dir" || rc=$?
     [[ $rc == 0 && $MAPPING_ASSERT_REJECT_LAYER == dns ]] || return 1
@@ -189,19 +199,35 @@ missing_invalid_and_unreachable_keep_distinct_causes() {
     done
     printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$dir/unreachable.log"
     printf '1\n' > "$dir/sync.exit"
-    printf 'run_id\trun\nscenario\tmapping-direct\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' > "$dir/identity.tsv"
+    printf 'snapshot\tabsent\nresolve_count\t0\n' > "$dir/validator.tsv"
+    printf '无地址快照，使用系统 DNS\n' > "$dir/validator.log"
+    printf 'HEAD\n' > "$dir/head.actual"
+    : > "$dir/refs.actual"
+    printf '128\n' > "$dir/head.exit"
+    printf '0\n' > "$dir/upstream.before"
+    printf '0\n' > "$dir/upstream.after"
+    : > "$dir/connect.log"
+    printf 'github.com\tA\tNXDOMAIN\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t%s\n' "$MP_X" > "$dir/dns.txt"
     for case_name in missing-map invalid-map; do
+        printf 'run_id\t%s\nscenario\tmapping-direct-%s\ngeneration\t%s\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' "$MP_RUN_ID" "$case_name" "$MAPPING_ASSERT_GENERATION" > "$dir/identity.tsv"
         if [[ $case_name == missing-map ]]; then MAPPING_ASSERT_SNAPSHOT_MODE=none; else MAPPING_ASSERT_SNAPSHOT_MODE=reserved; fi
         if [[ $case_name == missing-map ]]; then
-            printf '无地址快照，使用系统 DNS\n' > "$dir/sync.log"
+            printf '无地址快照，使用系统 DNS\n' > "$dir/validator.log"
+            printf 'snapshot\tabsent\nresolve_count\t0\n' > "$dir/validator.tsv"
             : > "$dir/control/snapshot.content"
         else
-            printf '地址快照无效，忽略动态映射\n' > "$dir/sync.log"
+            printf '地址快照无效，忽略动态映射\n' > "$dir/validator.log"
+            printf 'snapshot\tpresent\nresolve_count\t0\n' > "$dir/validator.tsv"
             printf '%s github.com\n' "$MAPPING_ASSERT_RESERVED_ADDR" > "$dir/control/snapshot.content"
         fi
+        printf '%s\n传输失败：直连系统 DNS\nfatal: unable to access '\''https://%s/%s/%s.git/'\'': Could not resolve host: %s\n' "$(cat "$dir/validator.log")" "$MAPPING_UPSTREAM_HOST" "$MAPPING_UPSTREAM_OWNER" "$MAPPING_UPSTREAM_REPO" "$MAPPING_UPSTREAM_HOST" > "$dir/sync.log"
         rc=0
         mapping_negative_rejected "$case_name" direct "$dir" || rc=$?
-        [[ $rc == 0 && $MAPPING_ASSERT_REJECT_LAYER == sync ]] || return 1
+        if [[ $case_name == missing-map ]]; then
+            [[ $rc == 0 && $MAPPING_ASSERT_REJECT_LAYER == sync ]] || return 1
+        else
+            [[ $rc == 1 && $MAPPING_ASSERT_REJECT_LAYER == mapping ]] || return 1
+        fi
         printf '%s\n' "$MAPPING_ASSERT_MARK_MAPPING" >> "$dir/sync.log"
         rc=0
         mapping_negative_rejected "$case_name" direct "$dir" || rc=$?
@@ -213,16 +239,35 @@ missing_invalid_require_real_judge() {
     local dir=$WORK/false-green case_name rc
     [[ -f $dir/identity.tsv ]] || return 1
     printf '1\n' > "$dir/sync.exit"
-    : > "$dir/control/snapshot.content"
-    printf '无地址快照，使用系统 DNS\n' > "$dir/sync.log"
+    printf 'snapshot\tabsent\nresolve_count\t0\n' > "$dir/validator.tsv"
+    printf '无地址快照，使用系统 DNS\n' > "$dir/validator.log"
+    printf 'HEAD\n' > "$dir/head.actual"
+    : > "$dir/refs.actual"
+    printf '128\n' > "$dir/head.exit"
+    printf '0\n' > "$dir/upstream.before"
+    printf '0\n' > "$dir/upstream.after"
+    : > "$dir/connect.log"
+    printf 'github.com\tA\tNXDOMAIN\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t%s\n' "$MP_X" > "$dir/dns.txt"
     for case_name in missing-map invalid-map; do
+        printf 'run_id\t%s\nscenario\tmapping-fallback-%s\ngeneration\t%s\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' "$MP_RUN_ID" "$case_name" "$MAPPING_ASSERT_GENERATION" > "$dir/identity.tsv"
         if [[ $case_name == invalid-map ]]; then
             printf '%s github.com\n' "$MAPPING_ASSERT_RESERVED_ADDR" > "$dir/control/snapshot.content"
-            printf '地址快照无效，忽略动态映射\n' > "$dir/sync.log"
+            printf '地址快照无效，忽略动态映射\n' > "$dir/validator.log"
+            printf 'snapshot\tpresent\nresolve_count\t0\n' > "$dir/validator.tsv"
+        else
+            : > "$dir/control/snapshot.content"
+            printf '无地址快照，使用系统 DNS\n' > "$dir/validator.log"
+            printf 'snapshot\tabsent\nresolve_count\t0\n' > "$dir/validator.tsv"
         fi
+        printf '传输失败：配置的 HTTPS 代理\n%s\n传输失败：直连系统 DNS\nfatal: unable to access '\''https://%s/%s/%s.git/'\'': Could not resolve host: %s\n' "$(cat "$dir/validator.log")" "$MAPPING_UPSTREAM_HOST" "$MAPPING_UPSTREAM_OWNER" "$MAPPING_UPSTREAM_REPO" "$MAPPING_UPSTREAM_HOST" > "$dir/sync.log"
+        printf 'accept\t0\nreject\t1\ntotal\t1\n' > "$dir/proxy.after"
         MAPPING_ASSERT_JUDGE=0 rc=0
         mapping_negative_rejected "$case_name" fallback "$dir" || rc=$?
-        [[ $rc == 0 && $MAPPING_ASSERT_JUDGE == 1 && $MAPPING_ASSERT_REJECT_LAYER == sync ]] || return 1
+        if [[ $case_name == missing-map ]]; then
+            [[ $rc == 0 && $MAPPING_ASSERT_JUDGE == 1 && $MAPPING_ASSERT_REJECT_LAYER == sync ]] || return 1
+        else
+            [[ $rc == 1 && $MAPPING_ASSERT_JUDGE == 0 && $MAPPING_ASSERT_REJECT_LAYER == mapping ]] || return 1
+        fi
     done
 }
 
@@ -250,6 +295,7 @@ unreachable_probe_rejects_empty_and_unrelated_failure() {
     mapping_fixture_docker() { return 7; }
     mapping_scenario_unreachable_probe product "$dir" || rc=$?
     [[ $rc == 80 ]] || return 1
+    [[ $(cat "$dir/unreachable.exit") == 7 ]] || return 1
     mapping_fixture_docker() { printf 'curl: (7) Failed to connect to unrelated.example:443\n'; return 7; }
     rc=0
     mapping_scenario_unreachable_probe product "$dir" || rc=$?
@@ -257,7 +303,110 @@ unreachable_probe_rejects_empty_and_unrelated_failure() {
     mapping_fixture_docker() { printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N"; return 7; }
     rc=0
     mapping_scenario_unreachable_probe product "$dir" || rc=$?
-    [[ $rc == 0 && -s $dir/unreachable.log ]]
+    [[ $rc == 0 && -s $dir/unreachable.log && $(cat "$dir/unreachable.exit") == 7 ]] || return 1
+    mapping_fixture_docker() { printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N"; return 28; }
+    rc=0
+    mapping_scenario_unreachable_probe product "$dir" || rc=$?
+    [[ $rc == 80 && $(cat "$dir/unreachable.exit") == 28 ]]
+}
+
+dns_negative_four_cases_require_complete_evidence() {
+    local case_name kind dir rc value file
+    for case_name in dns-false-green unreachable-map-system; do
+        for kind in fallback direct; do
+            dir=$WORK/$case_name-$kind
+            mkdir -p "$dir/control"
+            printf 'run_id\trun\nscenario\tmapping-%s-%s\ngeneration\tg1\nnetwork_id\tid\nimage_id\timage\nprofile_sha256\thash\ninput_sha256\thash\nmanifest_sha256\thash\nunique_commit\tabc\n' "$kind" "$case_name" > "$dir/identity.tsv"
+            printf 'abc\trefs/heads/main\n' > "$dir/refs.expected"
+            cp "$dir/refs.expected" "$dir/refs.actual"
+            printf 'abc\n' > "$dir/head.expected"
+            cp "$dir/head.expected" "$dir/head.actual"
+            printf 'abc\n' > "$dir/control/unique-commit"
+            printf '0\n' > "$dir/fsck.exit"
+            printf '0\n' > "$dir/sync.exit"
+            printf '传输失败：直连加动态地址映射\n%s\n' "$MAPPING_ASSERT_MARK_SYSTEM" > "$dir/sync.log"
+            printf 'github.com\tA\t%s\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t%s\n' "$MP_U" "$MP_X" > "$dir/dns.txt"
+            printf ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 1\ngithub.com. 0 IN A %s\n;; SERVER: %s#53\n' "$MP_U" "$MP_D" > "$dir/dig-github.com-A.txt"
+            printf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 0\n;; SERVER: %s#53\n' "$MP_D" > "$dir/dig-github.com-AAAA.txt"
+            printf '0\n' > "$dir/upstream.before"
+            printf '1\n' > "$dir/upstream.after"
+            : > "$dir/connect.log"
+            if [[ $kind == fallback ]]; then
+                printf 'accept\t0\nreject\t0\ntotal\t0\n' > "$dir/proxy.before"
+                printf 'accept\t0\nreject\t1\ntotal\t1\n' > "$dir/proxy.after"
+            else
+                printf 'accept\t0\nreject\t0\ntotal\t0\n' > "$dir/proxy.before"
+                cp "$dir/proxy.before" "$dir/proxy.after"
+            fi
+            if [[ $case_name == unreachable-map-system ]]; then
+                MP_N=140.82.112.14
+                printf '%s github.com\n' "$MP_N" > "$dir/control/snapshot.content"
+                printf '%s\n' "$MP_N" > "$dir/unreachable.txt"
+                printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$dir/unreachable.log"
+                printf '7\n' > "$dir/unreachable.exit"
+            else
+                : > "$dir/control/snapshot.content"
+            fi
+            MAPPING_ASSERT_JUDGE=0 rc=0
+            mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+            [[ $rc == 0 && $MAPPING_ASSERT_JUDGE == 1 && $MAPPING_ASSERT_REJECT_LAYER == dns ]] || return 1
+            printf 'other\n' > "$dir/head.expected"
+            printf 'other\n' > "$dir/head.actual"
+            rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+            [[ $rc == 80 ]] || return 1
+            printf 'abc\n' > "$dir/head.expected"
+            printf 'abc\n' > "$dir/head.actual"
+            if [[ $kind == fallback ]]; then
+                printf 'accept\t1\nreject\t0\ntotal\t1\n' > "$dir/proxy.after"
+                rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+                [[ $rc == 1 ]] || return 1
+                printf 'accept\t0\nreject\t1\ntotal\t1\n' > "$dir/proxy.after"
+            fi
+            for file in control/unique-commit dns.txt; do
+                cp "$dir/$file" "$dir/$file.saved"
+                if [[ $file == dns.txt ]]; then
+                    printf 'github.com\tA\t%s\ngithub.com\tAAAA\tNXDOMAIN\ngm-proxy\tA\t%s\n' "$MP_U" "$MP_X" >> "$dir/$file"
+                else
+                    printf 'other\n' > "$dir/$file"
+                fi
+                rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+                [[ $rc == 80 ]] || return 1
+                cp "$dir/$file.saved" "$dir/$file"
+            done
+            cp "$dir/identity.tsv" "$dir/identity.saved"
+            printf 'run_id\tother\n' > "$dir/identity.tsv"
+            rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+            [[ $rc == 80 ]] || return 1
+            cp "$dir/identity.saved" "$dir/identity.tsv"
+            cp "$dir/dig-github.com-AAAA.txt" "$dir/dig-aaaa.saved"
+            printf ';; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 1\n;; SERVER: %s#53\n' "$MP_D" > "$dir/dig-github.com-AAAA.txt"
+            rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+            [[ $rc == 80 ]] || return 1
+            cp "$dir/dig-aaaa.saved" "$dir/dig-github.com-AAAA.txt"
+            cp "$dir/proxy.after" "$dir/proxy.saved"
+            if [[ $kind == fallback ]]; then cp "$dir/proxy.before" "$dir/proxy.after"; else printf 'accept\t0\nreject\t1\ntotal\t1\n' > "$dir/proxy.after"; fi
+            rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+            [[ $rc == 1 ]] || return 1
+            cp "$dir/proxy.saved" "$dir/proxy.after"
+            if [[ $case_name == unreachable-map-system ]]; then
+                for value in 0 6 9; do
+                    printf '%s\n' "$value" > "$dir/unreachable.exit"
+                    rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+                    [[ $rc == 80 ]] || return 1
+                done
+                printf '28\n' > "$dir/unreachable.exit"
+                rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+                [[ $rc == 80 ]] || return 1
+                printf 'curl: (28) Failed to connect to %s port 443: Connection timed out\n' "$MP_N" > "$dir/unreachable.log"
+                rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+                [[ $rc == 0 ]] || return 1
+                printf '7\n' > "$dir/unreachable.exit"
+            fi
+            printf '1\n' > "$dir/sync.exit"
+            rc=0; mapping_negative_rejected "$case_name" "$kind" "$dir" || rc=$?
+            [[ $rc == 80 ]] || return 1
+        done
+    done
 }
 
 product_dns_has_no_host_search_suffix() {
@@ -279,7 +428,7 @@ product_dns_has_no_host_search_suffix() {
 }
 
 failed=0
-for name in dns_rebuild_and_restore dns_query_rejects_wrong_resolver dns_restart_failure_is_fixture_80 dns_restore_requires_system_resolution_and_product_readiness dns_false_green_requires_refs_head_before_dns missing_invalid_and_unreachable_keep_distinct_causes missing_invalid_require_real_judge reserved_snapshots_never_generate_resolve missing_snapshot_never_generates_resolve unreachable_probe_rejects_empty_and_unrelated_failure product_dns_has_no_host_search_suffix; do
+for name in dns_rebuild_and_restore dns_query_rejects_wrong_resolver dns_restart_failure_is_fixture_80 dns_restore_requires_system_resolution_and_product_readiness dns_false_green_requires_refs_head_before_dns missing_invalid_and_unreachable_keep_distinct_causes missing_invalid_require_real_judge reserved_snapshots_never_generate_resolve missing_snapshot_never_generates_resolve unreachable_probe_rejects_empty_and_unrelated_failure dns_negative_four_cases_require_complete_evidence product_dns_has_no_host_search_suffix; do
     rc=0
     ( "$name" ) || rc=$?
     printf '%s EXIT=%s\n' "$name" "$rc"

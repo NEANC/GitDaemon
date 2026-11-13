@@ -287,6 +287,21 @@ mapping_assert_dns_file() {
     return 0
 }
 
+mapping_assert_system_dns() {
+    local dir=${1:-} name type raw actual expected
+    [[ -f $dir/dns.txt && ! -L $dir/dns.txt ]] || return 80
+    mapping_profile_load "$MAPPING_PROFILE" || return 80
+    expected=$(printf '%s\tA\t%s\n%s\tAAAA\tNXDOMAIN\n%s\tA\t%s' \
+        "$MAPPING_UPSTREAM_HOST" "$MP_U" "$MAPPING_UPSTREAM_HOST" "$MAPPING_PROXY_HOST" "$MP_X")
+    [[ $(cat "$dir/dns.txt") == "$expected" ]] || return 80
+    for type in A AAAA; do
+        raw=$dir/dig-$MAPPING_UPSTREAM_HOST-$type.txt
+        [[ -f $raw && ! -L $raw && -s $raw ]] || return 80
+        actual=$(mapping_dns_query product "$MP_D" "$MAPPING_UPSTREAM_HOST" "$type" "$raw" 0) || return 80
+        [[ $actual == "$(printf '%s\t%s\t%s' "$MAPPING_UPSTREAM_HOST" "$type" "$([[ $type == A ]] && printf %s "$MP_U" || printf NXDOMAIN)")" ]] || return 80
+    done
+}
+
 # 判定器拒绝层次标记：设置层次后由调用点 return 1，确保判定立即中止并记录层次。
 mapping_assert_fail() {
     MAPPING_ASSERT_REJECT_LAYER=${1:-mapping}
@@ -1011,7 +1026,8 @@ mapping_scenario_identity_write() {
 mapping_scenario_input_facts() { stat -c '%u %a' -- "$1" 2>/dev/null; }
 
 mapping_scenario_frozen_input_hash() {
-    local root=${1:-} list=$root/inputs.sha256 anchor=$root/inputs.sha256.digest facts owner mode digest expected file
+    local root=${1:-} list anchor facts owner mode digest expected file
+    list=$root/inputs.sha256 anchor=$root/inputs.sha256.digest
     [[ -f $list && ! -L $list && -f $anchor && ! -L $anchor ]] || return 1
     for file in "$list" "$anchor"; do
         facts=$(mapping_scenario_input_facts "$file") || return 1
@@ -1059,7 +1075,7 @@ mapping_scenario_evidence() {
     mapping_assert_uint "$up_before" > "$dir/upstream.before" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_commit "$kind" "$scenario" "$dir" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
     # identity 绑定 kind 的基础场景，使负例变体仍以同一场景判定，拒绝只能来自注入缺陷本身。
-    if [[ ${MAPPING_ASSERT_CASE:-} == missing-map || ${MAPPING_ASSERT_CASE:-} == invalid-map/* ]]; then
+    if [[ ${MAPPING_ASSERT_CASE:-} == missing-map || ${MAPPING_ASSERT_CASE:-} == invalid-map/* || ${MAPPING_ASSERT_CASE:-} == dns-false-green || ${MAPPING_ASSERT_CASE:-} == unreachable-map-system ]]; then
         mapping_scenario_identity_write "$kind" "$scenario" "$generation" "$dir" || return 80
     else
         mapping_scenario_identity_write "$kind" "$base_scenario" "$generation" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
@@ -1114,17 +1130,19 @@ mapping_scenario_unreachable_probe() {
         --max-time 3 --noproxy '*' --resolve "$MAPPING_UPSTREAM_HOST:443:$MP_N" \
         "https://$MAPPING_UPSTREAM_HOST/health.txt" > "$dir/unreachable.log" 2>&1 || rc=$?
     [[ $rc == 7 || $rc == 28 ]] || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_assert_unreachable_log "$dir/unreachable.log" || return "$MAPPING_ASSERT_FIXTURE"
+    printf '%s\n' "$rc" > "$dir/unreachable.exit" || return "$MAPPING_ASSERT_FIXTURE"
+    mapping_assert_unreachable_log "$dir/unreachable.log" "$rc" || return "$MAPPING_ASSERT_FIXTURE"
     printf '%s\n' "$MP_N" > "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
 }
 
 # 核对直拨日志同时包含目标地址、443 端口及连接失败事实。
 mapping_assert_unreachable_log() {
-    local file=${1:-}
+    local file=${1:-} exit_code=${2:-}
     [[ -f $file && ! -L $file && -s $file ]] || return 1
-    awk -v addr="$MP_N" '
-        /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ {
+    awk -v addr="$MP_N" -v exit_code="$exit_code" '
+        /curl: \((7|28)\)/ && /Failed to connect|Connection (timed out|refused)|connect to .* port 443 failed/ {
+            if (exit_code != "" && index($0, "curl: (" exit_code ")") != 1) next
             port = "to " addr " port 443"
             position = index($0, port)
             if (!position) {
@@ -1195,25 +1213,42 @@ mapping_negative_rejected() {
             mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             mapping_assert_identity_load "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return "$MAPPING_ASSERT_FIXTURE"
+            [[ $MPA_RUN_ID == "$MP_RUN_ID" && $MPA_GENERATION == "$MAPPING_ASSERT_GENERATION" && $MPA_SCENARIO == "mapping-$kind-$case_name" ]] || return 80
+            [[ -f $dir/control/unique-commit && ! -L $dir/control/unique-commit && $(cat "$dir/control/unique-commit") == "$MPA_UNIQUE_COMMIT" ]] || return 80
+            [[ -z ${MAPPING_INPUT_ROOT:-} || $MPA_INPUT_SHA256 == "$(mapping_scenario_frozen_input_hash "$MAPPING_INPUT_ROOT")" ]] || return 80
+            [[ -z ${MAPPING_MANIFEST:-} || $MPA_MANIFEST_SHA256 == "$(mapping_scenario_hash_of "$MAPPING_MANIFEST")" ]] || return 80
             [[ $sync_exit == 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
             system_line=$(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_SYSTEM")
             [[ -n $system_line ]] || return "$MAPPING_ASSERT_FIXTURE"
             mapping_assert_refs_match "$dir" && mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" \
                 && mapping_assert_head_match "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return "$MAPPING_ASSERT_FIXTURE"
-            [[ -f $dir/dns.txt && ! -L $dir/dns.txt ]] || return "$MAPPING_ASSERT_FIXTURE"
+            [[ $(cat "$dir/head.actual") == "$MPA_UNIQUE_COMMIT" ]] || return "$MAPPING_ASSERT_FIXTURE"
             mapping_profile_load "$MAPPING_PROFILE" || return "$MAPPING_ASSERT_FIXTURE"
-            grep -Fqx "$(printf '%s\tA\t%s' "$MAPPING_UPSTREAM_HOST" "$MP_U")" "$dir/dns.txt" \
-                || return "$MAPPING_ASSERT_FIXTURE"
+            mapping_assert_system_dns "$dir" || return 80
             [[ -n $(mapping_assert_log_line "$dir/sync.log" '传输失败：直连加动态地址映射') ]] || return 1
             if [[ $case_name == unreachable-map-system ]]; then
-                snapshot=$(sed -n '1p' "$dir/control/snapshot.content" 2>/dev/null) || return "$MAPPING_ASSERT_FIXTURE"
+                [[ -f $dir/control/snapshot.content && ! -L $dir/control/snapshot.content ]] || return 80
+                snapshot=$(cat "$dir/control/snapshot.content") || return 80
                 [[ $snapshot == "$MP_N $MAPPING_UPSTREAM_HOST" ]] || return "$MAPPING_ASSERT_FIXTURE"
                 [[ -f $dir/unreachable.txt && ! -L $dir/unreachable.txt ]] || return "$MAPPING_ASSERT_FIXTURE"
                 grep -Fqx "$MP_N" "$dir/unreachable.txt" || return "$MAPPING_ASSERT_FIXTURE"
-                mapping_assert_unreachable_log "$dir/unreachable.log" || return "$MAPPING_ASSERT_FIXTURE"
+                local dial_exit
+                dial_exit=$(mapping_assert_uint_file "$dir/unreachable.exit") || return 80
+                [[ $dial_exit == 7 || $dial_exit == 28 ]] || return 80
+                mapping_assert_unreachable_log "$dir/unreachable.log" "$dial_exit" || return "$MAPPING_ASSERT_FIXTURE"
             else
-                [[ -f $dir/control/snapshot.content && ! -s $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
+                [[ -f $dir/control/snapshot.content && ! -L $dir/control/snapshot.content && ! -s $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
+            fi
+            local before after rejects_before rejects_after
+            before=$(mapping_proxy_baseline_total "$dir/proxy.before") || return 80
+            after=$(mapping_proxy_baseline_total "$dir/proxy.after") || return 80
+            if [[ $kind == fallback ]]; then
+                rejects_before=$(awk -F '\t' '$1 == "reject" {print $2}' "$dir/proxy.before")
+                rejects_after=$(awk -F '\t' '$1 == "reject" {print $2}' "$dir/proxy.after")
+                (( rejects_after > rejects_before )) || return 1
+            else
+                (( after == before )) || return 1
             fi
             judge=0
             mapping_assert_result "$kind" "$dir" || judge=$?

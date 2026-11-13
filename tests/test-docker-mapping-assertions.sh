@@ -239,6 +239,10 @@ sa_doubles() {
         printf '%s\tA\t%s\n' "$MAPPING_UPSTREAM_HOST" "$fake"
         printf '%s\tAAAA\tNXDOMAIN\n' "$MAPPING_UPSTREAM_HOST"
         printf '%s\tA\t%s\n' "$MAPPING_PROXY_HOST" "$proxy"
+        if [[ ${MAPPING_ASSERT_CASE:-} == dns-false-green || ${MAPPING_ASSERT_CASE:-} == unreachable-map-system ]]; then
+            printf ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 1\ngithub.com. 0 IN A %s\n;; SERVER: %s#53\n' "$MP_U" "$MP_D" > "$3/dig-$MAPPING_UPSTREAM_HOST-A.txt"
+            printf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n;; flags: qr aa; QUERY: 1, ANSWER: 0\n;; SERVER: %s#53\n' "$MP_D" > "$3/dig-$MAPPING_UPSTREAM_HOST-AAAA.txt"
+        fi
     }
     mapping_dns_set() { return 0; }
     mapping_fixture_docker() {
@@ -258,6 +262,11 @@ sa_doubles() {
             return 7
         fi
         return 80
+    }
+    mapping_scenario_unreachable_probe() {
+        printf 'curl: (7) Failed to connect to %s port 443: Connection refused\n' "$MP_N" > "$2/unreachable.log"
+        printf '7\n' > "$2/unreachable.exit"
+        printf '%s\n' "$MP_N" > "$2/unreachable.txt"
     }
     if [[ $keep_release != 1 ]]; then
         mapping_scenario_release() { return 0; }
