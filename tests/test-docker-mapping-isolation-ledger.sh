@@ -16,7 +16,8 @@ write_inspect() {
 
 write_ledger() {
     local hash
-    hash=$(sha256sum "$INSPECT"); hash=${hash%% *}
+    hash=$(cat "$INSPECT")
+    hash=$(printf '%s' "$hash" | sha256sum); hash=${hash%% *}
     printf '1\tregister\tnetwork\tnet-one\tmtest\tmapping\tnetwork\thash\tnet-one\t%s\n2\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\t%s\t%s\t%s\t%s\n3\tremoved\tnetwork\tnet-one\tmtest\tmapping\tnetwork\thash\tnet-one\t\n4\tremoved\tcontainer\t%s\tmtest\tmapping-fallback-isolation\t%s\t%s\t%s\t\n' "$LEDGER/objects/1-network.json" "$1" "$2" "$hash" "$1" "$INSPECT" "$1" "$2" "$hash" "$1" > "$LEDGER/ledger.tsv"
 }
 

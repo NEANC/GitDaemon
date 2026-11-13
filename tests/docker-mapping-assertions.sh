@@ -1662,7 +1662,8 @@ mapping_isolation_product_registration_accept() {
                 inspect_id=$(jq -r 'if type == "array" and length == 1 then .[0].Id // empty else empty end' "$path") || return 80
                 inspect_name=$(jq -r '.[0].Name // empty' "$path") || return 80
                 [[ $inspect_id == "$product_id" && $inspect_name == "/gm-$run-$generation-product" ]] || return 1
-                actual_hash=$(sha256sum "$path") || return 80
+                actual_hash=$(cat "$path") || return 80
+                actual_hash=$(printf '%s' "$actual_hash" | sha256sum) || return 80
                 [[ $hash =~ ^[0-9a-f]{64}$ && $hash == "${actual_hash%% *}" && $digest == "$product_id" ]] || return 1
                 jq -e --arg run "$run" --arg scenario "$scenario" \
                     '.[0].Config.Labels["gitdaemon.run"] == $run and .[0].Config.Labels["gitdaemon.scenario"] == $scenario and .[0].Config.Labels["gitdaemon.role"] == "product"' \
