@@ -202,13 +202,30 @@ sa_doubles() {
         printf '%s\n' "${D_SYNC_EXIT:-0}" > "$3/sync.exit"
         return 0
     }
+    mapping_scenario_missing_map_validator() {
+        local dir=$2 snapshot=$2/control/snapshot.content
+        [[ ! -s $snapshot ]] || return 80
+        GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+        GITHUB_HOST=github.com
+        load_resolve_args "$dir/no-snapshot" > "$dir/validator.log" || return 80
+        printf 'snapshot\tabsent\nresolve_count\t%s\n' "${#GM_RESOLVE_ARGS[@]}" > "$dir/validator.tsv"
+    }
     mapping_scenario_proxy_after() {
         local accept=${D_ACCEPT_AFTER:-0} reject=${D_REJECT_AFTER:-0}
         printf 'accept\t%s\nreject\t%s\ntotal\t%s\n' "$accept" "$reject" "$((accept + reject))"
     }
     mapping_scenario_connect_evidence() { printf '%s' "${D_CONNECT:-}"; }
-    mapping_scenario_local_refs() { printf '%s\n' "${D_REFS_ACTUAL:-}"; }
-    mapping_scenario_local_head() { printf '%s\n' "${D_HEAD_ACTUAL:-}"; }
+    mapping_scenario_local_refs() {
+        [[ ${MAPPING_ASSERT_CASE:-} != missing-map ]] || return 0
+        printf '%s\n' "${D_REFS_ACTUAL:-}"
+    }
+    mapping_scenario_local_head() {
+        if [[ ${MAPPING_ASSERT_CASE:-} == missing-map ]]; then
+            printf 'HEAD\n'
+            return 128
+        fi
+        printf '%s\n' "${D_HEAD_ACTUAL:-}"
+    }
     mapping_scenario_local_fsck() { printf '%s\n' "${D_FSCK:-0}"; }
     # 受控 DNS 状态替身：按假绿开关推导，模拟「开关生效 → github.com 指向可信 U；开关复位 → NXDOMAIN」，
     # 使假绿负例自包含，并让「恢复 NXDOMAIN」可被真实断言。
@@ -565,7 +582,14 @@ sa_negative_overrides() {
     case "$1" in
         missing-map)
             D_SYNC_EXIT=1
-            D_LOG=$'无地址快照，使用系统 DNS\n传输失败：直连系统 DNS；尝试下一路径\n同步失败：全部传输路径均不可用：gitdaemon/fixture\n'
+            D_FSCK=0
+            D_UP_AFTER=$D_UP_BEFORE
+            D_CONNECT=''
+            D_LOG=$'无地址快照，使用系统 DNS\n传输失败：直连系统 DNS；尝试下一路径\nfatal: unable to access '\''https://github.com/gitdaemon/fixture.git/'\'': Could not resolve host: github.com'
+            D_LOG+=$'\n'
+            if (( D_REJECT_AFTER > D_REJECT_BEFORE )); then
+                D_LOG=$'传输失败：配置的 HTTPS 代理；尝试下一路径\n'"$D_LOG"
+            fi
             ;;
         invalid-map)
             D_SYNC_EXIT=1

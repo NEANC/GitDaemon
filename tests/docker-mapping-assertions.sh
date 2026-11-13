@@ -525,6 +525,25 @@ mapping_scenario_sync_exec() {
 }
 
 # 代理增量读取：两端口各自独立计数文件求和，输出与基线同格式，缺失或损坏一律非零。
+mapping_scenario_missing_map_validator() {
+    local product=${1:-} dir=${2:-}
+    [[ -n $product && -d $dir ]] || return 80
+    mapping_fixture_docker exec -e "RUN_ROOT=$MAPPING_ASSERT_RUN_ROOT" "$product" /bin/bash -c '
+        source /usr/local/lib/git-mirror/git-mirror-sync.sh
+        GM_CONFIG[ENABLE_HOSTS_UPDATE]=yes
+        GITHUB_HOST=github.com
+        LOG_FILE=/dev/null
+        snapshot=$RUN_ROOT/hosts/github-hosts.snapshot
+        if [[ -e $snapshot ]]; then
+            printf "snapshot\tpresent\nresolve_count\t0\n"
+            exit 0
+        fi
+        load_resolve_args "$snapshot" >&2 && build_transport_sequence || exit 1
+        printf "snapshot\tabsent\nresolve_count\t%s\n" "${#GM_RESOLVE_ARGS[@]}"
+    ' > "$dir/validator.tsv" 2> "$dir/validator.log" || return 80
+    return 0
+}
+
 mapping_scenario_proxy_after() {
     local kind=${1:-} scenario=${2:-} dir=${3:-} accept reject
     [[ -n $kind && -n $scenario && -n $dir ]] || return 1
@@ -1004,7 +1023,7 @@ mapping_scenario_hash_of() {
 # 场景证据取证：准备 → 校准 → 取基线 → 独有提交 → 同步 → 汇总证据。
 mapping_scenario_evidence() {
     local kind=${1:-} scenario=${2:-} generation=${3:-} dir=${4:-}
-    local product up_before base_scenario
+    local product up_before base_scenario head_rc
     mapping_assert_kind_valid "$kind" || return "$MAPPING_ASSERT_FIXTURE"
     [[ -n $scenario && -n $generation && -n $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     base_scenario=$(mapping_assert_scenario "$kind") || return "$MAPPING_ASSERT_FIXTURE"
@@ -1025,7 +1044,11 @@ mapping_scenario_evidence() {
     mapping_assert_uint "$up_before" > "$dir/upstream.before" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_commit "$kind" "$scenario" "$dir" >/dev/null || return "$MAPPING_ASSERT_FIXTURE"
     # identity 绑定 kind 的基础场景，使负例变体仍以同一场景判定，拒绝只能来自注入缺陷本身。
-    mapping_scenario_identity_write "$kind" "$base_scenario" "$generation" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == missing-map ]]; then
+        mapping_scenario_identity_write "$kind" "$scenario" "$generation" "$dir" || return 80
+    else
+        mapping_scenario_identity_write "$kind" "$base_scenario" "$generation" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
+    fi
     mapping_scenario_upstream_refs "$kind" "$scenario" "$dir" > "$dir/refs.expected" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_upstream_head "$kind" "$scenario" "$dir" > "$dir/head.expected" || return "$MAPPING_ASSERT_FIXTURE"
     if [[ ${MAPPING_ASSERT_CASE:-} == wrong_upstream_san ]]; then
@@ -1036,10 +1059,13 @@ mapping_scenario_evidence() {
         mapping_tls_negative_run "$MAPPING_ASSERT_CASE" "$dir" "$kind" "$scenario" || return $?
         return 0
     fi
-    mapping_scenario_apply_negative "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
     if [[ ${MAPPING_ASSERT_CASE:-} == wrong_proxy_san ]]; then
         mapping_proxy_san_case "$dir" "$kind" "$scenario" || return $?
         return 0
+    fi
+    mapping_scenario_apply_negative "$kind" "$scenario" "$dir" "$product" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == missing-map ]]; then
+        mapping_scenario_missing_map_validator "$product" "$dir" || return 80
     fi
     mapping_scenario_sync_exec "$kind" "$scenario" "$dir" || return "$MAPPING_ASSERT_FIXTURE"
     if [[ ${MAPPING_ASSERT_CASE:-} == unreachable-map-system ]]; then
@@ -1054,7 +1080,13 @@ mapping_scenario_evidence() {
     mapping_scenario_upstream_count "$kind" "$scenario" "$dir" > "$dir/upstream.after" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_connect_evidence "$kind" "$scenario" "$dir" > "$dir/connect.log" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_local_refs "$kind" "$scenario" "$dir" > "$dir/refs.actual" || return "$MAPPING_ASSERT_FIXTURE"
-    mapping_scenario_local_head "$kind" "$scenario" "$dir" > "$dir/head.actual" || return "$MAPPING_ASSERT_FIXTURE"
+    if [[ ${MAPPING_ASSERT_CASE:-} == missing-map ]]; then
+        head_rc=0
+        mapping_scenario_local_head "$kind" "$scenario" "$dir" > "$dir/head.actual" 2> "$dir/head.stderr" || head_rc=$?
+        printf '%s\n' "$head_rc" > "$dir/head.exit"
+    else
+        mapping_scenario_local_head "$kind" "$scenario" "$dir" > "$dir/head.actual" || return "$MAPPING_ASSERT_FIXTURE"
+    fi
     mapping_scenario_local_fsck "$kind" "$scenario" "$dir" > "$dir/fsck.exit" || return "$MAPPING_ASSERT_FIXTURE"
     mapping_scenario_dns_state "$kind" "$scenario" "$dir" > "$dir/dns.txt" || return "$MAPPING_ASSERT_FIXTURE"
     return 0
@@ -1129,6 +1161,14 @@ mapping_negative_rejected() {
     local case_name=${1:-} kind=${2:-} dir=${3:-} sync_exit system_line snapshot judge
     [[ -n $dir && -d $dir ]] || return "$MAPPING_ASSERT_FIXTURE"
     case "$case_name" in
+        missing-map)
+            mapping_assert_identity_load "$dir" || return 80
+            [[ $MPA_GENERATION == "$MAPPING_ASSERT_GENERATION" && $MPA_RUN_ID == "$MP_RUN_ID" ]] || return 80
+            mapping_negative_case_evidence_accept "missing-map/$kind" "$MPA_RUN_ID" "$(mapping_assert_scenario "$kind")-missing-map" "$MPA_GENERATION" "$MPA_MANIFEST_SHA256" "$MPA_INPUT_SHA256" "$dir" || return $?
+            [[ $(cat "$dir/control/unique-commit" 2>/dev/null) == "$MPA_UNIQUE_COMMIT" ]] || return 80
+            MAPPING_ASSERT_JUDGE=1 MAPPING_ASSERT_REJECT_LAYER=sync
+            return 0
+            ;;
         isolation)
             MAPPING_ASSERT_REJECT_LAYER=''
             [[ -f $dir/isolation.tsv && ! -L $dir/isolation.tsv ]] || return "$MAPPING_ASSERT_FIXTURE"
@@ -1167,23 +1207,15 @@ mapping_negative_rejected() {
             MAPPING_ASSERT_REJECT_LAYER=dns
             return 0
             ;;
-        missing-map|invalid-map)
+        invalid-map)
             mapping_assert_require_files "$dir" || return "$MAPPING_ASSERT_FIXTURE"
             sync_exit=$(mapping_assert_uint_file "$dir/sync.exit") || return "$MAPPING_ASSERT_FIXTURE"
             (( sync_exit != 0 )) || return 1
             [[ -f $dir/control/snapshot.content && ! -L $dir/control/snapshot.content ]] || return "$MAPPING_ASSERT_FIXTURE"
             snapshot=$(sed -n '1p' "$dir/control/snapshot.content") || return "$MAPPING_ASSERT_FIXTURE"
-            if [[ $case_name == missing-map ]]; then
-                [[ -z $snapshot ]] || return 1
-            else
-                [[ $snapshot == "$MAPPING_ASSERT_RESERVED_ADDR $MAPPING_UPSTREAM_HOST" ]] || return 1
-            fi
+            [[ $snapshot == "$MAPPING_ASSERT_RESERVED_ADDR $MAPPING_UPSTREAM_HOST" ]] || return 1
             [[ -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_MAPPING") ]] || return 1
-            if [[ $case_name == invalid-map ]]; then
-                grep -Fq '地址快照无效，忽略动态映射' "$dir/sync.log" || return 1
-            else
-                grep -Fq '无地址快照，使用系统 DNS' "$dir/sync.log" || return 1
-            fi
+            grep -Fq '地址快照无效，忽略动态映射' "$dir/sync.log" || return 1
             judge=0
             mapping_assert_result "$kind" "$dir" || judge=$?
             [[ $judge == 1 && $MAPPING_ASSERT_REJECT_LAYER == sync ]] || return 1
@@ -1680,12 +1712,57 @@ mapping_isolation_product_registration_accept() {
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
-    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name dial_baseline_before dial_baseline dial_recovered ca_before ca_after ca_recovered key sub wb wa cb ca seq_before seq_after spec proto port dest negative_raw probe_raw stopped restored product_id
+    local request baseline recovery baseline_before baseline_after before after recovered upstream_before upstream_after name kind dial_baseline_before dial_baseline dial_recovered ca_before ca_after ca_recovered key sub wb wa cb ca seq_before seq_after spec proto port dest negative_raw probe_raw stopped restored product_id
     [[ -d $dir && ! -L $dir ]] || return 80
     mapping_assert_identity_load "$dir" || return 80
     [[ $MPA_RUN_ID == "$run" && $MPA_SCENARIO == "$scenario" && $MPA_GENERATION == "$generation" \
         && $MPA_MANIFEST_SHA256 == "$manifest" && $MPA_INPUT_SHA256 == "$input" ]] || return 80
     case $case_id in
+        missing-map/fallback|missing-map/direct)
+            kind=${case_id#missing-map/}
+            [[ $scenario == "mapping-$kind-missing-map" ]] || return 80
+            for name in validator.tsv validator.log sync.log sync.exit dns.txt proxy.before proxy.after upstream.before upstream.after; do
+                [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name && -s $dir/$name ]] || return 80
+            done
+            [[ -f $dir/control/snapshot.content && ! -L $dir/control/snapshot.content && -r $dir/control/snapshot.content ]] || return 80
+            [[ $(cat "$dir/validator.tsv") =~ ^snapshot$'\t'(absent|present)$'\n'resolve_count$'\t'[0-9]+$ ]] || return 80
+            [[ ! -s $dir/control/snapshot.content && $(cat "$dir/validator.tsv") == $'snapshot\tabsent\nresolve_count\t0' ]] || return 1
+            grep -Fq '无地址快照，使用系统 DNS' "$dir/validator.log" || return 1
+            mapping_profile_load "${MAPPING_PROFILE:-}" || return 80
+            request=$(mapping_assert_uint_file "$dir/sync.exit") || return 80
+            (( request > 0 )) || return 1
+            before=$(mapping_proxy_baseline_total "$dir/proxy.before") || return 80
+            after=$(mapping_proxy_baseline_total "$dir/proxy.after") || return 80
+            upstream_before=$(mapping_assert_uint_file "$dir/upstream.before") || return 80
+            upstream_after=$(mapping_assert_uint_file "$dir/upstream.after") || return 80
+            [[ -f $dir/connect.log && ! -L $dir/connect.log && -r $dir/connect.log ]] || return 80
+            (( upstream_after == upstream_before )) && [[ ! -s $dir/connect.log ]] || return 1
+            if [[ $kind == direct ]]; then
+                (( after == before )) || return 1
+                [[ -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_PROXY_FAIL") ]] || return 1
+            else
+                (( after > before )) || return 1
+                [[ -n $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_PROXY_FAIL") ]] || return 1
+            fi
+            grep -Fq '无地址快照，使用系统 DNS' "$dir/sync.log" || return 1
+            grep -Fq '传输失败：直连系统 DNS' "$dir/sync.log" || return 1
+            [[ $(awk -v url="https://$MAPPING_UPSTREAM_HOST/$MAPPING_UPSTREAM_OWNER/$MAPPING_UPSTREAM_REPO.git/" '
+                /^fatal: / {
+                    fatal++
+                    if ($0 == "fatal: unable to access '\''" url "'\'': Could not resolve host: github.com") matched++
+                }
+                END {print fatal == 1 && matched == 1 ? 1 : 0}
+            ' "$dir/sync.log") == 1 ]] || return 1
+            for name in refs.actual head.actual head.exit fsck.exit; do
+                [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name ]] || return 80
+            done
+            [[ ! -s $dir/refs.actual && $(cat "$dir/head.actual") == HEAD ]] || return 1
+            [[ $(mapping_assert_uint_file "$dir/head.exit") == 128 ]] || return 1
+            [[ $(mapping_assert_uint_file "$dir/fsck.exit") == 0 ]] || return 1
+            [[ -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_MAPPING") && -z $(mapping_assert_log_line "$dir/sync.log" "$MAPPING_ASSERT_MARK_SYSTEM") ]] || return 1
+            mapping_assert_dns_file "$dir/dns.txt" || return 1
+            return 0
+            ;;
         isolation/*)
             key=${case_id#isolation/}
             mapping_witness_key_valid "$key" || return 80
