@@ -154,6 +154,28 @@ missing_map_evidence() {
     printf 'commit\n' > "$dir/head.actual"
     check "$kind" 1 || return 1
     write_evidence "$kind"
+    mv "$dir/refs.expected" "$dir/refs.expected.saved"
+    check "$kind" 80 || return 1
+    mv "$dir/refs.expected.saved" "$dir/refs.expected"
+    mv "$dir/head.expected" "$dir/head.expected.saved"
+    check "$kind" 80 || return 1
+    mv "$dir/head.expected.saved" "$dir/head.expected"
+    : > "$dir/refs.expected"
+    check "$kind" 1 || return 1
+    write_evidence "$kind"
+    : > "$dir/head.expected"
+    check "$kind" 1 || return 1
+    write_evidence "$kind"
+    printf 'old refs/heads/main\n' > "$dir/refs.expected"
+    check "$kind" 1 || return 1
+    write_evidence "$kind"
+    printf 'old\n' > "$dir/head.expected"
+    check "$kind" 1 || return 1
+    write_evidence "$kind"
+    printf 'commit refs/heads/main\n' > "$dir/refs.expected"
+    printf 'commit\n' > "$dir/head.expected"
+    check "$kind" 0 || return 1
+    write_evidence "$kind"
     rc=0
     mapping_negative_case_evidence_accept "missing-map/$kind" run "mapping-$kind-missing-map" "gen-other" manifest input "$dir" || rc=$?
     [[ $rc == 80 ]] || return 1

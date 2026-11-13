@@ -1721,6 +1721,11 @@ mapping_negative_case_evidence_accept() {
         missing-map/fallback|missing-map/direct)
             kind=${case_id#missing-map/}
             [[ $scenario == "mapping-$kind-missing-map" ]] || return 80
+            for name in refs.expected head.expected; do
+                [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name ]] || return 80
+            done
+            mapping_assert_refs_contain "$dir/refs.expected" "$MPA_UNIQUE_COMMIT" || return 1
+            [[ $(cat "$dir/head.expected") == "$MPA_UNIQUE_COMMIT" ]] || return 1
             for name in validator.tsv validator.log sync.log sync.exit dns.txt proxy.before proxy.after upstream.before upstream.after; do
                 [[ -f $dir/$name && ! -L $dir/$name && -r $dir/$name && -s $dir/$name ]] || return 80
             done
