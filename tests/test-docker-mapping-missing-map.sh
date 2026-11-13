@@ -60,8 +60,8 @@ validator_exec_uses_original_code() (
     local kind=$1 dir=$WORK/validator-$1 script rc=0
     mkdir -p "$dir"
     mapping_fixture_docker() {
-        [[ $1 == exec && $2 == -e && $3 == "RUN_ROOT=$MAPPING_ASSERT_RUN_ROOT" && $4 == product && $5 == /bin/bash && $6 == -c ]] || return 1
-        script=${7//\/usr\/local\/lib\/git-mirror\/git-mirror-sync.sh/$HERE\/..\/scripts\/git-mirror-sync.sh}
+        [[ $1 == exec && $2 == -e && $3 == "RUN_ROOT=$MAPPING_ASSERT_RUN_ROOT" && $4 == -e && $5 == MAPPING_VALIDATE_INVALID=no && $6 == product && $7 == /bin/bash && $8 == -c ]] || return 1
+        script=${9//\/usr\/local\/lib\/git-mirror\/git-mirror-sync.sh/$HERE\/..\/scripts\/git-mirror-sync.sh}
         RUN_ROOT=$dir /bin/bash -c "$script"
     }
     mapping_scenario_missing_map_validator product "$dir" || rc=$?
@@ -222,8 +222,8 @@ scenario_runs_sync() (
     mapping_scenario_apply_negative() { return 0; }
     mapping_fixture_docker() {
         [[ $1 == exec ]] || return 1
-        if [[ $2 == -e && $3 == "RUN_ROOT=$MAPPING_ASSERT_RUN_ROOT" && $5 == /bin/bash ]]; then
-            script=${7//\/usr\/local\/lib\/git-mirror\/git-mirror-sync.sh/$HERE\/..\/scripts\/git-mirror-sync.sh}
+        if [[ $2 == -e && $3 == "RUN_ROOT=$MAPPING_ASSERT_RUN_ROOT" && $7 == /bin/bash ]]; then
+            script=${9//\/usr\/local\/lib\/git-mirror\/git-mirror-sync.sh/$HERE\/..\/scripts\/git-mirror-sync.sh}
             RUN_ROOT=$dir /bin/bash -c "$script"
             return $?
         fi
