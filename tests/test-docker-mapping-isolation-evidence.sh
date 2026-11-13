@@ -45,8 +45,9 @@ isolation_produces_and_consumes_five_bound_cases() (
     mapping_profile_load "$MAPPING_PROFILE"
     identity_write "$dir"
     printf '[{"Id":"%s","Name":"/gm-mtest-g1-product","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"product"}}}]\n' "$product_id" > "$root/control/resources/objects/1-container.json"
-    local object_hash
-    object_hash=$(sha256sum "$root/control/resources/objects/1-container.json"); object_hash=${object_hash%% *}
+    local object_hash inspect_raw
+    inspect_raw=$(cat "$root/control/resources/objects/1-container.json")
+    object_hash=$(printf '%s' "$inspect_raw" | sha256sum); object_hash=${object_hash%% *}
     printf '1\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t%s\n2\tremoved\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t\n' "$product_id" "$object_hash" "$product_id" "$root/control/resources/objects/1-container.json" "$product_id" "$object_hash" "$product_id" > "$root/control/resources/ledger.tsv"
     mapping_fixture_docker() { [[ $1 == inspect && $4 == product ]] || return 80; printf '%064d\n' 3; }
     resource_ledger_dir() { printf '%s\n' "$root/control/resources"; }
@@ -174,7 +175,8 @@ isolation_produces_and_consumes_five_bound_cases() (
                 generation_id=$(printf '%064d' "$((index + 2))")
                 object=$matrix_root/control/resources/objects/$((index * 2 - 1))-container.json
                 printf '[{"Id":"%s","Name":"/gm-mtest-%s-product","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"product"}}}]\n' "$generation_id" "$generation" > "$object"
-                object_hash=$(sha256sum "$object"); object_hash=${object_hash%% *}
+                inspect_raw=$(cat "$object")
+                object_hash=$(printf '%s' "$inspect_raw" | sha256sum); object_hash=${object_hash%% *}
                 printf '%s\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t%s\n%s\tremoved\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t\n' "$((index * 2 - 1))" "$generation_id" "$object_hash" "$generation_id" "$object" "$((index * 2))" "$generation_id" "$object_hash" "$generation_id" >> "$matrix_root/control/resources/ledger.tsv"
                 sed -i "s/$product_id/$generation_id/g" "$sub/binding.tsv" "$sub/probe.log" "$sub/probe/command.tsv"
             fi
@@ -191,6 +193,20 @@ isolation_produces_and_consumes_five_bound_cases() (
         done
         mapping_negative_matrix_accept "$matrix" mtest manifest input || return 1
         read -r first_key second_key _ <<< "$MAPPING_WITNESS_KEYS"
+        generation_id=$(printf '%064d' 4)
+        object=$matrix_root/control/resources/objects/3-container.json
+        cp "$object" "$WORK/g2-product.json"
+        cp "$matrix_root/control/resources/ledger.tsv" "$WORK/matrix-ledger.tsv"
+        sed -i 's/gm-mtest-g2-product/gm-mtest-g1-product/' "$object"
+        inspect_raw=$(cat "$object")
+        object_hash=$(printf '%s' "$inspect_raw" | sha256sum); object_hash=${object_hash%% *}
+        awk -F '\t' -v OFS='\t' -v id="$generation_id" -v hash="$object_hash" '$4 == id {$8=hash} {print}' "$WORK/matrix-ledger.tsv" > "$matrix_root/control/resources/ledger.tsv"
+        status=0
+        mapping_original_case_evidence_accept "isolation/$second_key" mtest mapping-fallback-isolation g2 manifest input "$dir/raw-isolation-$second_key" || status=$?
+        [[ $status == 1 ]] || { printf 'removed predecessor ID impersonates g2: %s\n' "$status" >&2; return 1; }
+        cp "$WORK/g2-product.json" "$object"
+        cp "$WORK/matrix-ledger.tsv" "$matrix_root/control/resources/ledger.tsv"
+        mapping_original_case_evidence_accept "isolation/$second_key" mtest mapping-fallback-isolation g2 manifest input "$dir/raw-isolation-$second_key" || return 1
         first_seq=$(awk -F '\t' '$1 == "seq" {print $2}' "$dir/raw-isolation-$first_key/isolation/$first_key/before.receipt")
         receipt=$matrix_root/mapping-snapshot-$first_seq.receipt
         cp "$receipt" "$WORK/first-root-receipt"
