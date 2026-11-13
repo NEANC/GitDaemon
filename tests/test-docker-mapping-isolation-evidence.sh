@@ -44,8 +44,10 @@ isolation_produces_and_consumes_five_bound_cases() (
     MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_CALIBRATED_GENERATION=g1 MAPPING_ASSERT_PRODUCT=$product_id MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=net-one MPF_SCENARIO=mapping-fallback-isolation
     mapping_profile_load "$MAPPING_PROFILE"
     identity_write "$dir"
-    printf '[{"Id":"%s","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"product"}}}]\n' "$product_id" > "$root/control/resources/objects/1-container.json"
-    printf '1\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\thash\t%s\t%s\n' "$product_id" "$product_id" "$root/control/resources/objects/1-container.json" > "$root/control/resources/ledger.tsv"
+    printf '[{"Id":"%s","Name":"/gm-mtest-g1-product","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"product"}}}]\n' "$product_id" > "$root/control/resources/objects/1-container.json"
+    local object_hash
+    object_hash=$(sha256sum "$root/control/resources/objects/1-container.json"); object_hash=${object_hash%% *}
+    printf '1\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t%s\n2\tremoved\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t\n' "$product_id" "$object_hash" "$product_id" "$root/control/resources/objects/1-container.json" "$product_id" "$object_hash" "$product_id" > "$root/control/resources/ledger.tsv"
     mapping_fixture_docker() { [[ $1 == inspect && $4 == product ]] || return 80; printf '%064d\n' 3; }
     resource_ledger_dir() { printf '%s\n' "$root/control/resources"; }
     resource_crosscheck() { return 0; }
@@ -139,7 +141,7 @@ isolation_produces_and_consumes_five_bound_cases() (
             fi
             printf '%s\tmtest\tmapping-fallback-isolation\tg1\tmanifest\tinput\t%s\t0\tPASS\n' "$case_id" "$evidence" >> "$matrix"
         done
-        local index=0 sub receipt name offset file seq first_key second_key first_seq
+        local index=0 sub receipt name offset file seq first_key second_key first_seq generation_id object object_hash
         for key in $MAPPING_WITNESS_KEYS; do
             offset=$((index * 25))
             index=$((index + 1))
@@ -168,6 +170,14 @@ isolation_produces_and_consumes_five_bound_cases() (
             index=$((index + 1))
             evidence=$dir/raw-isolation-$key
             sub=$evidence/isolation/$key
+            if (( index > 1 )); then
+                generation_id=$(printf '%064d' "$((index + 2))")
+                object=$matrix_root/control/resources/objects/$((index * 2 - 1))-container.json
+                printf '[{"Id":"%s","Name":"/gm-mtest-%s-product","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"product"}}}]\n' "$generation_id" "$generation" > "$object"
+                object_hash=$(sha256sum "$object"); object_hash=${object_hash%% *}
+                printf '%s\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t%s\n%s\tremoved\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\t%s\t%s\t\n' "$((index * 2 - 1))" "$generation_id" "$object_hash" "$generation_id" "$object" "$((index * 2))" "$generation_id" "$object_hash" "$generation_id" >> "$matrix_root/control/resources/ledger.tsv"
+                sed -i "s/$product_id/$generation_id/g" "$sub/binding.tsv" "$sub/probe.log" "$sub/probe/command.tsv"
+            fi
             sed -i "s/generation\tg1/generation\t$generation/" "$sub/binding.tsv" "$sub/negative/command.tsv" "$sub/probe/command.tsv" "$evidence/identity.tsv" "$sub/"*.receipt
             sed -i "s/mtest-g1/mtest-$generation/g" "$sub/negative/command.tsv" "$sub/probe/command.tsv"
             for name in calibration.before calibration.after negative before after; do

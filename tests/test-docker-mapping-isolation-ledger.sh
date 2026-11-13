@@ -11,22 +11,45 @@ mkdir -p "$LEDGER/objects"
 INSPECT=$LEDGER/objects/2-container.json
 
 write_inspect() {
-    printf '[{"Id":"%s","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"%s"}}}]\n' "$1" "$2" > "$INSPECT"
+    printf '[{"Id":"%s","Name":"/gm-mtest-g1-product","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"%s"}}}]\n' "$1" "$2" > "$INSPECT"
 }
 
 write_ledger() {
-    printf '1\tregister\tnetwork\tnet-one\tmtest\tmapping\tnetwork\thash\tnet-one\t%s\n2\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\t%s\thash\t%s\t%s\n3\tremoved\tnetwork\tnet-one\tmtest\tmapping\tnetwork\thash\tnet-one\t%s\n' "$LEDGER/objects/1-network.json" "$1" "$2" "$1" "$INSPECT" "$LEDGER/objects/1-network.json" > "$LEDGER/ledger.tsv"
+    local hash
+    hash=$(sha256sum "$INSPECT"); hash=${hash%% *}
+    printf '1\tregister\tnetwork\tnet-one\tmtest\tmapping\tnetwork\thash\tnet-one\t%s\n2\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\t%s\t%s\t%s\t%s\n3\tremoved\tnetwork\tnet-one\tmtest\tmapping\tnetwork\thash\tnet-one\t\n4\tremoved\tcontainer\t%s\tmtest\tmapping-fallback-isolation\t%s\t%s\t%s\t\n' "$LEDGER/objects/1-network.json" "$1" "$2" "$hash" "$1" "$INSPECT" "$1" "$2" "$hash" "$1" > "$LEDGER/ledger.tsv"
 }
 
 expect_status() {
     local expected=$1 rc=0
-    mapping_isolation_product_registration_accept "$ID" mtest mapping-fallback-isolation "$LEDGER" || rc=$?
+    mapping_isolation_product_registration_accept "$ID" mtest mapping-fallback-isolation "$LEDGER" g1 || rc=$?
     [[ $rc == "$expected" ]] || { printf 'expected %s got %s\n' "$expected" "$rc" >&2; return 1; }
 }
 
 write_inspect "$ID" product
 write_ledger "$ID" product
 expect_status 0
+sed -i 's/gm-mtest-g1-product/gm-mtest-g0-product/' "$INSPECT"
+expect_status 1
+write_inspect "$ID" product
+sed -i 's/gm-mtest-g1-product/gm-mtest-g1-product-extra/' "$INSPECT"
+expect_status 1
+write_inspect "$ID" product
+printf ' ' >> "$INSPECT"
+expect_status 1
+write_inspect "$ID" product
+sed -i '4d' "$LEDGER/ledger.tsv"
+expect_status 1
+write_ledger "$ID" product
+sed -i 's/^4\tremoved\tcontainer/4\tremoved\tnetwork/' "$LEDGER/ledger.tsv"
+expect_status 1
+write_ledger "$ID" product
+sed -i 's/^4\tremoved\tcontainer\t/4\tremoved\tcontainer\tbad-/' "$LEDGER/ledger.tsv"
+expect_status 1
+write_ledger "$ID" product
+sed -i '4s/\tproduct\t/\tother\t/' "$LEDGER/ledger.tsv"
+expect_status 1
+write_ledger "$ID" product
 printf '5\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\thash\t%s\t%s\n' "$OTHER" "$OTHER" "$LEDGER/objects/5-container.json" >> "$LEDGER/ledger.tsv"
 expect_status 0
 write_ledger "$OTHER" product
@@ -37,7 +60,7 @@ expect_status 1
 write_ledger "$ID" wrong-role
 expect_status 1
 write_ledger "$ID" product
-printf '4\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\thash\t%s\t%s\n' "$ID" "$ID" "$INSPECT" >> "$LEDGER/ledger.tsv"
+printf '5\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\thash\t%s\t%s\n' "$ID" "$ID" "$INSPECT" >> "$LEDGER/ledger.tsv"
 expect_status 1
 write_ledger "$ID" product
 printf 'broken\n' > "$INSPECT"
