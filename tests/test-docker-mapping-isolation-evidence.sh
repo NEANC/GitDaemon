@@ -360,6 +360,7 @@ isolation_produces_and_consumes_five_bound_cases() (
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
     [[ $rc == 1 ]] || return 1
     cp "$WORK/seq.after" "$dir/isolation/$key/seq.after"
+    mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || return 1
     key=dns-udp
     printf 'target\tother\ngeneration\tg1\nnetwork_id\tnet-one\nprofile_sha256\t%s\nproduct_id\t%s\n' "$MP_PROFILE_SHA256" "$product_id" > "$dir/isolation/$key/binding.tsv"
     rc=0; mapping_negative_case_evidence_accept "isolation/$key" mtest mapping-fallback-isolation g1 manifest input "$dir" || rc=$?
