@@ -39,11 +39,13 @@ isolation_produces_and_consumes_five_bound_cases() (
     local root=$WORK/run dir=$WORK/case key count=0 rc received=0 paused=0 product_id other_id
     product_id=$(printf '%064d' 3)
     other_id=$(printf '%064d' 4)
-    mkdir -p "$root/control" "$dir"
+    mkdir -p "$root/control/resources/objects" "$dir"
     IT_CONTROL_DIR=$root/control IT_EVIDENCE_DIR=$dir MAPPING_PROFILE=$WORK/profile.tsv
     MAPPING_ASSERT_GENERATION=g1 MAPPING_ASSERT_CALIBRATED_GENERATION=g1 MAPPING_ASSERT_PRODUCT=$product_id MP_WITNESS_CALIBRATED=1 MP_NETWORK_ID=net-one MPF_SCENARIO=mapping-fallback-isolation
     mapping_profile_load "$MAPPING_PROFILE"
     identity_write "$dir"
+    printf '[{"Id":"%s","Config":{"Labels":{"gitdaemon.run":"mtest","gitdaemon.scenario":"mapping-fallback-isolation","gitdaemon.role":"product"}}}]\n' "$product_id" > "$root/control/resources/objects/1-container.json"
+    printf '1\tregister\tcontainer\t%s\tmtest\tmapping-fallback-isolation\tproduct\thash\t%s\t%s\n' "$product_id" "$product_id" "$root/control/resources/objects/1-container.json" > "$root/control/resources/ledger.tsv"
     mapping_fixture_docker() { [[ $1 == inspect && $4 == product ]] || return 80; printf '%064d\n' 3; }
     resource_ledger_dir() { printf '%s\n' "$root/control/resources"; }
     resource_crosscheck() { return 0; }
@@ -116,6 +118,7 @@ isolation_produces_and_consumes_five_bound_cases() (
         local matrix=$dir/mapping-negative-matrix.tsv matrix_root=$WORK/matrix-root case_id evidence generation status
         local -a generations=(g1 g2 g3 g4 g5)
         cp -R "$root" "$matrix_root"
+        sed -i "s|$root/control/resources/objects/|$matrix_root/control/resources/objects/|" "$matrix_root/control/resources/ledger.tsv"
         IT_CONTROL_DIR=$matrix_root/control
         eval "$(declare -f mapping_negative_case_evidence_accept | sed '1s/mapping_negative_case_evidence_accept/mapping_original_case_evidence_accept/')"
         mapping_negative_case_evidence_accept() {

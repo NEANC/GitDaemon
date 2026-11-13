@@ -1646,6 +1646,25 @@ mapping_isolation_tcp_dns_raw_log_accept() {
     tail -n +2 "$sub/probe.log" | cmp -s - "$sub/probe/raw.log" || return 1
 }
 
+mapping_isolation_product_registration_accept() {
+    local product_id=$1 run=$2 scenario=$3 ledger=$4 file=$4/ledger.tsv
+    local seq event kind identity entry_run entry_scenario role hash digest path extra matches=0 inspect_id
+    [[ -f $file && ! -L $file && -r $file ]] || return 80
+    while IFS=$'\t' read -r seq event kind identity entry_run entry_scenario role hash digest path extra; do
+        [[ $event == register && $kind == container && $identity == "$product_id" ]] || continue
+        matches=$((matches + 1))
+        [[ $entry_run == "$run" && $entry_scenario == "$scenario" && $role == product ]] || return 1
+        [[ $seq =~ ^[1-9][0-9]*$ && -n $path && -f $path && ! -L $path && -r $path ]] || return 80
+        [[ $path == "$ledger/objects/$seq-container.json" ]] || return 1
+        jq -e . "$path" >/dev/null 2>&1 || return 80
+        inspect_id=$(jq -r 'if type == "array" and length == 1 then .[0].Id // empty else empty end' "$path") || return 80
+        [[ $inspect_id == "$product_id" ]] || return 1
+        jq -e --arg run "$run" --arg scenario "$scenario" \
+            '.[0].Config.Labels["gitdaemon.run"] == $run and .[0].Config.Labels["gitdaemon.scenario"] == $scenario and .[0].Config.Labels["gitdaemon.role"] == "product"' \
+            "$path" >/dev/null 2>&1 || return 1
+    done < "$file"
+    [[ $matches == 1 ]] || return 1
+}
 
 mapping_negative_case_evidence_accept() {
     local case_id=${1:-} run=${2:-} scenario=${3:-} generation=${4:-} manifest=${5:-} input=${6:-} dir=${7:-}
@@ -1668,6 +1687,7 @@ mapping_negative_case_evidence_accept() {
             product_id=$(awk -F '\t' '$1 == "product_id" {print $2}' "$sub/binding.tsv")
             [[ $product_id =~ ^[0-9a-f]{64}$ ]] || return 80
             [[ $(cat "$sub/binding.tsv") == "$(printf 'target\t%s\ngeneration\t%s\nnetwork_id\t%s\nprofile_sha256\t%s\nproduct_id\t%s' "$key" "$generation" "$MPA_NETWORK_ID" "$MPA_PROFILE_SHA256" "$product_id")" ]] || return 1
+            mapping_isolation_product_registration_accept "$product_id" "$run" "$scenario" "${IT_CONTROL_DIR:-}/resources" || return $?
             spec=$(mapping_witness_spec "$key") || return 80
             IFS=$'\t' read -r proto port dest <<< "$spec"
             for name in negative probe; do
